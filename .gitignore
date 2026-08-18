@@ -21,3 +21,6 @@ __pycache__/
 *.swp
 *.tmp
 state/uso_real.json
+memoria/*.md
+!memoria/README.md
+state/sesiones/

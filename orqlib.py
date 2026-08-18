@@ -336,7 +336,7 @@ def extraer(provider, stdout, stderr=""):
 
 
 # ---------------- ejecucion ----------------
-def correr(pid, p, prompt, tarea="reasoning", timeout=300):
+def correr(pid, p, prompt, tarea="reasoning", timeout=300, carpeta=None):
     env = entorno(pid, p)
     cmd = comando(p, prompt)
     prov = p.get("provider")
@@ -345,8 +345,9 @@ def correr(pid, p, prompt, tarea="reasoning", timeout=300):
     try:
         if f_lock:
             fcntl.flock(f_lock, fcntl.LOCK_EX)
+        destino = carpeta if carpeta and os.path.isdir(carpeta) else BASE
         r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, env=env, cwd=BASE)
+                           timeout=timeout, env=env, cwd=destino)
         out, err, rc = r.stdout, r.stderr, r.returncode
     except subprocess.TimeoutExpired:
         out, err, rc = "", f"timeout tras {timeout}s", 124
@@ -370,7 +371,7 @@ def correr(pid, p, prompt, tarea="reasoning", timeout=300):
          "tokens": tok, "seg": dur, "rc": rc, "limite": bool(lim),
          "sesion": os.environ.get("ORQ_SESION", "sin-sesion"),
          "term": os.environ.get("ORQ_SESION_TERM", ""),
-         "prompt": prompt[:200], "run_id": run_id})
+         "carpeta": carpeta or "", "prompt": prompt[:200], "run_id": run_id})
     return {"perfil": pid, "label": p.get("label", pid), "texto": texto,
             "tokens": tok, "seg": dur, "rc": rc, "run_id": run_id,
             "limitado": lim.isoformat(timespec="seconds") if lim else None}

@@ -16,8 +16,18 @@ except ImportError:
 R, D, N, B = "\033[38;2;224;50;46m", "\033[2m", "\033[0m", "\033[1m"
 G, Y, C = "\033[38;2;154;160;142m", "\033[38;2;201;185;138m", "\033[38;2;122;162;200m"
 HIST = os.path.join(L.BASE, "state", "chat_historial")
-CTX = os.path.join(L.BASE, "state", "chat_contexto.json")
-MAX_CTX = 12          # turnos que se arrastran como contexto
+DIR_SES = os.path.join(L.BASE, "state", "sesiones")
+DIR_MEM = os.path.join(L.BASE, "memoria")
+MAX_CTX = 14          # turnos que se arrastran dentro de ESTA ventana
+
+# Cada ventana de kitty tiene su propia conversacion. Una ventana nueva
+# empieza limpia: no hereda lo que hablaste en otra.
+SESION = os.environ.get("ORQ_SESION") or f"suelta-{os.getpid()}"
+CTX = os.path.join(DIR_SES, f"{SESION}.json")
+
+# Carpeta de trabajo de ESTA ventana. Todo lo que hagan las IA ocurre aqui
+# dentro; no ven ni tocan el resto del equipo salvo que se lo pidas.
+CARPETA = os.path.abspath(os.environ.get("ORQ_CARPETA") or os.getcwd())
 
 
 def ancho():
@@ -71,6 +81,11 @@ def cabecera():
         else:
             piezas.append(f"{D}{pid}{N} {G}·{N}")
     print(f" {D}│{N} " + f"  {D}·{N}  ".join(piezas))
+    mem = memoria()
+    extra = f"  {D}·{N}  {D}memoria:{N} {len(mem)} nota{'s' if len(mem)!=1 else ''}" if mem else ""
+    corta = CARPETA.replace(os.path.expanduser("~"), "~")
+    print(f" {D}│{N} {D}carpeta:{N} {corta}")
+    print(f" {D}│{N} {D}ventana nueva, conversacion limpia{N}{extra}")
     print(f" {D}│{N} {D}escribe lo que necesites.  /ayuda para los comandos{N}")
     print()
 
@@ -85,6 +100,10 @@ AYUDA = f"""
    {C}/tarea <tipo>{N}   {D}{' '.join(L.TAREAS)}{N}
    {C}/imagen <desc>{N}  generar una imagen en la carpeta actual
    {C}/proyecto <desc>{N} construir un proyecto completo aqui
+   {C}/carpeta [ruta]{N} ver o cambiar la carpeta de trabajo de esta ventana
+   {C}/memoria{N}        ver lo que Orquesta sabe siempre
+   {C}/recuerda <txt>{N} asignarle un hecho permanente
+   {C}/olvida <arch>{N}  quitarlo de la memoria
    {C}/nuevo{N}          empezar una conversacion limpia
    {C}/shell <cmd>{N}    ejecutar un comando del sistema
    {C}/salir{N}
@@ -92,6 +111,7 @@ AYUDA = f"""
 
 
 def cargar_ctx():
+    """Solo recupera el contexto de ESTA ventana (por si se reinicio el chat)."""
     try:
         with open(CTX) as f:
             return json.load(f)
@@ -99,9 +119,50 @@ def cargar_ctx():
         return []
 
 
+def limpiar_sesiones_viejas(dias=2):
+    """Borra conversaciones de ventanas que ya no existen."""
+    try:
+        corte = time.time() - dias * 86400
+        for f in os.listdir(DIR_SES):
+            ruta = os.path.join(DIR_SES, f)
+            if os.path.getmtime(ruta) < corte:
+                os.remove(ruta)
+    except OSError:
+        pass
+
+
+def memoria():
+    """Lo que Orquesta sabe siempre, porque tu se lo asignaste."""
+    trozos = []
+    if not os.path.isdir(DIR_MEM):
+        return trozos
+    for f in sorted(os.listdir(DIR_MEM)):
+        if not f.endswith(".md") or f == "README.md":
+            continue
+        try:
+            txt = open(os.path.join(DIR_MEM, f)).read().strip()
+            if txt:
+                trozos.append((f[:-3], txt))
+        except OSError:
+            pass
+    return trozos
+
+
+def recordar(hecho):
+    os.makedirs(DIR_MEM, exist_ok=True)
+    slug = re.sub(r"[^a-z0-9]+", "-", hecho.lower())[:40].strip("-") or "nota"
+    ruta = os.path.join(DIR_MEM, f"{slug}.md")
+    n = 1
+    while os.path.exists(ruta):
+        ruta = os.path.join(DIR_MEM, f"{slug}-{n}.md"); n += 1
+    with open(ruta, "w") as f:
+        f.write(hecho.strip() + "\n")
+    return os.path.basename(ruta)
+
+
 def guardar_ctx(c):
     try:
-        os.makedirs(os.path.dirname(CTX), exist_ok=True)
+        os.makedirs(DIR_SES, exist_ok=True)
         with open(CTX, "w") as f:
             json.dump(c[-MAX_CTX:], f, ensure_ascii=False)
     except OSError:
@@ -109,11 +170,16 @@ def guardar_ctx(c):
 
 
 def con_contexto(ctx, pregunta):
+    mem = memoria()
+    cabeza = ""
+    if mem:
+        cabeza = ("Contexto permanente que el usuario te asigno:\n" +
+                  "\n".join(f"[{n}] {t[:900]}" for n, t in mem) + "\n\n")
     if not ctx:
-        return pregunta
+        return (cabeza + pregunta) if cabeza else pregunta
     hist = "\n".join(f"{'Usuario' if t['rol']=='u' else 'Tu'}: {t['txt'][:700]}"
                      for t in ctx[-MAX_CTX:])
-    return (f"Esta es la conversacion hasta ahora:\n{hist}\n\n"
+    return (cabeza + f"Esta es la conversacion hasta ahora:\n{hist}\n\n"
             f"Usuario: {pregunta}\n\n"
             f"Responde solo al ultimo mensaje, en el mismo idioma, sin repetir "
             f"lo ya dicho y sin saludar de nuevo.")
@@ -153,6 +219,14 @@ def envolver(txt, sangria="   "):
     return "\n".join(out)
 
 
+def marco_carpeta():
+    """Instruccion de alcance: trabaja solo en esta carpeta."""
+    return (f"Carpeta de trabajo: {CARPETA}\n"
+            f"Trabaja unicamente dentro de esa carpeta y sus subcarpetas. "
+            f"No leas ni modifiques nada fuera de ella salvo que el usuario "
+            f"te lo pida explicitamente en este mensaje.\n\n")
+
+
 def responder(pregunta, ctx, tarea, forzado):
     if forzado:
         d = L.disponibles(incluir_bloqueados=True)
@@ -165,7 +239,8 @@ def responder(pregunta, ctx, tarea, forzado):
             print(f" {R}·{N} ninguna cuenta disponible ahora mismo\n"); return None
         pid, p = rk[0]["pid"], rk[0]["p"]
     with Girador(f"{pid} pensando…"):
-        r = L.correr(pid, p, con_contexto(ctx, pregunta), tarea, 600)
+        r = L.correr(pid, p, marco_carpeta() + con_contexto(ctx, pregunta),
+                     tarea, 600, carpeta=CARPETA)
     print(f" {R}▍{N} {D}{pid}{N}")
     print(envolver(r["texto"] or "(sin respuesta)"))
     print(f"   {D}{r['tokens']:,} tok · {r['seg']}s{N}\n")
@@ -179,6 +254,7 @@ def principal():
         except OSError:
             pass
         readline.set_history_length(2000)
+    limpiar_sesiones_viejas()
     logo()
     cabecera()
     ctx = cargar_ctx()
@@ -207,6 +283,48 @@ def principal():
                     break
                 if cmd == "ayuda":
                     print(AYUDA); continue
+                if cmd == "carpeta":
+                    global CARPETA
+                    if arg:
+                        nueva = os.path.abspath(os.path.expanduser(arg))
+                        if os.path.isdir(nueva):
+                            CARPETA = nueva
+                            os.chdir(CARPETA)
+                            ctx = []; guardar_ctx(ctx)
+                            print(f" {G}·{N} carpeta: {CARPETA}")
+                            print(f" {D}  conversacion reiniciada para este contexto{N}\n")
+                        else:
+                            print(f" {R}·{N} no existe: {nueva}\n")
+                    else:
+                        try:
+                            n = len(os.listdir(CARPETA))
+                        except OSError:
+                            n = "?"
+                        print(f" {D}carpeta:{N} {CARPETA}  {D}({n} elementos){N}\n")
+                    continue
+                if cmd == "memoria":
+                    mem = memoria()
+                    if not mem:
+                        print(f" {D}sin memoria asignada. Usa /recuerda <hecho>{N}\n")
+                    else:
+                        print(f"\n {B}Memoria permanente{N} {D}({DIR_MEM}){N}")
+                        for n, t in mem:
+                            print(f"   {R}·{N} {B}{n}{N}")
+                            print(envolver(t[:400], "     " + D) + N)
+                        print()
+                    continue
+                if cmd == "recuerda":
+                    if not arg:
+                        print(f" {D}que quieres que recuerde?{N}\n"); continue
+                    f = recordar(arg)
+                    print(f" {G}·{N} guardado en memoria/{f}\n"); continue
+                if cmd == "olvida":
+                    ruta = os.path.join(DIR_MEM, arg if arg.endswith(".md") else arg + ".md")
+                    if os.path.exists(ruta):
+                        os.remove(ruta); print(f" {G}·{N} olvidado: {arg}\n")
+                    else:
+                        print(f" {D}no encuentro '{arg}'. Mira /memoria{N}\n")
+                    continue
                 if cmd == "nuevo":
                     ctx = []; guardar_ctx(ctx)
                     print(f" {G}·{N} conversacion nueva\n"); continue
