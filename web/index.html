@@ -1,0 +1,413 @@
+<!doctype html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Orquesta IA</title>
+<style>
+:root{--bg:#08080a;--pan:#101014;--pan2:#17171d;--fg:#d6d6d8;--dim:#8a8a90;
+--acc:#e0322e;--ok:#9aa08e;--warn:#c9b98a;--line:#2a2a30;--r:10px}
+@media(prefers-color-scheme:light){:root{--bg:#f7f7f5;--pan:#fff;--pan2:#efefec;
+--fg:#1a1a1c;--dim:#6a6a70;--line:#dcdcd8}}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:14px/1.55 "JetBrainsMono Nerd Font",ui-monospace,SFMono-Regular,monospace}
+header{position:sticky;top:0;z-index:20;background:var(--bg);
+border-bottom:1px solid var(--line);padding:12px 18px env(safe-area-inset-right)}
+.hrow{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+h1{margin:0;font-size:16px;letter-spacing:.08em;white-space:nowrap}
+.sub{color:var(--dim);font-size:12px}
+nav{display:flex;gap:4px;margin-top:10px;overflow-x:auto;scrollbar-width:none}
+nav::-webkit-scrollbar{display:none}
+nav button{background:none;border:0;border-bottom:2px solid transparent;color:var(--dim);
+padding:7px 13px;cursor:pointer;font:inherit;font-size:13px;white-space:nowrap;border-radius:0}
+nav button[aria-selected=true]{color:var(--fg);border-bottom-color:var(--acc)}
+main{padding:18px;max-width:1500px;margin:0 auto}
+.cols{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr))}
+section{background:var(--pan);border:1px solid var(--line);border-radius:var(--r);padding:15px}
+section.wide{grid-column:1/-1}
+h2{margin:0 0 11px;font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim)}
+.tw{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table{width:100%;border-collapse:collapse;font-size:13px;min-width:440px}
+th{text-align:left;color:var(--dim);font-weight:400;padding:5px 8px;
+border-bottom:1px solid var(--line);font-size:10px;letter-spacing:.1em;text-transform:uppercase}
+td{padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:0}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11px;border:1px solid;white-space:nowrap}
+.ok{color:var(--ok);border-color:#3a4034}.no{color:var(--acc);border-color:#4a2220}
+.wa{color:var(--warn);border-color:#4a4230}.off{color:var(--dim);border-color:var(--line)}
+button,.btn{background:var(--pan2);color:var(--fg);border:1px solid var(--line);
+border-radius:7px;padding:7px 13px;cursor:pointer;font:inherit;font-size:12px;
+min-height:34px;transition:border-color .12s}
+button:hover{border-color:var(--acc)}button:disabled{opacity:.45;cursor:not-allowed}
+button.p{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+button.sm{padding:3px 9px;min-height:26px;font-size:11px}
+input,select,textarea{background:var(--bg);color:var(--fg);border:1px solid var(--line);
+border-radius:7px;padding:8px 10px;font:inherit;font-size:13px;width:100%;min-height:36px}
+textarea{resize:vertical;min-height:110px;line-height:1.5}
+input:focus,select:focus,textarea:focus{outline:0;border-color:var(--acc)}
+label{display:block;font-size:10px;color:var(--dim);margin:10px 0 4px;
+letter-spacing:.1em;text-transform:uppercase}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.g3{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.bar{height:5px;background:var(--pan2);border-radius:3px;overflow:hidden;margin-top:4px}
+.bar i{display:block;height:100%;background:var(--acc);transition:width .3s}
+code,pre{background:var(--pan2);border-radius:6px;font-size:12px;color:var(--warn)}
+code{display:block;padding:7px 9px;overflow-x:auto;white-space:pre;margin-top:6px;
+user-select:all;cursor:copy}
+pre{padding:12px;overflow-x:auto;white-space:pre-wrap;word-break:break-word;
+color:var(--fg);max-height:460px;overflow-y:auto;margin:0}
+.mut{color:var(--dim);font-size:12px}
+details{border:1px solid var(--line);border-radius:8px;margin-bottom:9px;background:var(--pan2)}
+summary{padding:10px 12px;cursor:pointer;font-size:13px;list-style:none;display:flex;
+gap:10px;align-items:center;flex-wrap:wrap}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"▸";color:var(--dim);transition:transform .15s}
+details[open] summary::before{transform:rotate(90deg)}
+.dbody{padding:0 12px 13px}
+#toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(20px + env(safe-area-inset-bottom));
+z-index:99;display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none;width:min(92vw,460px)}
+.tm{background:var(--pan);border:1px solid var(--line);border-left:3px solid var(--acc);
+padding:10px 15px;border-radius:8px;font-size:13px;box-shadow:0 8px 28px #0009;width:100%}
+.tm.good{border-left-color:var(--ok)}
+.res{border:1px solid var(--line);border-radius:8px;margin-bottom:11px;overflow:hidden}
+.rh{background:var(--pan2);padding:9px 12px;display:flex;gap:10px;align-items:center;
+flex-wrap:wrap;font-size:12px;border-bottom:1px solid var(--line)}
+.rh b{color:var(--acc)}.rh.aud b{color:var(--warn)}
+.spin{display:inline-block;width:11px;height:11px;border:2px solid var(--line);
+border-top-color:var(--acc);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-1px}
+@keyframes sp{to{transform:rotate(360deg)}}
+@media(max-width:620px){main{padding:12px}section{padding:12px}
+ .g2{grid-template-columns:1fr}h1{font-size:15px}header{padding:10px 12px}}
+</style></head><body>
+
+<header><div class="hrow">
+  <h1>ORQUESTA&nbsp;IA</h1>
+  <span class="sub" id="resumen">cargando…</span>
+  <span style="flex:1"></span>
+  <button class="sm" onclick="cargar()">↻</button>
+</div>
+<nav id="tabs" role="tablist">
+  <button role="tab" aria-selected="true" data-t="panel">Panel</button>
+  <button role="tab" aria-selected="false" data-t="consultar">Consultar</button>
+  <button role="tab" aria-selected="false" data-t="ajustes">Ajustes</button>
+  <button role="tab" aria-selected="false" data-t="historial">Historial</button>
+</nav></header>
+
+<main>
+<div id="v-panel" class="cols">
+  <section class="wide"><h2>Cuentas</h2><div class="tw" id="cuentas"></div></section>
+  <section><h2>A quién delegar</h2>
+    <label for="t_tarea">tipo de tarea</label>
+    <select id="t_tarea" onchange="cargar()"></select>
+    <div class="tw" id="ranking" style="margin-top:12px"></div>
+    <p class="mut" style="margin-top:11px">puntaje = peso técnico × rendimiento medido × holgura de cupo.
+    Las cuentas con límite activo se excluyen solas hasta que recargan.</p>
+  </section>
+  <section><h2>Gasto por cuenta</h2><div class="tw" id="gasto"></div></section>
+</div>
+
+<div id="v-consultar" hidden><div class="cols">
+  <section class="wide">
+    <h2>Consulta</h2>
+    <label for="q">prompt <span class="mut">(Ctrl+Enter para enviar)</span></label>
+    <textarea id="q" placeholder="Escribe aquí lo que necesitas…"></textarea>
+    <div class="g3" style="margin-top:11px">
+      <div><label for="q_modo">modo</label><select id="q_modo" onchange="modoCambio()">
+        <option value="ask">delegar a la mejor</option>
+        <option value="fan">preguntar a todas</option>
+        <option value="audit">auditoría cruzada</option></select></div>
+      <div><label for="q_tarea">tarea</label><select id="q_tarea"></select></div>
+      <div><label for="q_perfil">cuenta</label><select id="q_perfil"></select></div>
+      <div><label for="q_to">timeout (s)</label><input id="q_to" type="number" value="300" min="30" max="1800"></div>
+    </div>
+    <div class="row" style="margin-top:13px">
+      <button class="p" id="q_run" onclick="correr()">Enviar</button>
+      <span class="mut" id="q_hint"></span>
+    </div>
+  </section>
+  <section class="wide" id="q_res_sec" hidden><h2>Resultado</h2><div id="q_res"></div></section>
+</div></div>
+
+<div id="v-ajustes" hidden><div class="cols">
+  <section class="wide"><h2>Ajustes por cuenta</h2><div id="ajustes"></div></section>
+  <section><h2>Agregar cuenta</h2>
+    <div class="g2">
+      <div><label for="n_id">id</label><input id="n_id" placeholder="claude-cliente2"></div>
+      <div><label for="n_prov">proveedor</label><select id="n_prov">
+        <option value="claude">claude</option><option value="gpt">gpt</option>
+        <option value="gemini">gemini</option></select></div>
+      <div><label for="n_plan">plan</label><select id="n_plan"><option>max</option>
+        <option selected>pro</option><option>team</option><option>api</option><option>free</option></select></div>
+      <div><label for="n_prop">propósito</label><input id="n_prop" value="general"></div>
+      <div><label for="n_vent">ventana recarga (h)</label><input id="n_vent" type="number" value="5" step="0.5"></div>
+      <div><label for="n_cupo">cupo/ventana (0=sin)</label><input id="n_cupo" type="number" value="0"></div>
+    </div>
+    <label for="n_lab">etiqueta</label><input id="n_lab" placeholder="Claude · cliente 2">
+    <div style="margin-top:13px"><button class="p" onclick="agregar()">Crear cuenta</button></div>
+    <div id="n_out"></div>
+  </section>
+</div></div>
+
+<div id="v-historial" hidden><div class="cols">
+  <section class="wide"><h2>Últimas llamadas</h2><div class="tw" id="hist"></div></section>
+</div></div>
+</main>
+<div id="toast"></div>
+
+<script>
+"use strict";
+let S={}, JOB=null, TICK=null;
+const $ = i => document.getElementById(i);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const nf = n => (n ?? 0).toLocaleString('es');
+
+async function P(u, d){
+  const r = await fetch(u, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(d)});
+  const j = await r.json().catch(() => ({error:'respuesta invalida'}));
+  if (j.error) toast(j.error);
+  return j;
+}
+function toast(msg, good){
+  const e = document.createElement('div');
+  e.className = 'tm' + (good ? ' good' : '');
+  e.textContent = msg;
+  $('toast').appendChild(e);
+  setTimeout(() => e.remove(), 4200);
+}
+
+/* ---- pestañas ---- */
+$('tabs').addEventListener('click', e => {
+  const b = e.target.closest('button[data-t]'); if(!b) return;
+  [...$('tabs').children].forEach(x => x.setAttribute('aria-selected', x === b));
+  ['panel','consultar','ajustes','historial'].forEach(v => $('v-'+v).hidden = (v !== b.dataset.t));
+});
+
+/* ---- carga de estado ---- */
+async function cargar(){
+  try{
+    const t = $('t_tarea');
+    const r = await fetch('/api/state?tarea=' + encodeURIComponent(t.value || 'code'));
+    S = await r.json();
+  }catch(e){ toast('no hay conexion con el panel'); return; }
+
+  if(!$('t_tarea').options.length){
+    S.tareas.forEach(x => {
+      ['t_tarea','q_tarea'].forEach(id => {
+        const o = document.createElement('option'); o.value = o.textContent = x; $(id).appendChild(o);
+      });
+    });
+    $('t_tarea').value = 'code'; $('q_tarea').value = 'reasoning';
+  }
+  const sel = $('q_perfil'), prev = sel.value;
+  sel.innerHTML = '<option value="">automático (mejor cuenta)</option>' +
+    S.cuentas.filter(c => c.auth && c.enabled)
+             .map(c => `<option value="${esc(c.id)}">${esc(c.id)}</option>`).join('');
+  if(prev) sel.value = prev;
+
+  const listas = S.cuentas.filter(c => c.auth && c.enabled && !c.bloqueada).length;
+  $('resumen').textContent = `${listas}/${S.cuentas.length} listas · ${nf(S.total_tokens)} tokens · ${S.total_llamadas} llamadas`;
+
+  pintaCuentas(); pintaRanking(); pintaGasto(); pintaAjustes(); pintaHist();
+}
+
+function estadoPill(c){
+  if(!c.enabled)   return '<span class="pill off">apagada</span>';
+  if(!c.auth)      return '<span class="pill no">sin autenticar</span>';
+  if(c.bloqueada)  return `<span class="pill wa">límite → ${esc(c.bloqueada)}</span>`;
+  return '<span class="pill ok">activa</span>';
+}
+
+function pintaCuentas(){
+  $('cuentas').innerHTML = `<table><tr><th>cuenta</th><th>prov</th><th>estado</th>
+    <th>propósito</th><th class="num">hoy</th><th class="num">ventana ${''}</th><th></th></tr>` +
+    S.cuentas.map(c => `<tr>
+      <td><b>${esc(c.id)}</b><div class="mut">${esc(c.label)}</div>
+        ${!c.auth ? `<code onclick="copiar(this)" title="clic para copiar">${esc(c.login)}</code>` : ''}</td>
+      <td>${esc(c.provider)}</td><td>${estadoPill(c)}</td><td>${esc(c.proposito)}</td>
+      <td class="num">${nf(c.hoy)}</td>
+      <td class="num">${nf(c.ventana)}${c.cupo ? '/' + nf(c.cupo) : ''}<div class="mut">${c.horas}h</div>
+        ${c.cupo ? `<div class="bar"><i style="width:${Math.min(100, 100*c.ventana/c.cupo)}%"></i></div>` : ''}</td>
+      <td><div class="row">
+        <button class="sm" onclick="tog('${esc(c.id)}',${c.enabled?0:1})">${c.enabled?'apagar':'prender'}</button>
+        ${c.bloqueada ? `<button class="sm" onclick="limpiar('${esc(c.id)}')">liberar</button>` : ''}
+      </div></td></tr>`).join('') + `</table>`;
+}
+
+function pintaRanking(){
+  $('ranking').innerHTML = S.ranking.length
+    ? `<table><tr><th>#</th><th>cuenta</th><th class="num">puntaje</th><th>cupo</th></tr>` +
+      S.ranking.map((r,i) => `<tr><td>${i+1}</td>
+        <td>${i===0 ? '<b>'+esc(r.pid)+'</b> ←' : esc(r.pid)}</td>
+        <td class="num">${r.pts.toFixed(2)}</td><td class="mut">${esc(r.nota)}</td></tr>`).join('') + `</table>`
+    : '<p class="mut">ninguna cuenta disponible para esta tarea</p>';
+}
+
+function pintaGasto(){
+  $('gasto').innerHTML = `<table><tr><th>cuenta</th><th class="num">llam.</th><th class="num">tokens</th>
+    <th class="num">tok/llam</th><th class="num">seg</th></tr>` +
+    (S.gasto.length ? S.gasto.map(g => `<tr><td>${esc(g.pid)}</td><td class="num">${g.n}</td>
+      <td class="num">${nf(g.tokens)}</td><td class="num">${nf(g.por)}</td>
+      <td class="num">${g.seg}</td></tr>`).join('')
+      : '<tr><td colspan="5" class="mut">sin llamadas todavía</td></tr>') + `</table>`;
+}
+
+function pintaHist(){
+  $('hist').innerHTML = `<table><tr><th>hora</th><th>cuenta</th><th>tarea</th>
+    <th class="num">tokens</th><th class="num">seg</th><th>prompt</th></tr>` +
+    (S.recientes.length ? S.recientes.map(r => `<tr>
+      <td class="mut">${esc((r.ts||'').slice(11,19))}</td><td>${esc(r.perfil)}</td>
+      <td class="mut">${esc(r.tarea||'')}</td><td class="num">${nf(r.tokens)}</td>
+      <td class="num">${r.seg}</td>
+      <td class="mut">${esc((r.prompt||'').slice(0,70))}</td></tr>`).join('')
+      : '<tr><td colspan="6" class="mut">sin historial</td></tr>') + `</table>`;
+}
+
+function pintaAjustes(){
+  $('ajustes').innerHTML = S.cuentas.map(c => {
+    const sc = S.scores[c.id] || {};
+    const pesos = S.tareas.map(t => `<div><label for="w_${c.id}_${t}">${t}${sc[t] !== undefined
+      ? ` <span style="color:var(--acc)">·${sc[t]}</span>` : ''}</label>
+      <input id="w_${c.id}_${t}" type="number" min="0" max="10" step="0.5"
+      value="${(c.weights || {})[t] ?? 7}"></div>`).join('');
+    return `<details><summary>${estadoPill(c)} <b>${esc(c.id)}</b>
+      <span class="mut">${esc(c.provider)} · ${esc(c.plan)}</span></summary>
+      <div class="dbody">
+        <div class="g2">
+          <div><label for="f_${c.id}_label">etiqueta</label><input id="f_${c.id}_label" value="${esc(c.label)}"></div>
+          <div><label for="f_${c.id}_proposito">propósito</label><input id="f_${c.id}_proposito" value="${esc(c.proposito)}"></div>
+          <div><label for="f_${c.id}_plan">plan</label><input id="f_${c.id}_plan" value="${esc(c.plan)}"></div>
+          <div><label for="f_${c.id}_model">modelo (opcional)</label><input id="f_${c.id}_model" value="${esc(c.model)}" placeholder="por defecto"></div>
+          <div><label for="f_${c.id}_ventana_horas">ventana recarga (h)</label><input id="f_${c.id}_ventana_horas" type="number" step="0.5" value="${c.horas}"></div>
+          <div><label for="f_${c.id}_cupo_ventana">cupo por ventana</label><input id="f_${c.id}_cupo_ventana" type="number" value="${c.cupo}"></div>
+          <div><label for="f_${c.id}_budget_tokens_dia">tope diario (tok)</label><input id="f_${c.id}_budget_tokens_dia" type="number" value="${c.budget}"></div>
+        </div>
+        <label style="margin-top:14px">pesos por tarea (0-10) · en rojo tu nota medida</label>
+        <div class="g3">${pesos}</div>
+        ${!c.auth ? `<label style="margin-top:14px">autenticar (clic para copiar)</label>
+          <code onclick="copiar(this)">${esc(c.login)}</code>` : ''}
+        <div class="row" style="margin-top:15px">
+          <button class="p" onclick="guardar('${esc(c.id)}')">Guardar</button>
+          <button onclick="borrar('${esc(c.id)}')">Eliminar cuenta</button>
+        </div>
+      </div></details>`;
+  }).join('');
+}
+
+/* ---- acciones ---- */
+function copiar(el){
+  navigator.clipboard.writeText(el.textContent).then(
+    () => toast('comando copiado', 1), () => toast('no pude copiar'));
+}
+async function tog(id, on){ await P('/api/profile', {id, enabled: !!on}); cargar(); }
+async function limpiar(id){ await P('/api/limite', {id}); toast('límite liberado', 1); cargar(); }
+
+async function guardar(id){
+  const b = {id, weights:{}};
+  ['label','proposito','plan','model','ventana_horas','cupo_ventana','budget_tokens_dia']
+    .forEach(k => { const e = $(`f_${id}_${k}`); if(e) b[k] = e.value; });
+  S.tareas.forEach(t => { const e = $(`w_${id}_${t}`); if(e) b.weights[t] = e.value; });
+  const r = await P('/api/profile', b);
+  if(r.ok){ toast('ajustes guardados', 1); cargar(); }
+}
+async function borrar(id){
+  if(!confirm(`¿Eliminar "${id}" del registro?\n\nLas credenciales quedan en disco; no se borran.`)) return;
+  const r = await P('/api/delete', {id});
+  if(r.ok){ toast('cuenta eliminada del registro', 1); cargar(); }
+}
+async function agregar(){
+  const b = {id:$('n_id').value.trim(), provider:$('n_prov').value, plan:$('n_plan').value,
+    proposito:$('n_prop').value, label:$('n_lab').value,
+    ventana:parseFloat($('n_vent').value)||5, cupo:parseInt($('n_cupo').value)||0};
+  if(!b.id){ toast('falta el id'); return; }
+  const r = await P('/api/account', b);
+  if(r.login){
+    $('n_out').innerHTML = `<label style="margin-top:14px">creada — autentícala (clic para copiar)</label>
+      <code onclick="copiar(this)">${esc(r.login)}</code>`;
+    toast('cuenta creada', 1); $('n_id').value = ''; cargar();
+  }
+}
+
+/* ---- consola ---- */
+function modoCambio(){
+  const m = $('q_modo').value;
+  $('q_perfil').disabled = (m !== 'ask');
+  $('q_hint').textContent = m === 'audit'
+    ? 'responden todas y luego se auditan entre sí (gasta de cada cuenta)'
+    : m === 'fan' ? 'misma pregunta a todas las cuentas activas, en paralelo'
+    : 'el router elige la mejor cuenta según tarea y cupo';
+}
+$('q').addEventListener('keydown', e => {
+  if((e.ctrlKey || e.metaKey) && e.key === 'Enter') correr();
+});
+
+async function correr(){
+  const prompt = $('q').value.trim();
+  if(!prompt){ toast('escribe algo primero'); return; }
+  $('q_run').disabled = true;
+  $('q_res_sec').hidden = false;
+  $('q_res').innerHTML = '<p class="mut"><span class="spin"></span> encolando…</p>';
+  const r = await P('/api/run', {prompt, tarea:$('q_tarea').value, modo:$('q_modo').value,
+    perfil:$('q_perfil').value || null, timeout:parseInt($('q_to').value) || 300});
+  if(!r.job){ $('q_run').disabled = false; $('q_res').innerHTML = '<p class="mut">no se pudo iniciar</p>'; return; }
+  JOB = r.job;
+  clearInterval(TICK);
+  TICK = setInterval(poll, 1500);
+  poll();
+}
+
+async function poll(){
+  if(!JOB) return;
+  let j;
+  try{ j = await (await fetch('/api/job/' + JOB)).json(); }catch(e){ return; }
+  pintaJob(j);
+  if(j.estado === 'listo' || j.estado === 'error'){
+    clearInterval(TICK); TICK = null; JOB = null;
+    $('q_run').disabled = false;
+    if(j.estado === 'listo') toast(`listo · ${nf(j.total)} tokens`, 1);
+    cargar();
+  }
+}
+
+function bloque(r, esAud){
+  const err = r.rc !== 0;
+  return `<div class="res"><div class="rh${esAud ? ' aud' : ''}">
+      <b>${esAud ? 'auditoría por ' : ''}${esc(r.perfil)}</b>
+      <span class="mut">${nf(r.tokens)} tok · ${r.seg}s</span>
+      ${err ? '<span class="pill no">error</span>' : ''}
+      ${r.limitado ? `<span class="pill wa">límite → ${esc(r.limitado)}</span>` : ''}
+      <span style="flex:1"></span>
+      <span class="mut">nota:</span>
+      ${[0,3,5,7,8,9,10].map(n => `<button class="sm" onclick="nota('${esc(r.run_id)}',${n},this)">${n}</button>`).join('')}
+    </div><pre>${esc(r.texto || '(sin texto)')}</pre></div>`;
+}
+
+function pintaJob(j){
+  if(j.estado === 'error'){
+    $('q_res').innerHTML = `<p class="pill no" style="display:block;padding:11px">${esc(j.error)}</p>`; return;
+  }
+  let h = '';
+  if(j.estado !== 'listo'){
+    h += `<p class="mut"><span class="spin"></span> ${esc(j.fase || j.estado)}` +
+         (j.cuentas ? ` · ${esc(j.cuentas.join(', '))}` : '') + `…</p>`;
+  }
+  (j.respuestas || []).forEach(r => h += bloque(r, false));
+  (j.auditorias || []).forEach(r => h += bloque(r, true));
+  if(j.estado === 'listo'){
+    h += `<p class="mut">total de esta consulta: <b>${nf(j.total)}</b> tokens`
+       + ` · ${(j.respuestas||[]).length} respuestas`
+       + ((j.auditorias||[]).length ? ` + ${j.auditorias.length} auditorías` : '') + `</p>`;
+  }
+  $('q_res').innerHTML = h;
+}
+
+async function nota(run_id, n, btn){
+  const r = await P('/api/score', {run_id, nota:n, tarea:$('q_tarea').value});
+  if(r.ok){
+    toast(`nota ${n} guardada · promedio ${r.promedio} (n=${r.n})`, 1);
+    btn.parentElement.querySelectorAll('button.sm').forEach(b => b.disabled = true);
+    cargar();
+  }
+}
+
+modoCambio(); cargar(); setInterval(() => { if(!JOB) cargar(); }, 25000);
+</script></body></html>

@@ -1,0 +1,22 @@
+# ── NUNCA subir: credenciales y datos de cuentas ──
+accounts/
+**/.credentials.json
+**/auth.json
+**/api_key
+**/*credential*
+**/*.pem
+**/*.key
+.env
+.env.*
+
+# ── NUNCA subir: configuracion real y estado local ──
+profiles.json
+state/
+*.log
+
+# ── ruido ──
+__pycache__/
+*.pyc
+.DS_Store
+*.swp
+*.tmp

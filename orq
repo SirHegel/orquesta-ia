@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""orq — orquestador multi-cuenta de IA. Compartido entre todas las terminales."""
+import argparse, json, os, re, sys, subprocess, datetime, shutil
+from concurrent.futures import ThreadPoolExecutor
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import orqlib as L
+
+C = {"r":"\033[0m","b":"\033[1m","d":"\033[2m","g":"\033[32m","y":"\033[33m",
+     "red":"\033[31m","cy":"\033[36m","mg":"\033[35m"}
+def c(k, s): return f"{C[k]}{s}{C['r']}"
+
+RE_ANSI = re.compile(r"\033\[[0-9;]*m")
+def vw(s):  # ancho visible
+    return len(RE_ANSI.sub("", str(s)))
+def pad(s, n, der=False):
+    d = n - vw(s)
+    return (" " * d + str(s)) if der else (str(s) + " " * max(0, d))
+def tabla(cols, filas, titulo=None):
+    """cols = [(encabezado, alineacion_derecha)]"""
+    anchos = [max(vw(h), *(vw(f[i]) for f in filas)) if filas else vw(h)
+              for i, (h, _) in enumerate(cols)]
+    if titulo:
+        print("\n" + c("b", titulo))
+    print("  " + c("d", "  ".join(pad(h.upper(), anchos[i], cols[i][1])
+                                  for i, (h, _) in enumerate(cols))))
+    print("  " + c("d", "─" * (sum(anchos) + 2 * (len(cols) - 1))))
+    for f in filas:
+        print("  " + "  ".join(pad(f[i], anchos[i], cols[i][1]) for i in range(len(cols))))
+
+
+PESOS_BASE = {"code":8,"agentic":8,"reasoning":8,"review":8,
+              "writing":7,"research":7,"edicion":7,"bulk":6}
+
+# ---------- cuentas ----------
+def _pill(pid, p):
+    if not p.get("enabled", True):  return c("d", "apagada")
+    if not L.autenticado(pid, p):   return c("red", "sin autenticar")
+    b = L.bloqueado(pid)
+    if b:                           return c("y", f"limite→{b.strftime('%H:%M')}")
+    return c("g", "activa")
+
+def cmd_cuentas(a):
+    ps = L.cfg().get("profiles", {})
+    if not ps:
+        print("\n  sin cuentas.  " + c("y", "orq cuenta add <id> --provider claude") + "\n")
+        return
+    filas = []
+    for pid, p in ps.items():
+        horas = p.get("ventana_horas") or L.VENTANA_PLAN.get(p.get("plan", "desconocido"), 5)
+        gv = L.gastado_ventana(pid, horas)
+        cupo = p.get("cupo_ventana", 0)
+        vent = f"{gv:,}/{cupo:,}" if cupo else f"{gv:,}"
+        filas.append([pid, p.get("provider", ""), p.get("plan", ""), _pill(pid, p),
+                      p.get("proposito", ""), f"{L.gastado_hoy(pid):,}",
+                      vent, f"{horas:g}h"])
+    tabla([("cuenta", 0), ("prov", 0), ("plan", 0), ("estado", 0), ("proposito", 0),
+           ("hoy", 1), ("ventana", 1), ("recarga", 1)], filas, "CUENTAS")
+    faltan = [(pid, p) for pid, p in ps.items() if not L.autenticado(pid, p)]
+    if faltan:
+        print("\n  " + c("y", "PARA AUTENTICAR"))
+        for pid, p in faltan:
+            print(f"    {c('b', pid)}\n      {c('d', L.cmd_login(pid, p))}")
+    print()
+
+def cmd_cuenta_add(a):
+    with L.bloqueo():
+        cf = L.cfg(); ps = cf.setdefault("profiles", {})
+        if a.id in ps and not a.force:
+            print(c("red", f"'{a.id}' ya existe (usa --force para sobreescribir)")); sys.exit(1)
+        home = os.path.expanduser(a.home) if a.home else os.path.join(L.ACCOUNTS, a.id)
+        os.makedirs(home, exist_ok=True); os.chmod(home, 0o700)
+        ps[a.id] = {"label": a.label or f"{a.provider} · {a.id}",
+                    "provider": a.provider, "home": home,
+                    "plan": a.plan, "ventana_horas": a.ventana,
+                    "cupo_ventana": a.cupo, "proposito": a.proposito,
+                    "enabled": True, "budget_tokens_dia": a.budget,
+                    "weights": dict(PESOS_BASE)}
+        if a.model: ps[a.id]["model"] = a.model
+        if a.provider == "gemini": ps[a.id]["api_key_file"] = os.path.join(home, "api_key")
+        L.guardar_cfg(cf)
+    print(c("g", f"cuenta '{a.id}' creada") + f"  ({a.provider}, home={home})")
+    print(f"\n{c('b','Ahora autentícala corriendo esto:')}\n  {L.cmd_login(a.id, L.cfg()['profiles'][a.id])}\n")
+
+def cmd_cuenta_login(a):
+    ps = L.cfg().get("profiles", {})
+    if a.id not in ps: print(c("red","cuenta desconocida")); sys.exit(1)
+    print(f"{c('b','Corre esto en tu terminal:')}\n  {L.cmd_login(a.id, ps[a.id])}\n")
+    print(c("d","(el login es interactivo; no puedo hacerlo por ti — nunca manejo tus contraseñas)"))
+
+def cmd_cuenta_rm(a):
+    with L.bloqueo():
+        cf = L.cfg()
+        p = cf.get("profiles", {}).pop(a.id, None)
+        if not p: print(c("red","cuenta desconocida")); sys.exit(1)
+        L.guardar_cfg(cf)
+    print(c("g", f"'{a.id}' eliminada del registro"))
+    h = L.home_de(a.id, p)
+    if a.purge and h.startswith(L.ACCOUNTS):
+        shutil.rmtree(h, ignore_errors=True); print(c("y", f"credenciales borradas: {h}"))
+    else:
+        print(c("d", f"credenciales conservadas en {h} (usa --purge para borrarlas)"))
+
+def cmd_cuenta_toggle(a):
+    with L.bloqueo():
+        cf = L.cfg(); p = cf.get("profiles", {}).get(a.id)
+        if not p: print(c("red","cuenta desconocida")); sys.exit(1)
+        p["enabled"] = (a.c == "enable"); L.guardar_cfg(cf)
+    print(c("g", f"'{a.id}' {'activada' if a.c=='enable' else 'desactivada'}"))
+
+# ---------- estado / auditoria de gasto ----------
+def cmd_status(a):
+    cmd_cuentas(a)
+    rows = L.ledger_rows()
+    if not rows:
+        print("  " + c("d", "sin llamadas registradas todavia") + "\n")
+        return
+    filas = []
+    for pid in sorted({r["perfil"] for r in rows}):
+        rs = [r for r in rows if r["perfil"] == pid]
+        tk = sum(r.get("tokens", 0) for r in rs)
+        sg = sum(r.get("seg", 0) for r in rs) / max(1, len(rs))
+        filas.append([pid, f"{len(rs):,}", f"{tk:,}", f"{tk // max(1, len(rs)):,}", f"{sg:.1f}"])
+    tabla([("cuenta", 0), ("llamadas", 1), ("tokens", 1), ("tok/llam", 1), ("seg medio", 1)],
+          filas, "GASTO")
+    tot = sum(r.get("tokens", 0) for r in rows)
+    print("\n  " + c("d", f"total {tot:,} tokens en {len(rows)} llamadas"))
+    s_ = L.scores()
+    if s_:
+        fl = []
+        for pid, t in s_.items():
+            for k, v in t.items():
+                if v.get("n"):
+                    fl.append([pid, k, f"{v['suma'] / v['n']:.1f}", str(v["n"])])
+        if fl:
+            tabla([("cuenta", 0), ("tarea", 0), ("nota", 1), ("muestras", 1)],
+                  fl, "RENDIMIENTO MEDIDO")
+    print()
+
+def cmd_limites(a):
+    Lm = L.limites()
+    if a.limpiar:
+        L.limpiar_limite(a.limpiar); print(c("g", f"limite de '{a.limpiar}' borrado")); return
+    if not Lm: print(c("g","ninguna cuenta con limite activo")); return
+    print(f"\n{c('b','LIMITES DETECTADOS')}")
+    for pid, d in Lm.items():
+        b = L.bloqueado(pid)
+        est = c("red", f"bloqueada hasta {d['bloqueado_hasta']}") if b else c("g","ya liberada")
+        print(f"  {pid:<18} {est}\n    {c('d', d.get('motivo','')[:110])}")
+    print()
+
+# ---------- routing ----------
+def cmd_route(a):
+    rk = L.ranking(a.tarea, a.proposito)
+    if not rk:
+        print("\n  " + c("red", f"ninguna cuenta disponible para '{a.tarea}'"))
+        for pid in L.cfg().get("profiles", {}):
+            b = L.bloqueado(pid)
+            if b:
+                print("    " + c("y", f"{pid} bloqueada hasta {b.strftime('%H:%M')}"))
+        print()
+        return
+    filas = [[("→ " if i == 0 else "  ") + x["pid"], f"{x['pts']:.2f}", c("d", x["nota"])]
+             for i, x in enumerate(rk)]
+    t = f"DELEGACION · tarea={a.tarea}" + (f" · proposito={a.proposito}" if a.proposito else "")
+    tabla([("cuenta", 0), ("puntaje", 1), ("cupo", 0)], filas, t)
+    print("\n  " + c("d", "puntaje = peso tecnico x rendimiento medido x holgura de cupo") + "\n")
+
+def _elegir(a):
+    if a.perfil:
+        d = L.disponibles(incluir_bloqueados=True)
+        if a.perfil not in d: print(c("red", f"'{a.perfil}' no existe o no esta autenticada")); sys.exit(1)
+        return a.perfil, d[a.perfil]
+    rk = L.ranking(a.tarea, getattr(a,"proposito",None))
+    if not rk: print(c("red","ninguna cuenta disponible (¿todas con limite?)  orq limites")); sys.exit(1)
+    return rk[0]["pid"], rk[0]["p"]
+
+def cmd_ask(a):
+    pid, p = _elegir(a)
+    print(c("d", f"-> {pid} · {p.get('label',pid)}\n"))
+    r = L.correr(pid, p, a.prompt, a.tarea, a.timeout)
+    print(r["texto"])
+    extra = c("red", f" LIMITE hasta {r['limitado']}") if r["limitado"] else ""
+    pie = "[{0} | {1} tok | {2}s | run_id={3}]".format(r["perfil"], r["tokens"], r["seg"], r["run_id"])
+    print("\n" + c("d", pie) + extra)
+
+def _fan(prompt, tarea, timeout, perfiles=None):
+    d = L.disponibles()
+    if perfiles: d = {k:v for k,v in d.items() if k in perfiles}
+    if not d: print(c("red","sin cuentas disponibles")); sys.exit(1)
+    with ThreadPoolExecutor(max_workers=len(d)) as ex:
+        return list(ex.map(lambda kv: L.correr(kv[0], kv[1], prompt, tarea, timeout), d.items()))
+
+def cmd_fan(a):
+    for r in _fan(a.prompt, a.tarea, a.timeout, a.perfiles):
+        print(c("cy", f"{'='*70}\n{r['perfil']}  ({r['tokens']} tok · {r['seg']}s · {r['run_id']})\n{'='*70}"))
+        print(r["texto"], "\n")
+
+def cmd_audit(a):
+    d = L.disponibles()
+    if len(d) < 2:
+        print(c("red", f"se necesitan >=2 cuentas activas. Hay: {list(d)}")); sys.exit(1)
+    print(c("b", f"FASE 1 · respuestas en paralelo ({', '.join(d)})\n"))
+    res = _fan(a.prompt, a.tarea, a.timeout, list(d))
+    for r in res:
+        print(c("cy", f"--- {r['perfil']} ({r['tokens']} tok · {r['seg']}s) ---"))
+        print((r["texto"] or "")[:1800], "\n")
+    print(c("b","FASE 2 · auditoria cruzada\n"))
+    trab = []
+    for aud in res:
+        otros = [x for x in res if x["perfil"]!=aud["perfil"] and x["texto"]]
+        if not otros: continue
+        bloques = "\n\n".join(f"### Respuesta de {o['perfil']}\n{o['texto'][:3000]}" for o in otros)
+        pa = (f"Eres auditor tecnico. Pregunta original:\n{a.prompt}\n\n{bloques}\n\n"
+              "Para CADA respuesta ajena indica: (1) errores factuales concretos, "
+              "(2) omisiones importantes, (3) nota de 0 a 10. Breve y directo.")
+        trab.append((aud["perfil"], d[aud["perfil"]], pa))
+    with ThreadPoolExecutor(max_workers=max(1,len(trab))) as ex:
+        auds = list(ex.map(lambda t: L.correr(t[0], t[1], t[2], "review", a.timeout), trab))
+    for r in auds:
+        print(c("mg", f"--- auditoria por {r['perfil']} ({r['tokens']} tok) ---"))
+        print(r["texto"], "\n")
+    print(c("b", f"Gasto de esta auditoria: {sum(r['tokens'] for r in res+auds)} tokens "
+                 f"({len(res)} respuestas + {len(auds)} auditorias)"))
+
+def cmd_score(a):
+    if not 0 <= a.nota <= 10: print("nota de 0 a 10"); sys.exit(1)
+    pid = a.run_id.rsplit("-",1)[0]
+    with L.bloqueo():
+        s = L.scores(); s.setdefault(pid,{}).setdefault(a.tarea,{"suma":0,"n":0})
+        s[pid][a.tarea]["suma"] += a.nota; s[pid][a.tarea]["n"] += 1
+        L._escribir(L.SCORES, s)
+    dd = L.scores()[pid][a.tarea]
+    print(c("g","registrado") + f": {pid}/{a.tarea} promedio {round(dd['suma']/dd['n'],2)} (n={dd['n']}). El router ya pondera con esto.")
+
+def _set(a, campo, valor):
+    with L.bloqueo():
+        cf = L.cfg(); p = cf.get("profiles",{}).get(a.id)
+        if not p: print(c("red","cuenta desconocida")); sys.exit(1)
+        p[campo] = valor; L.guardar_cfg(cf)
+    print(c("g", f"{a.id}.{campo} = {valor}"))
+
+def cmd_budget(a): _set(a, "budget_tokens_dia", a.tokens)
+def cmd_cupo(a):   _set(a, "cupo_ventana", a.tokens)
+
+def cmd_web(a):
+    os.execv(sys.executable, [sys.executable, os.path.join(L.BASE,"orqweb.py"), str(a.puerto)])
+
+def main():
+    ap = argparse.ArgumentParser(prog="orq", description="Orquestador multi-cuenta de IA")
+    sub = ap.add_subparsers(dest="c", required=True)
+    sub.add_parser("status", help="cuentas + gasto + rendimiento").set_defaults(f=cmd_status)
+    sub.add_parser("cuentas", help="lista de cuentas y su estado").set_defaults(f=cmd_cuentas)
+
+    cu = sub.add_parser("cuenta", help="gestionar cuentas"); cs = cu.add_subparsers(dest="sc", required=True)
+    ad = cs.add_parser("add", help="registrar una cuenta nueva")
+    ad.add_argument("id"); ad.add_argument("--provider", required=True, choices=["claude","gpt","gemini"])
+    ad.add_argument("--label"); ad.add_argument("--home"); ad.add_argument("--model")
+    ad.add_argument("--plan", default="pro"); ad.add_argument("--proposito", default="general")
+    ad.add_argument("--ventana", type=float, default=5); ad.add_argument("--cupo", type=int, default=0)
+    ad.add_argument("--budget", type=int, default=0); ad.add_argument("--force", action="store_true")
+    ad.set_defaults(f=cmd_cuenta_add)
+    lo = cs.add_parser("login", help="muestra el comando de login"); lo.add_argument("id"); lo.set_defaults(f=cmd_cuenta_login)
+    rm = cs.add_parser("rm"); rm.add_argument("id"); rm.add_argument("--purge", action="store_true"); rm.set_defaults(f=cmd_cuenta_rm)
+    for k in ("enable","disable"):
+        t = cs.add_parser(k); t.add_argument("id"); t.set_defaults(f=cmd_cuenta_toggle, c=k)
+
+    r = sub.add_parser("route", help="a quien delegaria (no gasta tokens)")
+    r.add_argument("tarea", choices=L.TAREAS); r.add_argument("--proposito"); r.set_defaults(f=cmd_route)
+
+    k = sub.add_parser("ask", help="delega a la mejor cuenta")
+    k.add_argument("prompt"); k.add_argument("--tarea", choices=L.TAREAS, default="reasoning")
+    k.add_argument("--perfil"); k.add_argument("--proposito"); k.add_argument("--timeout", type=int, default=300)
+    k.set_defaults(f=cmd_ask)
+
+    fa = sub.add_parser("fan", help="misma pregunta a varias cuentas a la vez")
+    fa.add_argument("prompt"); fa.add_argument("--perfiles", nargs="*"); fa.add_argument("--tarea", choices=L.TAREAS, default="reasoning")
+    fa.add_argument("--timeout", type=int, default=300); fa.set_defaults(f=cmd_fan)
+
+    au = sub.add_parser("audit", help="responden y se auditan entre ellos")
+    au.add_argument("prompt"); au.add_argument("--tarea", choices=L.TAREAS, default="reasoning")
+    au.add_argument("--timeout", type=int, default=300); au.set_defaults(f=cmd_audit)
+
+    sc = sub.add_parser("score", help="califica un run para entrenar el router")
+    sc.add_argument("run_id"); sc.add_argument("nota", type=float)
+    sc.add_argument("--tarea", choices=L.TAREAS, default="reasoning"); sc.set_defaults(f=cmd_score)
+
+    bu = sub.add_parser("budget", help="tope de tokens por dia"); bu.add_argument("id"); bu.add_argument("tokens", type=int); bu.set_defaults(f=cmd_budget)
+    cp = sub.add_parser("cupo", help="tope de tokens por ventana de recarga"); cp.add_argument("id"); cp.add_argument("tokens", type=int); cp.set_defaults(f=cmd_cupo)
+    li = sub.add_parser("limites", help="cuentas con limite de uso activo"); li.add_argument("--limpiar"); li.set_defaults(f=cmd_limites)
+    we = sub.add_parser("web", help="interfaz local de control"); we.add_argument("--puerto", type=int, default=8787); we.set_defaults(f=cmd_web)
+
+    a = ap.parse_args(); a.f(a)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Panel de control local del orquestador multi-cuenta. Solo 127.0.0.1."""
+import json, os, sys, uuid, threading, webbrowser, traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+from concurrent.futures import ThreadPoolExecutor
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import orqlib as L
+
+PUERTO = int(sys.argv[1]) if len(sys.argv) > 1 else 8787
+JOBS, JLOCK = {}, threading.Lock()
+HTML_PATH = os.path.join(L.BASE, "web", "index.html")
+
+
+# ---------------- estado ----------------
+def estado(tarea="code"):
+    cf = L.cfg().get("profiles", {})
+    rows = L.ledger_rows()
+    cuentas = []
+    for pid, p in cf.items():
+        b = L.bloqueado(pid)
+        horas = p.get("ventana_horas") or L.VENTANA_PLAN.get(p.get("plan", "desconocido"), 5)
+        cuentas.append({
+            "id": pid, "label": p.get("label", pid), "provider": p.get("provider"),
+            "plan": p.get("plan"), "proposito": p.get("proposito"),
+            "enabled": p.get("enabled", True), "auth": L.autenticado(pid, p),
+            "bloqueada": b.strftime("%H:%M") if b else None,
+            "hoy": L.gastado_hoy(pid), "ventana": L.gastado_ventana(pid, horas),
+            "cupo": p.get("cupo_ventana", 0), "budget": p.get("budget_tokens_dia", 0),
+            "horas": horas, "model": p.get("model", ""),
+            "weights": p.get("weights", {}), "login": L.cmd_login(pid, p),
+        })
+    gasto = []
+    for pid in sorted({r["perfil"] for r in rows}):
+        rs = [r for r in rows if r["perfil"] == pid]
+        tk = sum(r.get("tokens", 0) for r in rs)
+        gasto.append({"pid": pid, "n": len(rs), "tokens": tk,
+                      "por": tk // max(1, len(rs)),
+                      "seg": round(sum(r.get("seg", 0) for r in rs) / max(1, len(rs)), 1)})
+    sc = {}
+    for pid, t in L.scores().items():
+        sc[pid] = {k: round(v["suma"] / v["n"], 2) for k, v in t.items() if v.get("n")}
+    return {"cuentas": cuentas, "gasto": gasto, "scores": sc, "tareas": L.TAREAS,
+            "ranking": [{"pid": x["pid"], "pts": round(x["pts"], 2), "nota": x["nota"]}
+                        for x in L.ranking(tarea)],
+            "recientes": rows[-25:][::-1],
+            "total_tokens": sum(r.get("tokens", 0) for r in rows), "total_llamadas": len(rows)}
+
+
+# ---------------- trabajos asincronos ----------------
+def _job_set(jid, **kw):
+    with JLOCK:
+        JOBS.setdefault(jid, {}).update(kw)
+
+
+def ejecutar_job(jid, prompt, tarea, modo, perfil, timeout):
+    try:
+        disp = L.disponibles()
+        if modo == "ask":
+            if perfil:
+                todos = L.disponibles(incluir_bloqueados=True)
+                if perfil not in todos:
+                    return _job_set(jid, estado="error", error=f"'{perfil}' no disponible")
+                objetivo = {perfil: todos[perfil]}
+            else:
+                rk = L.ranking(tarea)
+                if not rk:
+                    return _job_set(jid, estado="error", error="ninguna cuenta disponible")
+                objetivo = {rk[0]["pid"]: rk[0]["p"]}
+        else:
+            objetivo = dict(disp)
+            if not objetivo:
+                return _job_set(jid, estado="error", error="ninguna cuenta disponible")
+            if modo == "audit" and len(objetivo) < 2:
+                return _job_set(jid, estado="error",
+                                error=f"la auditoria cruzada necesita 2+ cuentas activas (hay {len(objetivo)})")
+        _job_set(jid, estado="corriendo", fase="respuestas", cuentas=list(objetivo))
+        with ThreadPoolExecutor(max_workers=len(objetivo)) as ex:
+            res = list(ex.map(lambda kv: L.correr(kv[0], kv[1], prompt, tarea, timeout),
+                              objetivo.items()))
+        _job_set(jid, respuestas=res)
+        if modo != "audit":
+            return _job_set(jid, estado="listo", auditorias=[],
+                            total=sum(r["tokens"] for r in res))
+        _job_set(jid, fase="auditoria")
+        trab = []
+        for aud in res:
+            otros = [x for x in res if x["perfil"] != aud["perfil"] and x["texto"]]
+            if not otros:
+                continue
+            bloques = "\n\n".join(f"### Respuesta de {o['perfil']}\n{o['texto'][:3000]}" for o in otros)
+            pa = (f"Eres auditor tecnico. Pregunta original:\n{prompt}\n\n{bloques}\n\n"
+                  "Para CADA respuesta ajena indica: (1) errores factuales concretos, "
+                  "(2) omisiones importantes, (3) nota de 0 a 10. Breve y directo.")
+            trab.append((aud["perfil"], objetivo[aud["perfil"]], pa))
+        with ThreadPoolExecutor(max_workers=max(1, len(trab))) as ex:
+            auds = list(ex.map(lambda t: L.correr(t[0], t[1], t[2], "review", timeout), trab))
+        _job_set(jid, estado="listo", auditorias=auds,
+                 total=sum(r["tokens"] for r in res + auds))
+    except Exception as e:
+        _job_set(jid, estado="error", error=f"{e}\n{traceback.format_exc()[-500:]}")
+
+
+# ---------------- servidor ----------------
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _send(self, code, body, ctype="application/json"):
+        b = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("Content-Length", str(len(b)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(b)
+
+    def _j(self, code, obj):
+        self._send(code, json.dumps(obj, ensure_ascii=False, default=str))
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        if u.path == "/api/state":
+            t = (parse_qs(u.query).get("tarea") or ["code"])[0]
+            return self._j(200, estado(t if t in L.TAREAS else "code"))
+        if u.path.startswith("/api/job/"):
+            jid = u.path.rsplit("/", 1)[-1]
+            with JLOCK:
+                j = JOBS.get(jid)
+            return self._j(200, j) if j else self._j(404, {"error": "job desconocido"})
+        if u.path in ("/", "/index.html"):
+            try:
+                with open(HTML_PATH, "rb") as f:
+                    return self._send(200, f.read(), "text/html")
+            except FileNotFoundError:
+                return self._send(500, "falta web/index.html", "text/plain")
+        self._j(404, {"error": "no encontrado"})
+
+    def do_POST(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            d = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            return self._j(400, {"error": "json invalido"})
+        try:
+            return self._ruta(d)
+        except Exception as e:
+            return self._j(500, {"error": str(e)})
+
+    def _ruta(self, d):
+        p = urlparse(self.path).path
+        if p == "/api/account":
+            pid = (d.get("id") or "").strip()
+            if not pid or "/" in pid or pid.startswith("."):
+                return self._j(400, {"error": "id invalido"})
+            prov = d.get("provider")
+            if prov not in ("claude", "gpt", "gemini"):
+                return self._j(400, {"error": "proveedor invalido"})
+            with L.bloqueo():
+                cf = L.cfg(); ps = cf.setdefault("profiles", {})
+                if pid in ps:
+                    return self._j(400, {"error": f"'{pid}' ya existe"})
+                home = os.path.join(L.ACCOUNTS, pid)
+                os.makedirs(home, exist_ok=True); os.chmod(home, 0o700)
+                ps[pid] = {"label": d.get("label") or f"{prov} · {pid}", "provider": prov,
+                           "home": home, "plan": d.get("plan", "pro"),
+                           "ventana_horas": float(d.get("ventana") or 5),
+                           "cupo_ventana": int(d.get("cupo") or 0),
+                           "proposito": d.get("proposito", "general"), "enabled": True,
+                           "budget_tokens_dia": int(d.get("budget") or 0),
+                           "weights": {t: 7 for t in L.TAREAS}}
+                if prov == "gemini":
+                    ps[pid]["api_key_file"] = os.path.join(home, "api_key")
+                L.guardar_cfg(cf)
+            return self._j(200, {"ok": True, "login": L.cmd_login(pid, L.cfg()["profiles"][pid])})
+
+        if p == "/api/profile":
+            with L.bloqueo():
+                cf = L.cfg(); pr = cf.get("profiles", {}).get(d.get("id"))
+                if not pr:
+                    return self._j(404, {"error": "no existe"})
+                for k, cast in (("label", str), ("plan", str), ("proposito", str),
+                                ("model", str), ("ventana_horas", float),
+                                ("cupo_ventana", int), ("budget_tokens_dia", int),
+                                ("enabled", bool)):
+                    if k in d:
+                        try:
+                            pr[k] = cast(d[k])
+                        except (TypeError, ValueError):
+                            return self._j(400, {"error": f"valor invalido en {k}"})
+                if "weights" in d and isinstance(d["weights"], dict):
+                    w = pr.setdefault("weights", {})
+                    for t, v in d["weights"].items():
+                        if t in L.TAREAS:
+                            try:
+                                w[t] = max(0, min(10, float(v)))
+                            except (TypeError, ValueError):
+                                pass
+                L.guardar_cfg(cf)
+            return self._j(200, {"ok": True})
+
+        if p == "/api/delete":
+            pid = d.get("id")
+            with L.bloqueo():
+                cf = L.cfg()
+                pr = cf.get("profiles", {}).pop(pid, None)
+                if not pr:
+                    return self._j(404, {"error": "no existe"})
+                L.guardar_cfg(cf)
+            return self._j(200, {"ok": True, "home": L.home_de(pid, pr)})
+
+        if p == "/api/limite":
+            L.limpiar_limite(d.get("id"))
+            return self._j(200, {"ok": True})
+
+        if p == "/api/score":
+            rid = d.get("run_id", "")
+            pid = rid.rsplit("-", 1)[0]
+            tarea = d.get("tarea", "reasoning")
+            try:
+                nota = float(d.get("nota"))
+            except (TypeError, ValueError):
+                return self._j(400, {"error": "nota invalida"})
+            if not (0 <= nota <= 10) or tarea not in L.TAREAS:
+                return self._j(400, {"error": "nota 0-10 y tarea valida"})
+            with L.bloqueo():
+                s = L.scores(); s.setdefault(pid, {}).setdefault(tarea, {"suma": 0, "n": 0})
+                s[pid][tarea]["suma"] += nota; s[pid][tarea]["n"] += 1
+                L._escribir(L.SCORES, s)
+            e = L.scores()[pid][tarea]
+            return self._j(200, {"ok": True, "promedio": round(e["suma"] / e["n"], 2), "n": e["n"]})
+
+        if p == "/api/run":
+            prompt = (d.get("prompt") or "").strip()
+            if not prompt:
+                return self._j(400, {"error": "prompt vacio"})
+            tarea = d.get("tarea", "reasoning")
+            if tarea not in L.TAREAS:
+                tarea = "reasoning"
+            modo = d.get("modo", "ask")
+            if modo not in ("ask", "fan", "audit"):
+                modo = "ask"
+            jid = uuid.uuid4().hex[:12]
+            _job_set(jid, estado="encolado", modo=modo, tarea=tarea, prompt=prompt[:300])
+            threading.Thread(target=ejecutar_job, daemon=True, args=(
+                jid, prompt, tarea, modo, d.get("perfil") or None,
+                int(d.get("timeout") or 300))).start()
+            return self._j(200, {"job": jid})
+
+        self._j(404, {"error": "no encontrado"})
+
+
+if __name__ == "__main__":
+    srv = ThreadingHTTPServer(("127.0.0.1", PUERTO), H)
+    url = f"http://127.0.0.1:{PUERTO}"
+    print(f"Panel Orquesta IA -> {url}   (Ctrl-C para parar)")
+    if "--no-abrir" not in sys.argv:
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nparado")

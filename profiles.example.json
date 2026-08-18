@@ -1,0 +1,31 @@
+{
+  "_lee_esto": "Copia este archivo a profiles.json y edítalo. profiles.json NUNCA se sube a git (está en .gitignore). Las credenciales viven en accounts/<id>/ y tampoco se suben.",
+  "profiles": {
+    "claude-personal": {
+      "label": "Claude · cuenta personal",
+      "provider": "claude",
+      "home": "~/.claude",
+      "plan": "max",
+      "ventana_horas": 5,
+      "cupo_ventana": 0,
+      "proposito": "personal",
+      "enabled": true,
+      "budget_tokens_dia": 0,
+      "weights": {"code": 10, "agentic": 10, "reasoning": 9, "review": 9,
+                  "writing": 8, "research": 7, "edicion": 9, "bulk": 4}
+    },
+    "gpt-personal": {
+      "label": "GPT · Codex CLI",
+      "provider": "gpt",
+      "home": "accounts/gpt-personal",
+      "plan": "pro",
+      "ventana_horas": 5,
+      "cupo_ventana": 0,
+      "proposito": "personal",
+      "enabled": true,
+      "budget_tokens_dia": 0,
+      "weights": {"code": 9, "agentic": 8, "reasoning": 10, "review": 9,
+                  "writing": 8, "research": 7, "edicion": 7, "bulk": 6}
+    }
+  }
+}
