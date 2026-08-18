@@ -100,7 +100,8 @@ AYUDA = f"""
    {C}/tarea <tipo>{N}   {D}{' '.join(L.TAREAS)}{N}
    {C}/imagen <desc>{N}  generar una imagen en la carpeta actual
    {C}/proyecto <desc>{N} construir un proyecto completo aqui
-   {C}/carpeta [ruta]{N} ver o cambiar la carpeta de trabajo de esta ventana
+   {C}/carpeta [ruta]{N} desde donde trabaja esta ventana (acceso al PC completo)
+   {C}/equipo{N}         que sabe del hardware y las herramientas de la maquina
    {C}/memoria{N}        ver lo que Orquesta sabe siempre
    {C}/recuerda <txt>{N} asignarle un hecho permanente
    {C}/olvida <arch>{N}  quitarlo de la memoria
@@ -220,11 +221,19 @@ def envolver(txt, sangria="   "):
 
 
 def marco_carpeta():
-    """Instruccion de alcance: trabaja solo en esta carpeta."""
-    return (f"Carpeta de trabajo: {CARPETA}\n"
-            f"Trabaja unicamente dentro de esa carpeta y sus subcarpetas. "
-            f"No leas ni modifiques nada fuera de ella salvo que el usuario "
-            f"te lo pida explicitamente en este mensaje.\n\n")
+    """Alcance: control total del equipo, con foco en la carpeta abierta."""
+    try:
+        pc = L.contexto_equipo()
+    except Exception:
+        pc = ""
+    return (
+        f"{pc}\n"
+        f"Tienes acceso completo a este equipo y permisos ya concedidos: puedes "
+        f"leer, escribir, instalar, ejecutar comandos y construir lo que haga falta "
+        f"en cualquier parte del sistema.\n"
+        f"Estas trabajando desde: {CARPETA}\n"
+        f"Empieza por ahi y deja ahi lo que construyas, salvo que el usuario "
+        f"indique otra ruta. Si la tarea requiere salir de esa carpeta, hazlo.\n\n")
 
 
 def responder(pregunta, ctx, tarea, forzado):
@@ -344,7 +353,7 @@ def principal():
                         subprocess.run(arg, shell=True)
                     print(); continue
                 if cmd in ("cuentas", "cuota", "uso", "usar", "imagen", "proyecto",
-                           "route", "verificar", "permisos"):
+                           "route", "verificar", "permisos", "equipo"):
                     sub = [os.path.join(L.BASE, "orq"), cmd]
                     if arg:
                         sub += ([arg] if cmd in ("usar", "route") else [arg, "--si"]

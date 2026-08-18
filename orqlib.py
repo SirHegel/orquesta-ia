@@ -1163,3 +1163,87 @@ def cuota(pid, p):
         if cupo:
             out["usado_pct"] = round(100 * v["facturable"] / cupo, 1)
     return out
+
+# ---------------- CONOCIMIENTO DEL EQUIPO ----------------
+# Orquesta controla la maquina entera. Esto es lo que sabe de ella siempre.
+CTX_PC = os.path.join(BASE, "state", "equipo.json")
+
+
+def _cmd(args, t=6):
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=t)
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def escanear_equipo():
+    """Radiografia de la maquina: se cachea y se refresca cada 12 h."""
+    d = {"generado": ahora().isoformat(timespec="seconds")}
+    so = {}
+    for linea in _cmd(["cat", "/etc/os-release"]).splitlines():
+        if "=" in linea:
+            k, v = linea.split("=", 1)
+            so[k] = v.strip('"')
+    d["so"] = so.get("PRETTY_NAME", "?")
+    d["kernel"] = _cmd(["uname", "-r"])
+    d["equipo"] = _cmd(["hostname"])
+    d["usuario"] = os.environ.get("USER", "")
+    d["escritorio"] = os.environ.get("XDG_CURRENT_DESKTOP", "") + " / " + \
+                      os.environ.get("XDG_SESSION_TYPE", "")
+    cpu = [l.split(":", 1)[1].strip() for l in _cmd(["lscpu"]).splitlines()
+           if l.startswith("Model name") or l.startswith("Nombre del modelo")]
+    d["cpu"] = cpu[0] if cpu else "?"
+    d["nucleos"] = _cmd(["nproc"])
+    mem = _cmd(["free", "-h"]).splitlines()
+    d["ram"] = mem[1].split()[1] if len(mem) > 1 else "?"
+    d["gpu"] = [l.split(": ", 1)[-1] for l in _cmd(["lspci"]).splitlines()
+                if "VGA" in l or "3D controller" in l]
+    disco = _cmd(["df", "-h", "/"]).splitlines()
+    d["disco"] = f"{disco[1].split()[3]} libres de {disco[1].split()[1]}" if len(disco) > 1 else "?"
+    # herramientas relevantes
+    herr = {}
+    for h in ("git", "python3", "node", "npm", "docker", "ffmpeg", "kdenlive",
+              "gh", "psql", "code", "kitty", "fastfetch", "rg", "jq"):
+        r = shutil.which(h)
+        if r:
+            herr[h] = r
+    d["herramientas"] = herr
+    # carpetas del usuario
+    home = os.path.expanduser("~")
+    d["carpetas"] = [x for x in sorted(os.listdir(home))
+                     if not x.startswith(".") and os.path.isdir(os.path.join(home, x))]
+    proyectos = os.path.join(home, "Documentos")
+    if os.path.isdir(proyectos):
+        d["documentos"] = sorted(os.listdir(proyectos))[:25]
+    with bloqueo():
+        _escribir(CTX_PC, d)
+    return d
+
+
+def equipo(max_horas=12):
+    d = _leer(CTX_PC, None)
+    if d:
+        try:
+            g = datetime.datetime.fromisoformat(d["generado"])
+            if (ahora() - g).total_seconds() < max_horas * 3600:
+                return d
+        except Exception:
+            pass
+    return escanear_equipo()
+
+
+def contexto_equipo():
+    """Texto compacto que se inyecta para que las IA conozcan la maquina."""
+    d = equipo()
+    cuentas = [f"{k} ({v.get('provider')})" for k, v in cfg().get("profiles", {}).items()
+               if autenticado(k, v) and v.get("enabled", True)]
+    return (
+        f"Equipo que controlas (acceso total, permisos concedidos):\n"
+        f"- {d.get('so')} · kernel {d.get('kernel')} · {d.get('escritorio')}\n"
+        f"- {d.get('cpu')} ({d.get('nucleos')} nucleos) · {d.get('ram')} RAM · {d.get('disco')}\n"
+        f"- GPU: {'; '.join(d.get('gpu') or []) or '?'}\n"
+        f"- Usuario {d.get('usuario')} en {d.get('equipo')}; home /home/{d.get('usuario')}\n"
+        f"- Carpetas: {', '.join(d.get('carpetas') or [])}\n"
+        f"- Herramientas: {', '.join(sorted((d.get('herramientas') or {}).keys()))}\n"
+        f"- IA conectadas por Orquesta: {', '.join(cuentas)}\n")

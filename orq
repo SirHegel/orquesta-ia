@@ -513,6 +513,24 @@ def cmd_cuota(a):
     print("  " + c("y", "estimado") + c("d", " = calculado leyendo TODAS las sesiones de esta maquina"))
     print("  " + c("d", "              (no incluye lo que uses desde el movil, la web u otro equipo)") + "\n")
 
+def cmd_equipo(a):
+    if a.refrescar:
+        L.escanear_equipo()
+    d = L.equipo()
+    print("\n  " + c("b", "EQUIPO QUE CONTROLA ORQUESTA"))
+    filas = [["sistema", d.get("so", "?")],
+             ["kernel", d.get("kernel", "?")],
+             ["escritorio", d.get("escritorio", "?")],
+             ["procesador", f"{d.get('cpu','?')} ({d.get('nucleos','?')} nucleos)"],
+             ["memoria", d.get("ram", "?")],
+             ["disco", d.get("disco", "?")],
+             ["grafica", "; ".join(d.get("gpu") or []) or "?"],
+             ["usuario", f"{d.get('usuario','?')}@{d.get('equipo','?')}"],
+             ["carpetas", ", ".join(d.get("carpetas") or [])],
+             ["herramientas", ", ".join(sorted((d.get("herramientas") or {}).keys()))]]
+    tabla([("", 0), ("", 0)], filas)
+    print("\n  " + c("d", f"escaneado {d.get('generado','?')}  ·  refresca con: orq equipo -r") + "\n")
+
 def cmd_score(a):
     if not 0 <= a.nota <= 10: print("nota de 0 a 10"); sys.exit(1)
     pid = a.run_id.rsplit("-",1)[0]
@@ -600,6 +618,9 @@ def main():
 
     pm = sub.add_parser("permisos", help="permitir que las IA ejecuten sin preguntar")
     pm.add_argument("estado", nargs="?", choices=["on", "off"]); pm.set_defaults(f=cmd_permisos)
+
+    eq = sub.add_parser("equipo", help="que sabe Orquesta de esta maquina")
+    eq.add_argument("-r", "--refrescar", action="store_true"); eq.set_defaults(f=cmd_equipo)
 
     cu = sub.add_parser("cuota", help="consumo REAL de cada cuenta, no solo el de Orquesta")
     cu.set_defaults(f=cmd_cuota)
