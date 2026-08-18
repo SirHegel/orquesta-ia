@@ -427,10 +427,24 @@ def puntuar(pid, p, tarea):
             print(f"[orq] cuota({pid}) fallo: {e!r}", file=sys.stderr)
     pct = q.get("usado_pct")
     if pct is not None and q.get("fuente") == "proveedor":
-        if pct >= 99:
-            return 0.0, f"cuota agotada ({pct:.0f}% real)"
-        factor *= max(0.15, 1 - (pct / 100) ** 1.6)
-        notas.append(f"{pct:.0f}% real de su cuota")
+        if pct >= 97:
+            return 0.0, f"cuota practicamente agotada ({pct:.0f}%)"
+        # Penalizacion proporcionada: gastar el 82% de una ventana SEMANAL que
+        # recarga manana no es lo mismo que agotar una de 5 horas.
+        castigo = 0.55 * (pct / 100) ** 1.25
+        horas_ventana = (q.get("ventana_min") or 300) / 60
+        if horas_ventana >= 24:
+            castigo *= 0.75            # ventanas largas se toleran mejor
+        try:
+            if q.get("reinicia"):
+                falta = (datetime.datetime.fromisoformat(q["reinicia"]) - ahora())
+                if falta.total_seconds() < 36 * 3600:
+                    castigo *= 0.7     # recarga inminente: casi no penalizar
+        except Exception:
+            pass
+        factor *= max(0.40, 1 - castigo)
+        notas.append(f"{pct:.0f}% de su cuota"
+                     + (f", recarga {q['reinicia'][5:16]}" if q.get("reinicia") else ""))
     elif q.get("fuente") == "local" and q.get("mensajes"):
         notas.append(f"{q['facturable']:,} tok reales en {q.get('ventana_horas',5)}h")
 
@@ -443,7 +457,16 @@ def puntuar(pid, p, tarea):
         gastos = {}
         for k, v in hermanas:
             hv = v.get("ventana_horas") or VENTANA_PLAN.get(v.get("plan", "desconocido"), 5)
-            gastos[k] = gastado_ventana(k, hv)
+            try:
+                # uso REAL (todas las sesiones), no solo lo que gasto Orquesta
+                gastos[k] = uso_real_ventana(k, v, hv)["facturable"]
+            except Exception:
+                gastos[k] = gastado_ventana(k, hv)
+            # normalizar por el plan: un Max 20x aguanta mas que un Max 5x
+            mplan = ((plan_claude(k, v) or {}).get("multiplicador", 1)
+                     if v.get("provider") == "claude" else 1)
+            if mplan > 1:
+                gastos[k] = gastos[k] / mplan
         total = sum(gastos.values())
         if total > 0:
             parte = gastos.get(pid, 0) / total          # 0 = sin usar, 1 = se lo lleva todo
