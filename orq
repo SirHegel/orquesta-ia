@@ -55,6 +55,17 @@ def cmd_cuentas(a):
                       vent, f"{horas:g}h"])
     tabla([("cuenta", 0), ("prov", 0), ("plan", 0), ("estado", 0), ("proposito", 0),
            ("hoy", 1), ("ventana", 1), ("recarga", 1)], filas, "CUENTAS")
+    ext = L.sesiones_externas()
+    if ext:
+        filas = []
+        for prov, ss in sorted(ext.items()):
+            for x in ss:
+                filas.append([prov, x["pid"], f"{x['segundos']//60} min", x["cmd"][:52]])
+        tabla([("proveedor", 0), ("pid", 1), ("activa", 1), ("comando", 0)], filas,
+              "TERMINALES TUYAS TRABAJANDO AHORA")
+        if any(prov in L.SERIALIZAR for prov in ext):
+            print("  " + c("y", "aviso") + c("d", ": esos CLIs no admiten llamadas en paralelo; "
+                  "Orquesta serializa las suyas para no chocar."))
     faltan = [(pid, p) for pid, p in ps.items() if not L.autenticado(pid, p)]
     if faltan:
         print("\n  " + c("y", "PARA AUTENTICAR"))
@@ -231,8 +242,20 @@ def _elegir(a):
 def cmd_ask(a):
     pid, p = _elegir(a)
     print(c("d", f"-> {pid} · {p.get('label',pid)}\n"))
-    r = L.correr(pid, p, a.prompt, a.tarea, a.timeout)
-    print(r["texto"])
+    prompt = a.prompt + (BREVE if getattr(a, "corto", False) else "")
+    r = L.correr(pid, p, prompt, a.tarea, a.timeout)
+    txt = r["texto"] or ""
+    lim = getattr(a, "lineas", 0)
+    if lim and txt.count("\n") + 1 > lim:
+        partes = txt.split("\n")
+        print("\n".join(partes[:lim]))
+        print(c("d", f"  … {len(partes) - lim} lineas mas. Completo en:  "
+                    f"orq ver {r['run_id']}"))
+        os.makedirs(os.path.join(L.BASE, "state", "salidas"), exist_ok=True)
+        with open(os.path.join(L.BASE, "state", "salidas", r["run_id"] + ".txt"), "w") as f:
+            f.write(txt)
+    else:
+        print(txt)
     extra = c("red", f" LIMITE hasta {r['limitado']}") if r["limitado"] else ""
     pie = "[{0} | {1} tok | {2}s | run_id={3}]".format(r["perfil"], r["tokens"], r["seg"], r["run_id"])
     print("\n" + c("d", pie) + extra)
@@ -301,6 +324,89 @@ def cmd_verificar(a):
           filas, "VERIFICACION REAL")
     print()
 
+def _barra(v, maxv, ancho=22):
+    if not maxv:
+        return ""
+    n = max(1, round(ancho * v / maxv)) if v else 0
+    return c("red", "█" * n) + c("d", "·" * (ancho - n))
+
+def cmd_uso(a):
+    R = L.resumen_uso()
+    print("\n  " + c("b", "RESUMEN DE USO"))
+    filas = [["hoy", f"{R['hoy']['tokens']:,}", f"{R['hoy']['llamadas']:,}"],
+             ["esta semana", f"{R['semana']['tokens']:,}", f"{R['semana']['llamadas']:,}"],
+             ["este mes", f"{R['mes']['tokens']:,}", f"{R['mes']['llamadas']:,}"],
+             ["histórico", f"{R['total']['tokens']:,}", f"{R['total']['llamadas']:,}"]]
+    tabla([("periodo", 0), ("tokens", 1), ("llamadas", 1)], filas)
+    if R.get("sesiones_mes"):
+        print("  " + c("d", f"{R['sesiones_mes']} sesiones de terminal distintas este mes"))
+
+    datos = L.uso(a.periodo, a.por, a.n)
+    if not datos:
+        print("\n  " + c("d", "sin datos para ese periodo") + "\n"); return
+    etq = {"dia": "DIA", "semana": "SEMANA", "mes": "MES", "todo": "TOTAL"}[a.periodo]
+    for per in sorted(datos, reverse=True):
+        g = datos[per]
+        maxv = max((v["tokens"] for v in g.values()), default=0)
+        total = sum(v["tokens"] for v in g.values())
+        filas = []
+        for k, v in sorted(g.items(), key=lambda x: -x[1]["tokens"]):
+            pct = (100 * v["tokens"] / total) if total else 0
+            nom = k if a.por != "sesion" else (k[:17] + ("·" + v["term"] if v["term"] else ""))
+            filas.append([nom, f"{v['tokens']:,}", f"{pct:4.1f}%",
+                          _barra(v["tokens"], maxv), f"{v['llamadas']:,}",
+                          c("red", str(v["errores"])) if v["errores"] else c("d", "0")])
+        tabla([(a.por, 0), ("tokens", 1), ("%", 1), ("", 0), ("llam", 1), ("err", 1)],
+              filas, f"{etq} {per}   ·   {total:,} tokens")
+    print()
+
+BREVE = ("\n\nResponde de forma compacta: ve al grano, sin preambulos ni resumen final. "
+         "Usa listas cortas en vez de parrafos. Maximo ~12 lineas.")
+
+def cmd_imagen(a):
+    rk = L.ranking("imagen")
+    if a.perfil:
+        d = L.disponibles(incluir_bloqueados=True)
+        if a.perfil not in d:
+            print(c("red", f"'{a.perfil}' no disponible")); sys.exit(1)
+        pid, p = a.perfil, d[a.perfil]
+    elif rk:
+        pid, p = rk[0]["pid"], rk[0]["p"]
+    else:
+        print("\n  " + c("red", "ninguna cuenta sabe generar imagenes"))
+        print("  " + c("d", "hoy solo el proveedor 'antigravity' puede") + "\n"); sys.exit(1)
+    destino = os.path.abspath(os.path.expanduser(a.en or os.getcwd()))
+    print(c("d", f"-> {pid} · generando en {destino}\n"))
+    nombre = a.nombre or "imagen"
+    ruta = os.path.join(destino, f"{nombre}.png")
+    prompt = (
+        f"{a.prompt}\n\n"
+        f"DESPUES de generarla es OBLIGATORIO que uses la terminal para copiar "
+        f"el archivo resultante a esta ruta exacta: {ruta}\n"
+        f"Verifica con 'ls -la {destino}/' que el archivo existe y muestra esa salida. "
+        f"No afirmes que guardaste nada sin haberlo comprobado con ls. "
+        f"Responde en una sola linea.")
+    r = L.generar_imagen(pid, p, prompt, destino, a.timeout)
+    if r["archivos"]:
+        print("  " + c("g", "imagen generada"))
+        for f in r["archivos"]:
+            try:
+                tam = os.path.getsize(f)
+                print(f"    {f}  {c('d', f'({tam//1024} KB)')}")
+            except OSError:
+                print(f"    {f}")
+    else:
+        print("  " + c("y", "no encontre archivo de imagen nuevo"))
+        print("  " + c("d", (r["texto"] or "")[:220]))
+    pie = "[{0} | {1} tok | {2}s | run_id={3}]".format(pid, r["tokens"], r["seg"], r["run_id"])
+    print("\n  " + c("d", pie) + "\n")
+
+def cmd_ver(a):
+    f = os.path.join(L.BASE, "state", "salidas", a.run_id + ".txt")
+    if not os.path.exists(f):
+        print(c("red", "no hay salida guardada para ese run_id")); sys.exit(1)
+    print(open(f).read())
+
 def cmd_score(a):
     if not 0 <= a.nota <= 10: print("nota de 0 a 10"); sys.exit(1)
     pid = a.run_id.rsplit("-",1)[0]
@@ -355,7 +461,18 @@ def main():
     k = sub.add_parser("ask", help="delega a la mejor cuenta")
     k.add_argument("prompt"); k.add_argument("--tarea", choices=L.TAREAS, default="reasoning")
     k.add_argument("--perfil"); k.add_argument("--proposito"); k.add_argument("--timeout", type=int, default=300)
+    k.add_argument("--corto", action="store_true", help="pide respuesta compacta")
+    k.add_argument("--lineas", type=int, default=0, help="corta la salida a N lineas")
     k.set_defaults(f=cmd_ask)
+
+    im = sub.add_parser("imagen", help="generar una imagen o diseno")
+    im.add_argument("prompt"); im.add_argument("--en", help="carpeta destino (por defecto, la actual)")
+    im.add_argument("--nombre", help="nombre del archivo, sin extension")
+    im.add_argument("--perfil"); im.add_argument("--timeout", type=int, default=420)
+    im.set_defaults(f=cmd_imagen)
+
+    vr = sub.add_parser("ver", help="ver completa una salida recortada")
+    vr.add_argument("run_id"); vr.set_defaults(f=cmd_ver)
 
     fa = sub.add_parser("fan", help="misma pregunta a varias cuentas a la vez")
     fa.add_argument("prompt"); fa.add_argument("--perfiles", nargs="*"); fa.add_argument("--tarea", choices=L.TAREAS, default="reasoning")
@@ -364,6 +481,12 @@ def main():
     au = sub.add_parser("audit", help="responden y se auditan entre ellos")
     au.add_argument("prompt"); au.add_argument("--tarea", choices=L.TAREAS, default="reasoning")
     au.add_argument("--timeout", type=int, default=300); au.set_defaults(f=cmd_audit)
+
+    uz = sub.add_parser("uso", help="informe de consumo por dia / semana / mes / sesion")
+    uz.add_argument("--periodo", choices=["dia", "semana", "mes", "todo"], default="mes")
+    uz.add_argument("--por", choices=["perfil", "tarea", "sesion", "provider"], default="perfil")
+    uz.add_argument("-n", type=int, default=3, help="cuantos periodos mostrar")
+    uz.set_defaults(f=cmd_uso)
 
     ve = sub.add_parser("verificar", help="llama de verdad a cada cuenta y dice cual responde")
     ve.add_argument("--id"); ve.add_argument("--timeout", type=int, default=120)

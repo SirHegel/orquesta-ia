@@ -556,19 +556,69 @@ async function nota(run_id,n,btn){
 }
 
 /* ═══ USO ═══ */
+function kpi(t,v,sub){return `<div class="card" style="padding:14px;animation:none">
+ <div class="stl">${esc(t)}</div><div class="stv" style="font-size:22px;margin-top:2px">${nf(v)}</div>
+ ${sub?`<div class="hint" style="margin-top:2px">${esc(sub)}</div>`:''}</div>`}
+
+function tablaUso(titulo,datos,etiqueta){
+ const per=Object.keys(datos||{}).sort().reverse();
+ if(!per.length) return '';
+ let h=`<div class="sec"><div class="sh"><h2>${esc(titulo)}</h2></div>`;
+ per.forEach(pp=>{
+  const g=datos[pp], ks=Object.keys(g).sort((a,b)=>g[b].tokens-g[a].tokens);
+  const tot=ks.reduce((s,k)=>s+g[k].tokens,0), mx=ks.length?g[ks[0]].tokens:0;
+  h+=`<div class="tw" style="margin-bottom:11px"><table>
+   <thead><tr><th>${esc(etiqueta)} · ${esc(pp)}</th><th class="num">Tokens</th>
+   <th class="num">%</th><th style="width:34%">Reparto</th>
+   <th class="num">Llam.</th></tr></thead><tbody>`;
+  ks.forEach(k=>{const v=g[k], pct=tot?100*v.tokens/tot:0;
+   h+=`<tr><td>${esc(k)}${v.term?` <span style="color:var(--tx3)">·${esc(v.term)}</span>`:''}</td>
+    <td class="num">${nf(v.tokens)}</td><td class="num">${pct.toFixed(1)}%</td>
+    <td><div class="bar" style="margin:0"><i style="width:${mx?100*v.tokens/mx:0}%"></i></div></td>
+    <td class="num">${nf(v.llamadas)}${v.errores?` <span style="color:var(--ac2)">${v.errores}✗</span>`:''}</td></tr>`});
+  h+=`</tbody><tfoot><tr><td style="color:var(--tx2)">total</td>
+   <td class="num"><b>${nf(tot)}</b></td><td colspan="3"></td></tr></tfoot></table></div>`;
+ });
+ return h+`</div>`;
+}
+
 function vistaUso(){
- if(!S.total_llamadas){
-  $('c-uso').innerHTML=`<div class="empty"><div class="ei">◎</div>
-   <h3>Sin actividad todavía</h3><p>Cuando hagas consultas aparecerá aquí el gasto de cada cuenta.</p></div>`;
-  return;
+ const R=S.resumen_uso||{};
+ let h='';
+
+ const act=S.sesiones_activas||{};
+ const nact=Object.values(act).reduce((s,a)=>s+a.length,0);
+ if(nact){
+  h+=`<div class="sec"><div class="sh"><h2>Trabajando ahora</h2>
+   <span class="sd">terminales tuyas con una sesión abierta</span></div>
+   <div class="tw"><table><thead><tr><th>Proveedor</th><th class="num">PID</th>
+   <th class="num">Activa</th><th>Comando</th></tr></thead><tbody>`;
+  Object.entries(act).forEach(([prov,ss])=>ss.forEach(x=>{
+   h+=`<tr><td><span class="dot on" style="display:inline-block;margin-right:7px"></span>${esc(PROV[prov]||prov)}</td>
+    <td class="num">${esc(x.pid)}</td><td class="num">${Math.floor(x.segundos/60)} min</td>
+    <td style="color:var(--tx2)" class="mono">${esc(x.cmd)}</td></tr>`}));
+  h+=`</tbody></table></div>
+   <p class="hint" style="margin-top:8px">Estos CLIs no admiten llamadas en paralelo.
+   Orquesta serializa las suyas para no chocar con tu trabajo.</p></div>`;
  }
- let h=`<div class="sec"><div class="sh"><h2>Gasto por cuenta</h2></div><div class="tw"><table>
-  <thead><tr><th>Cuenta</th><th class="num">Llamadas</th><th class="num">Tokens</th>
-  <th class="num">Por llamada</th><th class="num">Segundos</th></tr></thead><tbody>`;
- S.gasto.forEach(g=>h+=`<tr><td><b>${esc(g.pid)}</b></td><td class="num">${nf(g.n)}</td>
-   <td class="num">${nf(g.tokens)}</td><td class="num">${nf(g.por)}</td>
-   <td class="num">${g.seg}</td></tr>`);
- h+=`</tbody></table></div></div>`;
+
+ if(!S.total_llamadas){
+  h+=`<div class="empty"><div class="ei">◎</div><h3>Sin consumo registrado</h3>
+   <p>Cuando delegues consultas verás aquí el gasto por día, semana, mes y sesión.</p></div>`;
+  $('c-uso').innerHTML=h; return;
+ }
+
+ h+=`<div class="sec"><div class="sh"><h2>Consumo</h2></div>
+  <div class="cards" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
+  ${kpi('Hoy',(R.hoy||{}).tokens,`${nf((R.hoy||{}).llamadas)} llamadas`)}
+  ${kpi('Esta semana',(R.semana||{}).tokens,`${nf((R.semana||{}).llamadas)} llamadas`)}
+  ${kpi('Este mes',(R.mes||{}).tokens,`${nf((R.mes||{}).llamadas)} llamadas`)}
+  ${kpi('Histórico',(R.total||{}).tokens,`${nf(R.sesiones_mes||0)} sesiones este mes`)}
+  </div></div>`;
+
+ h+=tablaUso('Por semana',S.uso_semana,'Cuenta');
+ h+=tablaUso('Por mes',S.uso_mes,'Cuenta');
+ h+=tablaUso('Por sesión de terminal',S.uso_sesion,'Sesión');
 
  if(S.ranking&&S.ranking.length){
   h+=`<div class="sec"><div class="sh"><h2>A quién delega</h2>
@@ -580,16 +630,6 @@ function vistaUso(){
    <td>${i===0?'<b>'+esc(r.pid)+'</b>':esc(r.pid)}</td>
    <td class="num">${r.pts.toFixed(2)}</td>
    <td style="color:var(--tx2)">${esc(r.nota)}</td></tr>`);
-  h+=`</tbody></table></div></div>`;
- }
-
- if(S.recientes&&S.recientes.length){
-  h+=`<div class="sec"><div class="sh"><h2>Últimas llamadas</h2></div><div class="tw"><table>
-   <thead><tr><th>Hora</th><th>Cuenta</th><th>Tarea</th><th class="num">Tokens</th>
-   <th class="num">Seg</th></tr></thead><tbody>`;
-  S.recientes.slice(0,14).forEach(r=>h+=`<tr><td style="color:var(--tx2)">${esc((r.ts||'').slice(11,19))}</td>
-   <td>${esc(r.perfil)}</td><td style="color:var(--tx2)">${esc(r.tarea||'')}</td>
-   <td class="num">${nf(r.tokens)}</td><td class="num">${r.seg}</td></tr>`);
   h+=`</tbody></table></div></div>`;
  }
  $('c-uso').innerHTML=h;

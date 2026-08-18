@@ -44,6 +44,11 @@ def estado(tarea="code"):
     return {"cuentas": cuentas, "gasto": gasto, "scores": sc, "tareas": L.TAREAS,
             "navegadores": L.navegadores(), "terminal": L.terminal_disponible()[0],
             "activas": L.activas(),
+            "resumen_uso": L.resumen_uso(),
+            "uso_semana": L.uso("semana", "perfil", 4),
+            "uso_mes": L.uso("mes", "perfil", 3),
+            "uso_sesion": L.uso("mes", "sesion", 1),
+            "sesiones_activas": L.sesiones_externas(),
             "ranking": [{"pid": x["pid"], "pts": round(x["pts"], 2), "nota": x["nota"]}
                         for x in L.ranking(tarea)],
             "recientes": rows[-25:][::-1],
