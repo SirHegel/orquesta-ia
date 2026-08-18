@@ -533,6 +533,9 @@ def _set(a, campo, valor):
 def cmd_budget(a): _set(a, "budget_tokens_dia", a.tokens)
 def cmd_cupo(a):   _set(a, "cupo_ventana", a.tokens)
 
+def cmd_chat(a):
+    os.execv(sys.executable, [sys.executable, os.path.join(L.BASE, "orqchat.py")])
+
 def cmd_web(a):
     os.execv(sys.executable, [sys.executable, os.path.join(L.BASE,"orqweb.py"), str(a.puerto)])
 
@@ -618,6 +621,8 @@ def main():
     bu = sub.add_parser("budget", help="tope de tokens por dia"); bu.add_argument("id"); bu.add_argument("tokens", type=int); bu.set_defaults(f=cmd_budget)
     cp = sub.add_parser("cupo", help="tope de tokens por ventana de recarga"); cp.add_argument("id"); cp.add_argument("tokens", type=int); cp.set_defaults(f=cmd_cupo)
     li = sub.add_parser("limites", help="cuentas con limite de uso activo"); li.add_argument("--limpiar"); li.set_defaults(f=cmd_limites)
+    ch = sub.add_parser("chat", help="interfaz de lenguaje natural"); ch.set_defaults(f=cmd_chat)
+
     we = sub.add_parser("web", help="interfaz local de control"); we.add_argument("--puerto", type=int, default=8787); we.set_defaults(f=cmd_web)
 
     a = ap.parse_args(); a.f(a)

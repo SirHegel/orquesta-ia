@@ -112,32 +112,19 @@ ia() {
   fi
 }
 
-# ── Modo kitty: abrir y promptear ───────────────────────────────────────
-# Solo en kitty. La terminal por defecto queda intacta: comandos normales,
-# y la IA solo si la invocas tu con 'ia' u 'orq'.
-if [ -n "$KITTY_WINDOW_ID" ] && [ "$TERM" != "dumb" ] && [ -z "$ORQ_SIN_MODO_PROMPT" ]; then
-  export ORQ_MODO=kitty
-
-  # TODO lo que no sea un comando va a la IA. Sin heuristicas, sin minimos
-  # de palabras: si escribes 'hola', responde.
-  command_not_found_handle() {
-    local linea="$*"
-    printf '\033[38;2;224;50;46m▍\033[0m\033[2m orquesta\033[0m\n'
-    orq ask "$linea" --tarea reasoning --lineas 30
-    return $?
-  }
-
-  # Una sola linea, debajo de tu fastfetch de Musashi. Sin cajas ni ruido.
-  _orq_linea() {
-    [ -n "$ORQ_LINEA_HECHA" ] && return
-    export ORQ_LINEA_HECHA=1
-    local R=$'\033[38;2;224;50;46m' D=$'\033[2m' N=$'\033[0m' B=$'\033[1m'
-    printf '%s▍%s%s orquesta ia%s %spotencia maxima · permisos dados · escribe y ya%s\n' \
-      "$R" "$N" "$B" "$N" "$D" "$N"
-    printf '  %sclaude%s %s   %sgpt%s %s   %sgemini%s %s\n\n' \
-      "$D" "$N" "${ORQ_CLAUDE_CUENTA:-—}" \
-      "$D" "$N" "${ORQ_GPT_CUENTA:-—}" \
-      "$D" "$N" "${ORQ_ANTIGRAVITY_CUENTA:-—}"
-  }
-  _orq_linea
+# ── kitty = interfaz de lenguaje natural ────────────────────────────────
+# Kitty no es un shell con IA encima: arranca directamente la conversacion.
+# Dentro tienes /shell para comandos del sistema, y /salir para volver a bash.
+# Para abrir kitty como bash normal:  ORQ_SIN_MODO_PROMPT=1 kitty
+if [ -n "$KITTY_WINDOW_ID" ] && [ "$TERM" != "dumb" ] \
+   && [ -z "$ORQ_SIN_MODO_PROMPT" ] && [ -z "$ORQ_CHAT_ACTIVO" ]; then
+  export ORQ_MODO=kitty ORQ_CHAT_ACTIVO=1
+  if [ -f "$ORQ_HOME/orqchat.py" ]; then
+    python3 "$ORQ_HOME/orqchat.py"
+    # red de seguridad: si el chat falla, no te quedas sin terminal
+    if [ $? -ne 0 ]; then
+      printf '\033[38;2;224;50;46m▍\033[0m la interfaz fallo; tienes bash normal.\n'
+      printf '  \033[2mreintenta con:  orq chat\033[0m\n'
+    fi
+  fi
 fi
