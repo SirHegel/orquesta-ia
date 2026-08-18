@@ -443,8 +443,11 @@ def cmd_proyecto(a):
           f"PLAN · {plan.get('nombre','?')} · por {plan['_planificador']}")
     print("  " + c("d", plan.get("resumen", "")))
     olas = L._ordenar_por_olas(plan["tareas"])
-    print("  " + c("d", f"{len(plan['tareas'])} tareas en {len(olas)} olas "
-                       f"(las de una misma ola corren en paralelo)"))
+    if plan.get("_aviso"):
+        print("  " + c("y", "ajuste") + c("d", " · " + plan["_aviso"]))
+    paralelo = max((len(o) for o in olas), default=1)
+    print("  " + c("d", f"{len(plan['tareas'])} tareas en {len(olas)} olas · "
+                       f"hasta {paralelo} IA trabajando a la vez"))
 
     if not a.si:
         try:

@@ -778,14 +778,48 @@ ESQUEMA_PLAN = """Devuelve SOLO un JSON valido, sin markdown ni texto alrededor,
  "resumen":"una frase de que se va a construir",
  "tareas":[
    {"id":"t1","titulo":"...","tipo":"code|research|writing|edicion|imagen|review",
-    "depende":[],"instruccion":"instruccion concreta y autocontenida para quien la ejecute"}
+    "depende":[],"instruccion":"instruccion concreta y autocontenida",
+    "archivos":["ruta/que/crea.py"]}
  ]}
-Reglas del plan:
-- Entre 3 y 7 tareas. Ni una mas.
-- 'depende' lista los id que deben terminar antes. La primera tarea no depende de nada.
-- Cada 'instruccion' debe decir exactamente que archivos crear o modificar.
-- Todo vive en UNA sola carpeta de proyecto; nada de estructuras paralelas.
-- No incluyas tareas de instalar dependencias del sistema ni de desplegar."""
+
+Reglas del plan (importantes, el trabajo se reparte entre varias IA en paralelo):
+- Entre 4 y 7 tareas.
+- MAXIMO PARALELISMO. Varias IA distintas trabajan a la vez, asi que la mayoria
+  de las tareas deben tener "depende":[] o depender solo de la primera.
+  Una cadena lineal (t2 depende de t1, t3 de t2, t4 de t3...) es un plan MALO
+  porque deja a tres IA sin hacer nada. Evitala.
+- Para lograrlo, define primero UNA tarea de cimientos (contratos, modelos de
+  datos, estructura de archivos) y que el resto dependa solo de ella y se
+  reparta modulos que NO se pisan entre si.
+- Cada tarea declara en "archivos" que ficheros escribe. Dos tareas de la misma
+  ola nunca pueden escribir el mismo fichero.
+- Usa tipos variados y realistas, no marques todo como "code": la documentacion
+  es "writing", verificar es "review", buscar informacion es "research",
+  cualquier grafico o logo es "imagen".
+- Cada 'instruccion' dice exactamente que crear, con nombres de archivo.
+- Todo vive en UNA sola carpeta; nada de estructuras paralelas.
+- No incluyas instalar dependencias del sistema ni desplegar."""
+
+
+def _reparar_plan(plan, n_cuentas):
+    """Si el plan salio como cadena lineal, lo reestructura para que haya paralelo."""
+    tareas = plan.get("tareas") or []
+    if len(tareas) < 3:
+        return plan, None
+    olas = _ordenar_por_olas(tareas)
+    if max((len(o) for o in olas), default=0) > 1:
+        return plan, None                     # ya tiene paralelo
+    # cadena lineal: la primera queda de cimientos y el resto cuelga de ella
+    base = tareas[0]["id"]
+    for t in tareas[1:]:
+        t["depende"] = [base]
+    # la ultima de tipo review vuelve a depender de todas (cierre)
+    for t in reversed(tareas[1:]):
+        if t.get("tipo") == "review":
+            t["depende"] = [x["id"] for x in tareas if x["id"] != t["id"]]
+            break
+    return plan, (f"el plan venia en cadena lineal; reestructurado a "
+                  f"{len(_ordenar_por_olas(tareas))} olas para repartirlo")
 
 
 def _mejor_para(tarea):
@@ -822,6 +856,8 @@ def planificar(descripcion, carpeta, timeout=300):
         return None, f"{pid} no devolvio un plan valido: {(r['texto'] or '')[:180]}"
     plan["_planificador"] = pid
     plan["_tokens_plan"] = r["tokens"]
+    plan, aviso = _reparar_plan(plan, len(disponibles()))
+    plan["_aviso"] = aviso
     return plan, None
 
 
@@ -847,16 +883,20 @@ def ejecutar_proyecto(plan, carpeta, timeout=600, callback=None):
     for n, ola in enumerate(_ordenar_por_olas(plan["tareas"]), 1):
         if callback:
             callback("ola", {"n": n, "tareas": [t["titulo"] for t in ola]})
+        # Asignacion de la ola: cada tarea a la cuenta que mejor rinde en su
+        # tipo Y que tenga cuota, sin repetir cuenta mientras queden libres.
         trabajos = []
-        usados = set()      # reparte la ola entre cuentas distintas
-        for t in ola:
+        usados = set()
+        # las tareas mas exigentes eligen primero
+        orden = sorted(ola, key=lambda t: -(len(t.get("instruccion", ""))))
+        for t in orden:
             tipo = t.get("tipo", "code")
             if tipo not in TAREAS:
                 tipo = "code"
             r = ranking(tipo)
             eleg = next((x for x in r if x["pid"] not in usados), r[0] if r else None)
             pid, p = (eleg["pid"], eleg["p"]) if eleg else (None, None)
-            if pid:
+            if pid and len(usados) < len(disponibles()):
                 usados.add(pid)
             if not pid:
                 resultados.append({"id": t["id"], "titulo": t["titulo"], "perfil": None,
