@@ -190,14 +190,16 @@ def cmd_login(pid, p):
     """Comando exacto que el usuario debe correr para autenticar la cuenta."""
     prov = p.get("provider")
     h = home_de(pid, p)
+    nav = p.get("navegador")
+    pre = f'BROWSER={nav} ' if nav else ""
     if prov == "claude":
-        return f'CLAUDE_CONFIG_DIR="{h}" claude   # dentro escribe: /login'
+        return f'{pre}CLAUDE_CONFIG_DIR="{h}" claude   # dentro escribe: /login'
     if prov == "gpt":
-        return f'CODEX_HOME="{h}" codex login'
+        return f'{pre}CODEX_HOME="{h}" codex login'
     if prov == "gemini":
         if p.get("auth") == "oauth":
-            return (f'GEMINI_CLI_HOME="{h}" GOOGLE_GENAI_USE_GCA=true BROWSER=firefox gemini'
-                    f'   # autoriza con la cuenta de Google')
+            return (f'GEMINI_CLI_HOME="{h}" GOOGLE_GENAI_USE_GCA=true '
+                    f'BROWSER={nav or "firefox"} gemini   # autoriza con la cuenta de Google')
         return (f'mkdir -p "{h}" && printf %s "TU_API_KEY" > "{h}/api_key" '
                 f'&& chmod 600 "{h}/api_key"')
     return "proveedor desconocido"
@@ -360,3 +362,122 @@ def ranking(tarea, proposito=None, incluir_bloqueados=False):
         out.append({"pid": pid, "p": p, "pts": pts, "nota": nota})
     out.sort(key=lambda x: -x["pts"])
     return [x for x in out if x["pts"] > 0]
+
+# ---------------- navegadores y terminales ----------------
+NAVEGADORES = [("firefox", "Firefox"), ("brave", "Brave"),
+               ("google-chrome", "Google Chrome"), ("chromium", "Chromium"),
+               ("microsoft-edge", "Edge")]
+TERMINALES = [("kitty", ["kitty", "--title", "{titulo}", "-e", "bash", "-lc", "{cmd}"]),
+              ("ptyxis", ["ptyxis", "--title", "{titulo}", "--", "bash", "-lc", "{cmd}"]),
+              ("gnome-terminal", ["gnome-terminal", "--title", "{titulo}", "--",
+                                  "bash", "-lc", "{cmd}"]),
+              ("konsole", ["konsole", "-e", "bash", "-lc", "{cmd}"]),
+              ("xterm", ["xterm", "-T", "{titulo}", "-e", "bash", "-lc", "{cmd}"])]
+
+
+def navegadores():
+    import shutil
+    out, vistos = [], set()
+    for b, n in NAVEGADORES:
+        r = shutil.which(b)
+        if r and n not in vistos:
+            vistos.add(n)
+            out.append({"bin": b, "nombre": n})
+    return out
+
+
+def terminal_disponible():
+    import shutil
+    for t, plantilla in TERMINALES:
+        if shutil.which(t):
+            return t, plantilla
+    return None, None
+
+
+def lanzar_login(pid, p, titulo=None):
+    """Abre una terminal con el entorno listo para autenticar esa cuenta."""
+    t, plantilla = terminal_disponible()
+    if not t:
+        return False, "no encontre ninguna terminal grafica instalada"
+    cmd_auth = cmd_login(pid, p).split("#")[0].strip()
+    titulo = titulo or f"LOGIN · {pid}"
+    guion = (
+        "clear; "
+        f"printf '\\n  \\033[1mCONECTAR {pid}\\033[0m\\n'; "
+        f"printf '  \\033[2m{p.get('provider','')} · navegador: {p.get('navegador') or 'por defecto'}\\033[0m\\n\\n'; "
+        + (("printf '  Escribe \\033[33m/login\\033[0m y autoriza en el navegador.\\n\\n'; "
+            ) if p.get("provider") == "claude" else
+           ("printf '  Sigue las instrucciones en pantalla.\\n\\n'; "))
+        + cmd_auth + "; "
+        "printf '\\n  --- terminado ---\\n'; exec bash"
+    )
+    args = [x.replace("{titulo}", titulo).replace("{cmd}", guion) for x in plantilla]
+    try:
+        subprocess.Popen(args, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True, f"terminal abierta ({t})"
+    except Exception as e:
+        return False, str(e)
+
+# ---------------- cuenta activa por proveedor ----------------
+ENTORNO_SH = os.path.join(BASE, "state", "entorno.sh")
+
+
+def activas():
+    """{proveedor: id_de_cuenta} que usan por defecto TODAS las terminales."""
+    return cfg().get("_activas", {})
+
+
+def escribir_entorno():
+    """Genera el archivo que cada terminal carga al abrirse.
+
+    Con esto, escribir 'claude' o 'codex' en cualquier terminal usa
+    automaticamente la cuenta activa, sin autenticar nada de nuevo.
+    """
+    c = cfg()
+    ps = c.get("profiles", {})
+    act = c.get("_activas", {})
+    lineas = ["# Generado por 'orq usar' — no editar a mano",
+              "# Lo carga shell.sh en cada terminal nueva.", ""]
+    for prov, pid in sorted(act.items()):
+        p = ps.get(pid)
+        if not p or not autenticado(pid, p):
+            continue
+        h = home_de(pid, p)
+        if prov == "claude":
+            lineas += [f'export CLAUDE_CONFIG_DIR="{h}"']
+        elif prov == "gpt":
+            lineas += [f'export CODEX_HOME="{h}"']
+        elif prov == "gemini":
+            lineas += [f'export GEMINI_CLI_HOME="{h}"',
+                       'export GEMINI_CLI_TRUST_WORKSPACE=true']
+            if p.get("auth") == "oauth":
+                lineas.append('export GOOGLE_GENAI_USE_GCA=true')
+            k = p.get("api_key_file")
+            if k and os.path.exists(os.path.expanduser(k)):
+                lineas.append(f'export GEMINI_API_KEY="$(cat "{k}" 2>/dev/null)"')
+        lineas.append(f'export ORQ_{prov.upper()}_CUENTA="{pid}"')
+    lineas.append("")
+    with bloqueo():
+        os.makedirs(os.path.dirname(ENTORNO_SH), exist_ok=True)
+        tmp = ENTORNO_SH + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("\n".join(lineas))
+        os.replace(tmp, ENTORNO_SH)
+    return ENTORNO_SH
+
+
+def usar(pid):
+    """Fija esa cuenta como la activa de su proveedor, para todas las terminales."""
+    c = cfg()
+    p = c.get("profiles", {}).get(pid)
+    if not p:
+        return False, f"cuenta desconocida: {pid}"
+    if not autenticado(pid, p):
+        return False, f"'{pid}' no esta autenticada todavia"
+    with bloqueo():
+        c = cfg()
+        c.setdefault("_activas", {})[p["provider"]] = pid
+        guardar_cfg(c)
+    escribir_entorno()
+    return True, f"'{pid}' es ahora la cuenta {p['provider']} de todas las terminales nuevas"

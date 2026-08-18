@@ -176,6 +176,33 @@ def cmd_limites(a):
     print()
 
 # ---------- routing ----------
+def cmd_usar(a):
+    ok, msg = L.usar(a.id)
+    print(("\n  " + (c("g", msg) if ok else c("red", msg))))
+    if ok:
+        print("  " + c("d", "las terminales YA abiertas siguen igual; recarga con:  source ~/.bashrc") + "\n")
+    else:
+        sys.exit(1)
+
+def cmd_activas(a):
+    act = L.activas()
+    ps = L.cfg().get("profiles", {})
+    provs = sorted({p.get("provider") for p in ps.values()})
+    filas = []
+    for prov in provs:
+        pid = act.get(prov)
+        if pid and pid in ps:
+            filas.append([prov, pid, c("g", "lista")])
+        else:
+            cand = [k for k, v in ps.items()
+                    if v.get("provider") == prov and L.autenticado(k, v)]
+            filas.append([prov, c("d", "(ninguna)"),
+                          c("y", f"elige: orq usar {cand[0]}") if cand
+                          else c("red", "sin cuentas autenticadas")])
+    tabla([("proveedor", 0), ("cuenta activa", 0), ("estado", 0)], filas,
+          "CUENTA POR DEFECTO DE TODAS LAS TERMINALES")
+    print("\n  " + c("d", "escribir 'claude' o 'codex' en cualquier terminal usa estas cuentas") + "\n")
+
 def cmd_route(a):
     rk = L.ranking(a.tarea, a.proposito)
     if not rk:
@@ -317,6 +344,10 @@ def main():
     rm = cs.add_parser("rm"); rm.add_argument("id"); rm.add_argument("--purge", action="store_true"); rm.set_defaults(f=cmd_cuenta_rm)
     for k in ("enable","disable"):
         t = cs.add_parser(k); t.add_argument("id"); t.set_defaults(f=cmd_cuenta_toggle, c=k)
+
+    us = sub.add_parser("usar", help="fijar la cuenta por defecto de TODAS las terminales")
+    us.add_argument("id"); us.set_defaults(f=cmd_usar)
+    sub.add_parser("activas", help="que cuenta usa cada proveedor por defecto").set_defaults(f=cmd_activas)
 
     r = sub.add_parser("route", help="a quien delegaria (no gasta tokens)")
     r.add_argument("tarea", choices=L.TAREAS); r.add_argument("--proposito"); r.set_defaults(f=cmd_route)

@@ -2,412 +2,600 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Orquesta IA</title>
 <style>
-:root{--bg:#08080a;--pan:#101014;--pan2:#17171d;--fg:#d6d6d8;--dim:#8a8a90;
---acc:#e0322e;--ok:#9aa08e;--warn:#c9b98a;--line:#2a2a30;--r:10px}
-@media(prefers-color-scheme:light){:root{--bg:#f7f7f5;--pan:#fff;--pan2:#efefec;
---fg:#1a1a1c;--dim:#6a6a70;--line:#dcdcd8}}
-*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
-body{margin:0;background:var(--bg);color:var(--fg);
-font:14px/1.55 "JetBrainsMono Nerd Font",ui-monospace,SFMono-Regular,monospace}
-header{position:sticky;top:0;z-index:20;background:var(--bg);
-border-bottom:1px solid var(--line);padding:12px 18px env(safe-area-inset-right)}
-.hrow{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-h1{margin:0;font-size:16px;letter-spacing:.08em;white-space:nowrap}
-.sub{color:var(--dim);font-size:12px}
-nav{display:flex;gap:4px;margin-top:10px;overflow-x:auto;scrollbar-width:none}
+:root{
+ --bg:#0a0a0d; --s1:#111117; --s2:#17171f; --s3:#1e1e28;
+ --tx:#e8e8ea; --tx2:#9a9aa4; --tx3:#5f5f6b;
+ --br:#252530; --br2:#33333f;
+ --ac:#e0322e; --ac2:#ff5f56; --ok:#7fc98f; --wa:#e2b95f; --in:#6ba8e8;
+ --rad:14px; --rad-s:9px;
+ --sh:0 1px 2px #0006, 0 8px 24px -8px #0009;
+ --ease:cubic-bezier(.32,.72,0,1);
+}
+@media(prefers-color-scheme:light){:root{
+ --bg:#f6f6f4; --s1:#fff; --s2:#f0f0ee; --s3:#e7e7e4;
+ --tx:#16161a; --tx2:#5c5c66; --tx3:#8e8e98; --br:#e2e2de; --br2:#d0d0cc;
+ --sh:0 1px 2px #0000000d, 0 8px 24px -10px #0000001f;}}
+*{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
+body{background:var(--bg);color:var(--tx);font:14px/1.6 -apple-system,BlinkMacSystemFont,
+ "Inter","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased;
+ padding-bottom:env(safe-area-inset-bottom)}
+.mono{font-family:"JetBrainsMono Nerd Font",ui-monospace,SFMono-Regular,monospace}
+
+/* ── header ── */
+header{position:sticky;top:0;z-index:40;background:color-mix(in srgb,var(--bg) 88%,transparent);
+ backdrop-filter:saturate(180%) blur(14px);border-bottom:1px solid var(--br)}
+.hin{max-width:1240px;margin:0 auto;padding:13px 20px}
+.brand{display:flex;align-items:center;gap:11px}
+.logo{width:26px;height:26px;flex:0 0 26px}
+.bt{font-size:15px;font-weight:650;letter-spacing:-.01em}
+.bs{font-size:12px;color:var(--tx2);margin-left:auto;text-align:right;line-height:1.35}
+nav{display:flex;gap:2px;margin-top:11px;overflow-x:auto;scrollbar-width:none;position:relative}
 nav::-webkit-scrollbar{display:none}
-nav button{background:none;border:0;border-bottom:2px solid transparent;color:var(--dim);
-padding:7px 13px;cursor:pointer;font:inherit;font-size:13px;white-space:nowrap;border-radius:0}
-nav button[aria-selected=true]{color:var(--fg);border-bottom-color:var(--acc)}
-main{padding:18px;max-width:1500px;margin:0 auto}
-.cols{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr))}
-section{background:var(--pan);border:1px solid var(--line);border-radius:var(--r);padding:15px}
-section.wide{grid-column:1/-1}
-h2{margin:0 0 11px;font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim)}
-.tw{overflow-x:auto;-webkit-overflow-scrolling:touch}
-table{width:100%;border-collapse:collapse;font-size:13px;min-width:440px}
-th{text-align:left;color:var(--dim);font-weight:400;padding:5px 8px;
-border-bottom:1px solid var(--line);font-size:10px;letter-spacing:.1em;text-transform:uppercase}
-td{padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}
-tr:last-child td{border-bottom:0}
+nav button{background:none;border:0;color:var(--tx2);padding:8px 15px;cursor:pointer;
+ font:inherit;font-size:13.5px;font-weight:500;white-space:nowrap;border-radius:8px;
+ transition:color .18s,background .18s}
+nav button:hover{color:var(--tx);background:var(--s2)}
+nav button[aria-selected=true]{color:var(--tx);background:var(--s3);font-weight:600}
+
+main{max-width:1240px;margin:0 auto;padding:22px 20px 60px}
+.view{animation:enter .34s var(--ease) both}
+@keyframes enter{from{opacity:0;transform:translateY(9px)}to{opacity:1;transform:none}}
+
+/* ── secciones ── */
+.sec{margin-bottom:30px}
+.sh{display:flex;align-items:baseline;gap:10px;margin-bottom:13px;flex-wrap:wrap}
+h2{font-size:12px;font-weight:650;letter-spacing:.1em;text-transform:uppercase;color:var(--tx2)}
+.sd{font-size:12.5px;color:var(--tx3)}
+
+/* ── tarjetas de cuenta ── */
+.cards{display:grid;gap:13px;grid-template-columns:repeat(auto-fill,minmax(min(100%,330px),1fr))}
+.card{background:var(--s1);border:1px solid var(--br);border-radius:var(--rad);padding:16px;
+ box-shadow:var(--sh);transition:transform .22s var(--ease),border-color .22s,box-shadow .22s;
+ animation:pop .4s var(--ease) both;position:relative;overflow:hidden}
+@keyframes pop{from{opacity:0;transform:translateY(12px) scale(.985)}to{opacity:1;transform:none}}
+.card:hover{transform:translateY(-2px);border-color:var(--br2);
+ box-shadow:0 2px 4px #0006,0 14px 34px -10px #000b}
+.card.act::before{content:"";position:absolute;inset:0 auto 0 0;width:3px;background:var(--ac)}
+.ct{display:flex;align-items:flex-start;gap:10px;margin-bottom:12px}
+.dot{width:8px;height:8px;border-radius:50%;flex:0 0 8px;margin-top:7px}
+.dot.on{background:var(--ok);box-shadow:0 0 0 0 #7fc98f80;animation:pulse 2.4s infinite}
+.dot.off{background:var(--tx3)}.dot.err{background:var(--ac)}.dot.wa{background:var(--wa)}
+@keyframes pulse{0%{box-shadow:0 0 0 0 #7fc98f66}70%{box-shadow:0 0 0 7px #7fc98f00}100%{box-shadow:0 0 0 0 #7fc98f00}}
+.cn{font-size:14.5px;font-weight:600;letter-spacing:-.01em}
+.cl{font-size:12.5px;color:var(--tx2);margin-top:1px}
+.tags{display:flex;gap:5px;margin-left:auto;flex-wrap:wrap;justify-content:flex-end}
+.tag{font-size:10.5px;font-weight:600;letter-spacing:.04em;padding:2.5px 8px;border-radius:99px;
+ background:var(--s3);color:var(--tx2);text-transform:uppercase;white-space:nowrap}
+.tag.ac{background:color-mix(in srgb,var(--ac) 18%,transparent);color:var(--ac2)}
+.tag.ok{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+.tag.wa{background:color-mix(in srgb,var(--wa) 16%,transparent);color:var(--wa)}
+.stats{display:flex;gap:16px;margin:13px 0 11px;padding-top:12px;border-top:1px solid var(--br)}
+.st{flex:1;min-width:0}
+.stl{font-size:10.5px;color:var(--tx3);text-transform:uppercase;letter-spacing:.06em}
+.stv{font-size:16px;font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-.02em;margin-top:1px}
+.bar{height:4px;background:var(--s3);border-radius:99px;overflow:hidden;margin-top:6px}
+.bar i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--ok),var(--wa));
+ transition:width .7s var(--ease)}
+.bar i.hi{background:linear-gradient(90deg,var(--wa),var(--ac))}
+.acts{display:flex;gap:6px;flex-wrap:wrap}
+
+/* ── botones ── */
+button.b{background:var(--s2);color:var(--tx);border:1px solid var(--br);border-radius:var(--rad-s);
+ padding:7px 13px;cursor:pointer;font:inherit;font-size:12.5px;font-weight:500;min-height:33px;
+ transition:background .16s,border-color .16s,transform .1s;display:inline-flex;align-items:center;gap:6px}
+button.b:hover:not(:disabled){background:var(--s3);border-color:var(--br2)}
+button.b:active:not(:disabled){transform:scale(.97)}
+button.b:disabled{opacity:.4;cursor:not-allowed}
+button.b.p{background:var(--ac);border-color:var(--ac);color:#fff;font-weight:600}
+button.b.p:hover:not(:disabled){background:var(--ac2);border-color:var(--ac2)}
+button.b.gh{background:none;border-color:transparent;color:var(--tx2)}
+button.b.gh:hover:not(:disabled){background:var(--s2);color:var(--tx)}
+button.b.sm{padding:4px 9px;min-height:27px;font-size:11.5px}
+
+/* ── formularios ── */
+.f{margin-bottom:13px}
+label{display:block;font-size:11.5px;font-weight:550;color:var(--tx2);margin-bottom:5px}
+input,select,textarea{background:var(--bg);color:var(--tx);border:1px solid var(--br);
+ border-radius:var(--rad-s);padding:9px 11px;font:inherit;font-size:13.5px;width:100%;
+ min-height:38px;transition:border-color .16s,box-shadow .16s}
+input:focus,select:focus,textarea:focus{outline:0;border-color:var(--ac);
+ box-shadow:0 0 0 3px color-mix(in srgb,var(--ac) 16%,transparent)}
+textarea{resize:vertical;min-height:120px;line-height:1.55;font-family:inherit}
+.gr{display:grid;gap:11px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+.hint{font-size:11.5px;color:var(--tx3);margin-top:5px}
+
+/* ── vacio ── */
+.empty{text-align:center;padding:44px 22px;border:1px dashed var(--br2);border-radius:var(--rad);
+ color:var(--tx2);background:var(--s1)}
+.empty .ei{font-size:30px;opacity:.4;margin-bottom:10px}
+.empty h3{font-size:14.5px;font-weight:600;color:var(--tx);margin-bottom:5px}
+.empty p{font-size:13px;max-width:390px;margin:0 auto 15px}
+
+/* ── codigo ── */
+code.cmd{display:block;background:var(--s2);border:1px solid var(--br);border-radius:var(--rad-s);
+ padding:10px 12px;font-family:"JetBrainsMono Nerd Font",ui-monospace,monospace;font-size:11.5px;
+ color:var(--wa);overflow-x:auto;white-space:pre;cursor:copy;transition:border-color .16s;margin-top:8px}
+code.cmd:hover{border-color:var(--ac)}
+code.cmd::after{content:"clic para copiar";float:right;color:var(--tx3);font-size:10px;margin-left:12px}
+
+/* ── tabla ── */
+.tw{overflow-x:auto;border:1px solid var(--br);border-radius:var(--rad);background:var(--s1)}
+table{width:100%;border-collapse:collapse;font-size:13px;min-width:420px}
+th{text-align:left;font-size:10.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;
+ color:var(--tx3);padding:10px 13px;border-bottom:1px solid var(--br);background:var(--s2)}
+td{padding:10px 13px;border-bottom:1px solid var(--br)}
+tbody tr:last-child td{border-bottom:0}
+tbody tr{transition:background .14s}tbody tr:hover{background:var(--s2)}
 .num{text-align:right;font-variant-numeric:tabular-nums}
-.pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11px;border:1px solid;white-space:nowrap}
-.ok{color:var(--ok);border-color:#3a4034}.no{color:var(--acc);border-color:#4a2220}
-.wa{color:var(--warn);border-color:#4a4230}.off{color:var(--dim);border-color:var(--line)}
-button,.btn{background:var(--pan2);color:var(--fg);border:1px solid var(--line);
-border-radius:7px;padding:7px 13px;cursor:pointer;font:inherit;font-size:12px;
-min-height:34px;transition:border-color .12s}
-button:hover{border-color:var(--acc)}button:disabled{opacity:.45;cursor:not-allowed}
-button.p{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
-button.sm{padding:3px 9px;min-height:26px;font-size:11px}
-input,select,textarea{background:var(--bg);color:var(--fg);border:1px solid var(--line);
-border-radius:7px;padding:8px 10px;font:inherit;font-size:13px;width:100%;min-height:36px}
-textarea{resize:vertical;min-height:110px;line-height:1.5}
-input:focus,select:focus,textarea:focus{outline:0;border-color:var(--acc)}
-label{display:block;font-size:10px;color:var(--dim);margin:10px 0 4px;
-letter-spacing:.1em;text-transform:uppercase}
-.g2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.g3{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.bar{height:5px;background:var(--pan2);border-radius:3px;overflow:hidden;margin-top:4px}
-.bar i{display:block;height:100%;background:var(--acc);transition:width .3s}
-code,pre{background:var(--pan2);border-radius:6px;font-size:12px;color:var(--warn)}
-code{display:block;padding:7px 9px;overflow-x:auto;white-space:pre;margin-top:6px;
-user-select:all;cursor:copy}
-pre{padding:12px;overflow-x:auto;white-space:pre-wrap;word-break:break-word;
-color:var(--fg);max-height:460px;overflow-y:auto;margin:0}
-.mut{color:var(--dim);font-size:12px}
-details{border:1px solid var(--line);border-radius:8px;margin-bottom:9px;background:var(--pan2)}
-summary{padding:10px 12px;cursor:pointer;font-size:13px;list-style:none;display:flex;
-gap:10px;align-items:center;flex-wrap:wrap}
-summary::-webkit-details-marker{display:none}
-summary::before{content:"▸";color:var(--dim);transition:transform .15s}
-details[open] summary::before{transform:rotate(90deg)}
-.dbody{padding:0 12px 13px}
-#toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(20px + env(safe-area-inset-bottom));
-z-index:99;display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none;width:min(92vw,460px)}
-.tm{background:var(--pan);border:1px solid var(--line);border-left:3px solid var(--acc);
-padding:10px 15px;border-radius:8px;font-size:13px;box-shadow:0 8px 28px #0009;width:100%}
+
+/* ── resultados ── */
+.res{border:1px solid var(--br);border-radius:var(--rad);overflow:hidden;margin-bottom:12px;
+ background:var(--s1);animation:pop .34s var(--ease) both}
+.rh{background:var(--s2);padding:10px 14px;display:flex;gap:9px;align-items:center;flex-wrap:wrap;
+ font-size:12.5px;border-bottom:1px solid var(--br)}
+.rh b{font-weight:650}
+pre.out{padding:14px;overflow-x:auto;white-space:pre-wrap;word-break:break-word;font-size:12.5px;
+ line-height:1.6;max-height:440px;overflow-y:auto;font-family:"JetBrainsMono Nerd Font",ui-monospace,monospace}
+
+/* ── modal ── */
+.ov{position:fixed;inset:0;background:#000000a8;backdrop-filter:blur(3px);z-index:60;
+ display:flex;align-items:center;justify-content:center;padding:18px;animation:fade .2s both}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+.modal{background:var(--s1);border:1px solid var(--br2);border-radius:18px;padding:22px;
+ width:min(520px,100%);max-height:88vh;overflow-y:auto;box-shadow:0 24px 70px -14px #000;
+ animation:up .32s var(--ease) both}
+@keyframes up{from{opacity:0;transform:translateY(22px) scale(.97)}to{opacity:1;transform:none}}
+.mh{display:flex;align-items:center;gap:10px;margin-bottom:17px}
+.mh h3{font-size:16px;font-weight:650;letter-spacing:-.01em}
+.mh button{margin-left:auto}
+
+/* ── toast ── */
+#toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(22px + env(safe-area-inset-bottom));
+ z-index:90;display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none;
+ width:min(93vw,440px)}
+.tm{background:var(--s1);border:1px solid var(--br2);border-left:3px solid var(--ac);
+ padding:11px 16px;border-radius:11px;font-size:13px;box-shadow:0 12px 34px -8px #000c;width:100%;
+ animation:slide .3s var(--ease) both}
 .tm.good{border-left-color:var(--ok)}
-.res{border:1px solid var(--line);border-radius:8px;margin-bottom:11px;overflow:hidden}
-.rh{background:var(--pan2);padding:9px 12px;display:flex;gap:10px;align-items:center;
-flex-wrap:wrap;font-size:12px;border-bottom:1px solid var(--line)}
-.rh b{color:var(--acc)}.rh.aud b{color:var(--warn)}
-.spin{display:inline-block;width:11px;height:11px;border:2px solid var(--line);
-border-top-color:var(--acc);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-1px}
+@keyframes slide{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
+
+.spin{width:13px;height:13px;border:2px solid var(--br2);border-top-color:var(--ac);
+ border-radius:50%;animation:sp .65s linear infinite;display:inline-block;flex:0 0 13px}
 @keyframes sp{to{transform:rotate(360deg)}}
-@media(max-width:620px){main{padding:12px}section{padding:12px}
- .g2{grid-template-columns:1fr}h1{font-size:15px}header{padding:10px 12px}}
+.sk{background:linear-gradient(90deg,var(--s2) 25%,var(--s3) 50%,var(--s2) 75%);
+ background-size:200% 100%;animation:shim 1.3s infinite;border-radius:7px;height:96px}
+@keyframes shim{to{background-position:-200% 0}}
+@media(prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+@media(max-width:600px){.hin,main{padding-left:14px;padding-right:14px}
+ .cards{grid-template-columns:1fr}.bs{width:100%;text-align:left;margin:6px 0 0}}
 </style></head><body>
 
-<header><div class="hrow">
-  <h1>ORQUESTA&nbsp;IA</h1>
-  <span class="sub" id="resumen">cargando…</span>
-  <span style="flex:1"></span>
-  <button class="sm" onclick="cargar()">↻</button>
-</div>
-<nav id="tabs" role="tablist">
-  <button role="tab" aria-selected="true" data-t="panel">Panel</button>
+<header><div class="hin">
+ <div class="brand">
+  <svg class="logo" viewBox="0 0 128 128"><circle cx="64" cy="64" r="14" fill="#e0322e"/>
+   <circle cx="64" cy="22" r="9" fill="currentColor" opacity=".85"/>
+   <circle cx="100" cy="86" r="9" fill="currentColor" opacity=".5"/>
+   <circle cx="28" cy="86" r="9" fill="currentColor" opacity=".5"/>
+   <path d="M64 36v13M77 73l14 8M51 73l-14 8" stroke="currentColor" stroke-width="4"
+    stroke-linecap="round" opacity=".3" fill="none"/></svg>
+  <span class="bt">Orquesta IA</span>
+  <span class="bs" id="resumen"></span>
+ </div>
+ <nav id="tabs" role="tablist">
+  <button role="tab" aria-selected="true" data-t="cuentas">Cuentas</button>
   <button role="tab" aria-selected="false" data-t="consultar">Consultar</button>
-  <button role="tab" aria-selected="false" data-t="ajustes">Ajustes</button>
-  <button role="tab" aria-selected="false" data-t="historial">Historial</button>
-</nav></header>
+  <button role="tab" aria-selected="false" data-t="uso">Uso</button>
+ </nav>
+</div></header>
 
 <main>
-<div id="v-panel" class="cols">
-  <section class="wide"><h2>Cuentas</h2><div class="tw" id="cuentas"></div></section>
-  <section><h2>A quién delegar</h2>
-    <label for="t_tarea">tipo de tarea</label>
-    <select id="t_tarea" onchange="cargar()"></select>
-    <div class="tw" id="ranking" style="margin-top:12px"></div>
-    <p class="mut" style="margin-top:11px">puntaje = peso técnico × rendimiento medido × holgura de cupo.
-    Las cuentas con límite activo se excluyen solas hasta que recargan.</p>
-  </section>
-  <section><h2>Gasto por cuenta</h2><div class="tw" id="gasto"></div></section>
-</div>
-
-<div id="v-consultar" hidden><div class="cols">
-  <section class="wide">
-    <h2>Consulta</h2>
-    <label for="q">prompt <span class="mut">(Ctrl+Enter para enviar)</span></label>
-    <textarea id="q" placeholder="Escribe aquí lo que necesitas…"></textarea>
-    <div class="g3" style="margin-top:11px">
-      <div><label for="q_modo">modo</label><select id="q_modo" onchange="modoCambio()">
-        <option value="ask">delegar a la mejor</option>
-        <option value="fan">preguntar a todas</option>
-        <option value="audit">auditoría cruzada</option></select></div>
-      <div><label for="q_tarea">tarea</label><select id="q_tarea"></select></div>
-      <div><label for="q_perfil">cuenta</label><select id="q_perfil"></select></div>
-      <div><label for="q_to">timeout (s)</label><input id="q_to" type="number" value="300" min="30" max="1800"></div>
-    </div>
-    <div class="row" style="margin-top:13px">
-      <button class="p" id="q_run" onclick="correr()">Enviar</button>
-      <span class="mut" id="q_hint"></span>
-    </div>
-  </section>
-  <section class="wide" id="q_res_sec" hidden><h2>Resultado</h2><div id="q_res"></div></section>
-</div></div>
-
-<div id="v-ajustes" hidden><div class="cols">
-  <section class="wide"><h2>Ajustes por cuenta</h2><div id="ajustes"></div></section>
-  <section><h2>Agregar cuenta</h2>
-    <div class="g2">
-      <div><label for="n_id">id</label><input id="n_id" placeholder="claude-cliente2"></div>
-      <div><label for="n_prov">proveedor</label><select id="n_prov">
-        <option value="claude">claude</option><option value="gpt">gpt</option>
-        <option value="gemini">gemini</option></select></div>
-      <div><label for="n_plan">plan</label><select id="n_plan"><option>max</option>
-        <option selected>pro</option><option>team</option><option>api</option><option>free</option></select></div>
-      <div><label for="n_prop">propósito</label><input id="n_prop" value="general"></div>
-      <div><label for="n_vent">ventana recarga (h)</label><input id="n_vent" type="number" value="5" step="0.5"></div>
-      <div><label for="n_cupo">cupo/ventana (0=sin)</label><input id="n_cupo" type="number" value="0"></div>
-    </div>
-    <label for="n_lab">etiqueta</label><input id="n_lab" placeholder="Claude · cliente 2">
-    <div style="margin-top:13px"><button class="p" onclick="agregar()">Crear cuenta</button></div>
-    <div id="n_out"></div>
-  </section>
-</div></div>
-
-<div id="v-historial" hidden><div class="cols">
-  <section class="wide"><h2>Últimas llamadas</h2><div class="tw" id="hist"></div></section>
-</div></div>
+ <div id="v-cuentas" class="view"><div id="c-cuentas"></div></div>
+ <div id="v-consultar" class="view" hidden><div id="c-consultar"></div></div>
+ <div id="v-uso" class="view" hidden><div id="c-uso"></div></div>
 </main>
-<div id="toast"></div>
+<div id="toast"></div><div id="modal"></div>
 
 <script>
 "use strict";
-let S={}, JOB=null, TICK=null;
-const $ = i => document.getElementById(i);
-const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const nf = n => (n ?? 0).toLocaleString('es');
+let S=null, JOB=null, TICK=null, TAB='cuentas';
+const $=i=>document.getElementById(i);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const nf=n=>(n??0).toLocaleString('es');
+const PROV={claude:'Claude',gpt:'GPT',gemini:'Gemini'};
 
-async function P(u, d){
-  const r = await fetch(u, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(d)});
-  const j = await r.json().catch(() => ({error:'respuesta invalida'}));
-  if (j.error) toast(j.error);
+async function P(u,d){
+ try{
+  const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})});
+  const j=await r.json().catch(()=>({error:'respuesta inválida'}));
+  if(j.error) toast(j.error);
   return j;
+ }catch(e){ toast('sin conexión con el panel'); return {error:'sin conexión'}; }
 }
-function toast(msg, good){
-  const e = document.createElement('div');
-  e.className = 'tm' + (good ? ' good' : '');
-  e.textContent = msg;
-  $('toast').appendChild(e);
-  setTimeout(() => e.remove(), 4200);
+function toast(m,good){
+ const e=document.createElement('div'); e.className='tm'+(good?' good':''); e.textContent=m;
+ $('toast').appendChild(e);
+ setTimeout(()=>{e.style.opacity='0';e.style.transform='translateY(10px)';
+  e.style.transition='all .25s';setTimeout(()=>e.remove(),260)},3900);
 }
+function copiar(el){navigator.clipboard.writeText(el.textContent.replace(/clic para copiar$/,'').trim())
+ .then(()=>toast('copiado',1),()=>toast('no pude copiar'))}
 
-/* ---- pestañas ---- */
-$('tabs').addEventListener('click', e => {
-  const b = e.target.closest('button[data-t]'); if(!b) return;
-  [...$('tabs').children].forEach(x => x.setAttribute('aria-selected', x === b));
-  ['panel','consultar','ajustes','historial'].forEach(v => $('v-'+v).hidden = (v !== b.dataset.t));
+$('tabs').addEventListener('click',e=>{
+ const b=e.target.closest('button[data-t]'); if(!b)return;
+ TAB=b.dataset.t;
+ [...$('tabs').children].forEach(x=>x.setAttribute('aria-selected',x===b));
+ ['cuentas','consultar','uso'].forEach(v=>{
+   const el=$('v-'+v); el.hidden=(v!==TAB);
+   if(v===TAB){el.style.animation='none';el.offsetHeight;el.style.animation=''}
+ });
+ render();
 });
 
-/* ---- carga de estado ---- */
-async function cargar(){
-  try{
-    const t = $('t_tarea');
-    const r = await fetch('/api/state?tarea=' + encodeURIComponent(t.value || 'code'));
-    S = await r.json();
-  }catch(e){ toast('no hay conexion con el panel'); return; }
-
-  if(!$('t_tarea').options.length){
-    S.tareas.forEach(x => {
-      ['t_tarea','q_tarea'].forEach(id => {
-        const o = document.createElement('option'); o.value = o.textContent = x; $(id).appendChild(o);
-      });
-    });
-    $('t_tarea').value = 'code'; $('q_tarea').value = 'reasoning';
-  }
-  const sel = $('q_perfil'), prev = sel.value;
-  sel.innerHTML = '<option value="">automático (mejor cuenta)</option>' +
-    S.cuentas.filter(c => c.auth && c.enabled)
-             .map(c => `<option value="${esc(c.id)}">${esc(c.id)}</option>`).join('');
-  if(prev) sel.value = prev;
-
-  const listas = S.cuentas.filter(c => c.auth && c.enabled && !c.bloqueada).length;
-  $('resumen').textContent = `${listas}/${S.cuentas.length} listas · ${nf(S.total_tokens)} tokens · ${S.total_llamadas} llamadas`;
-
-  pintaCuentas(); pintaRanking(); pintaGasto(); pintaAjustes(); pintaHist();
+async function cargar(silencioso){
+ if(!silencioso && !S) $('c-cuentas').innerHTML=
+   '<div class="cards">'+'<div class="sk"></div>'.repeat(3)+'</div>';
+ try{
+  const t=(S&&S._tarea)||'code';
+  const r=await fetch('/api/state?tarea='+encodeURIComponent(t));
+  const nuevo=await r.json(); nuevo._tarea=t; S=nuevo;
+ }catch(e){ if(!silencioso) toast('sin conexión con el panel'); return; }
+ render();
 }
 
-function estadoPill(c){
-  if(!c.enabled)   return '<span class="pill off">apagada</span>';
-  if(!c.auth)      return '<span class="pill no">sin autenticar</span>';
-  if(c.bloqueada)  return `<span class="pill wa">límite → ${esc(c.bloqueada)}</span>`;
-  return '<span class="pill ok">activa</span>';
+function render(){
+ if(!S) return;
+ const con=S.cuentas.filter(c=>c.auth), listas=con.filter(c=>c.enabled&&!c.bloqueada);
+ $('resumen').innerHTML = listas.length
+   ? `<b>${listas.length}</b> ${listas.length===1?'cuenta lista':'cuentas listas'}`
+     + (S.total_llamadas?` · ${nf(S.total_tokens)} tokens usados`:'')
+   : 'sin cuentas conectadas todavía';
+ if(TAB==='cuentas') vistaCuentas();
+ if(TAB==='consultar') vistaConsultar();
+ if(TAB==='uso') vistaUso();
 }
 
-function pintaCuentas(){
-  $('cuentas').innerHTML = `<table><tr><th>cuenta</th><th>prov</th><th>estado</th>
-    <th>propósito</th><th class="num">hoy</th><th class="num">ventana ${''}</th><th></th></tr>` +
-    S.cuentas.map(c => `<tr>
-      <td><b>${esc(c.id)}</b><div class="mut">${esc(c.label)}</div>
-        ${!c.auth ? `<code onclick="copiar(this)" title="clic para copiar">${esc(c.login)}</code>` : ''}</td>
-      <td>${esc(c.provider)}</td><td>${estadoPill(c)}</td><td>${esc(c.proposito)}</td>
-      <td class="num">${nf(c.hoy)}</td>
-      <td class="num">${nf(c.ventana)}${c.cupo ? '/' + nf(c.cupo) : ''}<div class="mut">${c.horas}h</div>
-        ${c.cupo ? `<div class="bar"><i style="width:${Math.min(100, 100*c.ventana/c.cupo)}%"></i></div>` : ''}</td>
-      <td><div class="row">
-        <button class="sm" onclick="tog('${esc(c.id)}',${c.enabled?0:1})">${c.enabled?'apagar':'prender'}</button>
-        ${c.bloqueada ? `<button class="sm" onclick="limpiar('${esc(c.id)}')">liberar</button>` : ''}
-      </div></td></tr>`).join('') + `</table>`;
+/* ═══ CUENTAS ═══ */
+function vistaCuentas(){
+ const con=S.cuentas.filter(c=>c.auth), pend=S.cuentas.filter(c=>!c.auth);
+ let h='';
+
+ if(!con.length && !pend.length){
+  h+=`<div class="empty"><div class="ei">◎</div><h3>Todavía no hay cuentas</h3>
+   <p>Conecta tu primera cuenta de Claude, GPT o Gemini. Solo necesitas un nombre
+   y hacer el login una vez.</p>
+   <button class="b p" onclick="modalNueva()">Conectar una cuenta</button></div>`;
+ }
+
+ if(con.length){
+  h+=`<div class="sec"><div class="sh"><h2>Conectadas</h2>
+   <span class="sd">la marcada como <b>activa</b> es la que usan todas tus terminales</span>
+   <span style="flex:1"></span>
+   <button class="b sm" onclick="verificarTodas()">Verificar todas</button>
+   <button class="b p sm" onclick="modalNueva()">+ Conectar cuenta</button></div>
+   <div class="cards">`;
+  con.forEach((c,i)=>h+=tarjeta(c,i));
+  h+=`</div></div>`;
+ }
+
+ if(pend.length){
+  h+=`<div class="sec"><div class="sh"><h2>Por conectar</h2>
+   <span class="sd">registradas pero sin login</span></div><div class="cards">`;
+  pend.forEach((c,i)=>h+=tarjeta(c,i+con.length));
+  h+=`</div></div>`;
+ }
+
+ if(con.length && !pend.length){
+  h+=`<div class="sec"><div class="empty" style="padding:26px">
+   <p style="margin-bottom:12px">¿Otra cuenta? Nombre, proveedor y navegador — el resto lo hago yo.</p>
+   <button class="b" onclick="modalNueva()">+ Conectar otra cuenta</button></div></div>`;
+ }
+ $('c-cuentas').innerHTML=h;
 }
 
-function pintaRanking(){
-  $('ranking').innerHTML = S.ranking.length
-    ? `<table><tr><th>#</th><th>cuenta</th><th class="num">puntaje</th><th>cupo</th></tr>` +
-      S.ranking.map((r,i) => `<tr><td>${i+1}</td>
-        <td>${i===0 ? '<b>'+esc(r.pid)+'</b> ←' : esc(r.pid)}</td>
-        <td class="num">${r.pts.toFixed(2)}</td><td class="mut">${esc(r.nota)}</td></tr>`).join('') + `</table>`
-    : '<p class="mut">ninguna cuenta disponible para esta tarea</p>';
+function tarjeta(c,i){
+ const activa = S.activas[c.provider]===c.id;
+ let dot='off', tags=[];
+ if(!c.enabled) tags.push('<span class="tag">apagada</span>');
+ else if(!c.auth){ dot='err'; tags.push('<span class="tag wa">sin login</span>'); }
+ else if(c.bloqueada){ dot='wa'; tags.push(`<span class="tag wa">límite ${esc(c.bloqueada)}</span>`); }
+ else dot='on';
+ if(activa) tags.unshift('<span class="tag ac">activa</span>');
+
+ const pct=c.cupo?Math.min(100,100*c.ventana/c.cupo):0;
+ let cuerpo='';
+ if(c.auth){
+  cuerpo=`<div class="stats">
+    <div class="st"><div class="stl">hoy</div><div class="stv">${nf(c.hoy)}</div></div>
+    <div class="st"><div class="stl">ventana ${c.horas}h</div>
+      <div class="stv">${nf(c.ventana)}${c.cupo?`<span style="font-size:12px;color:var(--tx3)">/${nf(c.cupo)}</span>`:''}</div>
+      ${c.cupo?`<div class="bar"><i class="${pct>75?'hi':''}" style="width:${pct}%"></i></div>`:''}</div>
+   </div>
+   <div class="acts">
+    ${activa?'':`<button class="b sm p" onclick="usar('${esc(c.id)}')">Usar en terminales</button>`}
+    <button class="b sm" onclick="verificar('${esc(c.id)}')">Verificar</button>
+    <button class="b sm gh" onclick="modalAjustes('${esc(c.id)}')">Ajustes</button>
+   </div>`;
+ }else{
+  cuerpo=`<div style="margin:12px 0 11px;padding-top:12px;border-top:1px solid var(--br)">
+    <p style="font-size:12.5px;color:var(--tx2)">Falta el login. Ábrelo y autoriza en el navegador.</p></div>
+   <div class="acts">
+    <button class="b sm p" onclick="modalLogin('${esc(c.id)}')">Hacer login</button>
+    <button class="b sm gh" onclick="borrar('${esc(c.id)}')">Eliminar</button>
+   </div>`;
+ }
+ return `<div class="card${activa?' act':''}" style="animation-delay:${i*45}ms">
+   <div class="ct"><span class="dot ${dot}"></span>
+    <div style="min-width:0"><div class="cn">${esc(c.id)}</div>
+     <div class="cl">${esc(c.label)}</div></div>
+    <div class="tags"><span class="tag">${esc(PROV[c.provider]||c.provider)}</span>${tags.join('')}</div>
+   </div>${cuerpo}</div>`;
 }
 
-function pintaGasto(){
-  $('gasto').innerHTML = `<table><tr><th>cuenta</th><th class="num">llam.</th><th class="num">tokens</th>
-    <th class="num">tok/llam</th><th class="num">seg</th></tr>` +
-    (S.gasto.length ? S.gasto.map(g => `<tr><td>${esc(g.pid)}</td><td class="num">${g.n}</td>
-      <td class="num">${nf(g.tokens)}</td><td class="num">${nf(g.por)}</td>
-      <td class="num">${g.seg}</td></tr>`).join('')
-      : '<tr><td colspan="5" class="mut">sin llamadas todavía</td></tr>') + `</table>`;
+/* ═══ MODALES ═══ */
+function cerrar(){const m=$('modal');m.innerHTML=''}
+function abrir(html){
+ $('modal').innerHTML=`<div class="ov" onclick="if(event.target===this)cerrar()">
+   <div class="modal">${html}</div></div>`;
+ const f=$('modal').querySelector('input,select,textarea'); if(f)f.focus();
+}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')cerrar()});
+
+function selNav(id,val){
+ return `<select id="${id}"><option value="">Navegador por defecto del sistema</option>`+
+  S.navegadores.map(n=>`<option value="${esc(n.bin)}"${val===n.bin?' selected':''}>${esc(n.nombre)}</option>`).join('')
+  +`</select>`;
 }
 
-function pintaHist(){
-  $('hist').innerHTML = `<table><tr><th>hora</th><th>cuenta</th><th>tarea</th>
-    <th class="num">tokens</th><th class="num">seg</th><th>prompt</th></tr>` +
-    (S.recientes.length ? S.recientes.map(r => `<tr>
-      <td class="mut">${esc((r.ts||'').slice(11,19))}</td><td>${esc(r.perfil)}</td>
-      <td class="mut">${esc(r.tarea||'')}</td><td class="num">${nf(r.tokens)}</td>
-      <td class="num">${r.seg}</td>
-      <td class="mut">${esc((r.prompt||'').slice(0,70))}</td></tr>`).join('')
-      : '<tr><td colspan="6" class="mut">sin historial</td></tr>') + `</table>`;
+function modalNueva(){
+ abrir(`<div class="mh"><h3>Conectar una cuenta</h3>
+   <button class="b gh sm" onclick="cerrar()">✕</button></div>
+  <div class="f"><label for="n_id">Nombre corto</label>
+   <input id="n_id" placeholder="claude-trabajo" autocomplete="off">
+   <div class="hint">Como la vas a identificar. Sin espacios.</div></div>
+  <div class="gr">
+   <div class="f"><label for="n_prov">Proveedor</label><select id="n_prov">
+     <option value="claude">Claude</option><option value="gpt">GPT (Codex)</option>
+     <option value="gemini">Gemini</option></select></div>
+   <div class="f"><label for="n_prop">Para qué es</label>
+     <input id="n_prop" value="general" placeholder="personal, empresa…"></div>
+  </div>
+  <div class="f"><label for="n_nav">Abrir el login en</label>${selNav('n_nav','')}
+   <div class="hint">Elige donde ya tienes la sesión de esa cuenta iniciada.</div></div>
+  <div class="acts" style="margin-top:18px">
+   <button class="b p" onclick="crear()">Crear y hacer login</button>
+   <button class="b gh" onclick="cerrar()">Cancelar</button></div>`);
 }
 
-function pintaAjustes(){
-  $('ajustes').innerHTML = S.cuentas.map(c => {
-    const sc = S.scores[c.id] || {};
-    const pesos = S.tareas.map(t => `<div><label for="w_${c.id}_${t}">${t}${sc[t] !== undefined
-      ? ` <span style="color:var(--acc)">·${sc[t]}</span>` : ''}</label>
-      <input id="w_${c.id}_${t}" type="number" min="0" max="10" step="0.5"
-      value="${(c.weights || {})[t] ?? 7}"></div>`).join('');
-    return `<details><summary>${estadoPill(c)} <b>${esc(c.id)}</b>
-      <span class="mut">${esc(c.provider)} · ${esc(c.plan)}</span></summary>
-      <div class="dbody">
-        <div class="g2">
-          <div><label for="f_${c.id}_label">etiqueta</label><input id="f_${c.id}_label" value="${esc(c.label)}"></div>
-          <div><label for="f_${c.id}_proposito">propósito</label><input id="f_${c.id}_proposito" value="${esc(c.proposito)}"></div>
-          <div><label for="f_${c.id}_plan">plan</label><input id="f_${c.id}_plan" value="${esc(c.plan)}"></div>
-          <div><label for="f_${c.id}_model">modelo (opcional)</label><input id="f_${c.id}_model" value="${esc(c.model)}" placeholder="por defecto"></div>
-          <div><label for="f_${c.id}_ventana_horas">ventana recarga (h)</label><input id="f_${c.id}_ventana_horas" type="number" step="0.5" value="${c.horas}"></div>
-          <div><label for="f_${c.id}_cupo_ventana">cupo por ventana</label><input id="f_${c.id}_cupo_ventana" type="number" value="${c.cupo}"></div>
-          <div><label for="f_${c.id}_budget_tokens_dia">tope diario (tok)</label><input id="f_${c.id}_budget_tokens_dia" type="number" value="${c.budget}"></div>
-        </div>
-        <label style="margin-top:14px">pesos por tarea (0-10) · en rojo tu nota medida</label>
-        <div class="g3">${pesos}</div>
-        ${!c.auth ? `<label style="margin-top:14px">autenticar (clic para copiar)</label>
-          <code onclick="copiar(this)">${esc(c.login)}</code>` : ''}
-        <div class="row" style="margin-top:15px">
-          <button class="p" onclick="guardar('${esc(c.id)}')">Guardar</button>
-          <button onclick="borrar('${esc(c.id)}')">Eliminar cuenta</button>
-        </div>
-      </div></details>`;
-  }).join('');
+async function crear(){
+ const id=$('n_id').value.trim().replace(/\s+/g,'-');
+ if(!id){toast('ponle un nombre');return}
+ const r=await P('/api/account',{id,provider:$('n_prov').value,proposito:$('n_prop').value,
+   navegador:$('n_nav').value,plan:'pro',ventana:5,cupo:0});
+ if(r.ok){ toast('cuenta creada',1); await cargar(true); modalLogin(id); }
 }
 
-/* ---- acciones ---- */
-function copiar(el){
-  navigator.clipboard.writeText(el.textContent).then(
-    () => toast('comando copiado', 1), () => toast('no pude copiar'));
+function modalLogin(id){
+ const c=S.cuentas.find(x=>x.id===id); if(!c){cerrar();return}
+ abrir(`<div class="mh"><h3>Login de ${esc(id)}</h3>
+   <button class="b gh sm" onclick="cerrar()">✕</button></div>
+  <div class="f"><label for="l_nav">Abrir en</label>${selNav('l_nav',c.navegador)}</div>
+  <p style="font-size:13px;color:var(--tx2);margin-bottom:14px">
+   Abro una terminal con todo preparado. ${c.provider==='claude'
+    ?'Escribe <b>/login</b> dentro y autoriza en el navegador.'
+    :'Sigue las instrucciones en pantalla.'}</p>
+  <div class="acts">
+   <button class="b p" onclick="lanzarLogin('${esc(id)}')">Abrir terminal de login</button>
+   <button class="b gh" onclick="verComando('${esc(id)}')">Ver el comando</button></div>
+  <div id="l_cmd"></div>`);
 }
-async function tog(id, on){ await P('/api/profile', {id, enabled: !!on}); cargar(); }
-async function limpiar(id){ await P('/api/limite', {id}); toast('límite liberado', 1); cargar(); }
+
+async function lanzarLogin(id){
+ const r=await P('/api/login-launch',{id,navegador:$('l_nav')?$('l_nav').value:null});
+ if(r.ok){
+  toast('terminal abierta — completa el login ahí',1);
+  $('l_cmd').innerHTML=`<p class="hint" style="margin-top:14px">Cuando termines, cierra esto y
+   pulsa <b>Verificar</b> en la tarjeta.</p>`;
+  cargar(true);
+ }
+}
+async function verComando(id){
+ const r=await P('/api/login-launch',{id,navegador:$('l_nav')?$('l_nav').value:null});
+ if(r.comando) $('l_cmd').innerHTML=`<label style="margin-top:14px">Comando</label>
+   <code class="cmd" onclick="copiar(this)">${esc(r.comando)}</code>`;
+}
+
+function modalAjustes(id){
+ const c=S.cuentas.find(x=>x.id===id); if(!c)return;
+ const pesos=S.tareas.map(t=>`<div class="f" style="margin:0">
+   <label for="w_${t}" style="font-size:10.5px">${t}${(S.scores[id]||{})[t]!==undefined
+    ?` <span style="color:var(--ac2)">·${(S.scores[id])[t]}</span>`:''}</label>
+   <input id="w_${t}" type="number" min="0" max="10" step="0.5" value="${(c.weights||{})[t]??7}"
+    style="min-height:32px;padding:5px 8px;font-size:12.5px"></div>`).join('');
+ abrir(`<div class="mh"><h3>${esc(id)}</h3><button class="b gh sm" onclick="cerrar()">✕</button></div>
+  <div class="gr">
+   <div class="f"><label for="a_label">Etiqueta</label><input id="a_label" value="${esc(c.label)}"></div>
+   <div class="f"><label for="a_proposito">Para qué es</label><input id="a_proposito" value="${esc(c.proposito)}"></div>
+   <div class="f"><label for="a_ventana_horas">Recarga (horas)</label>
+     <input id="a_ventana_horas" type="number" step="0.5" value="${c.horas}"></div>
+   <div class="f"><label for="a_cupo_ventana">Cupo por ventana</label>
+     <input id="a_cupo_ventana" type="number" value="${c.cupo}"><div class="hint">0 = sin tope</div></div>
+  </div>
+  <div class="f"><label for="a_navegador">Navegador para el login</label>${selNav('a_navegador',c.navegador)}</div>
+  <label style="margin-top:6px">Qué tan bueno es en cada tarea (0-10)</label>
+  <div class="hint" style="margin-bottom:9px">En rojo, la nota real que le has puesto tú.</div>
+  <div class="gr" style="grid-template-columns:repeat(auto-fit,minmax(96px,1fr))">${pesos}</div>
+  <div class="acts" style="margin-top:20px">
+   <button class="b p" onclick="guardar('${esc(id)}')">Guardar</button>
+   <button class="b gh" onclick="cerrar()">Cancelar</button>
+   <span style="flex:1"></span>
+   <button class="b gh" onclick="borrar('${esc(id)}')" style="color:var(--ac2)">Eliminar</button></div>`);
+}
 
 async function guardar(id){
-  const b = {id, weights:{}};
-  ['label','proposito','plan','model','ventana_horas','cupo_ventana','budget_tokens_dia']
-    .forEach(k => { const e = $(`f_${id}_${k}`); if(e) b[k] = e.value; });
-  S.tareas.forEach(t => { const e = $(`w_${id}_${t}`); if(e) b.weights[t] = e.value; });
-  const r = await P('/api/profile', b);
-  if(r.ok){ toast('ajustes guardados', 1); cargar(); }
+ const b={id,weights:{}};
+ ['label','proposito','ventana_horas','cupo_ventana','navegador'].forEach(k=>{
+   const e=$('a_'+k); if(e) b[k]=e.value;});
+ S.tareas.forEach(t=>{const e=$('w_'+t); if(e) b.weights[t]=e.value});
+ const r=await P('/api/profile',b);
+ if(r.ok){toast('guardado',1);cerrar();cargar(true)}
 }
 async function borrar(id){
-  if(!confirm(`¿Eliminar "${id}" del registro?\n\nLas credenciales quedan en disco; no se borran.`)) return;
-  const r = await P('/api/delete', {id});
-  if(r.ok){ toast('cuenta eliminada del registro', 1); cargar(); }
+ if(!confirm(`¿Eliminar "${id}"?\n\nSe quita del registro; las credenciales quedan en disco.`))return;
+ const r=await P('/api/delete',{id});
+ if(r.ok){toast('eliminada',1);cerrar();cargar(true)}
 }
-async function agregar(){
-  const b = {id:$('n_id').value.trim(), provider:$('n_prov').value, plan:$('n_plan').value,
-    proposito:$('n_prop').value, label:$('n_lab').value,
-    ventana:parseFloat($('n_vent').value)||5, cupo:parseInt($('n_cupo').value)||0};
-  if(!b.id){ toast('falta el id'); return; }
-  const r = await P('/api/account', b);
-  if(r.login){
-    $('n_out').innerHTML = `<label style="margin-top:14px">creada — autentícala (clic para copiar)</label>
-      <code onclick="copiar(this)">${esc(r.login)}</code>`;
-    toast('cuenta creada', 1); $('n_id').value = ''; cargar();
-  }
+async function usar(id){
+ const r=await P('/api/usar',{id});
+ if(r.ok){toast(r.mensaje,1);cargar(true)}
 }
 
-/* ---- consola ---- */
-function modoCambio(){
-  const m = $('q_modo').value;
-  $('q_perfil').disabled = (m !== 'ask');
-  $('q_hint').textContent = m === 'audit'
-    ? 'responden todas y luego se auditan entre sí (gasta de cada cuenta)'
-    : m === 'fan' ? 'misma pregunta a todas las cuentas activas, en paralelo'
-    : 'el router elige la mejor cuenta según tarea y cupo';
+/* ═══ CONSULTAR ═══ */
+function vistaConsultar(){
+ const listas=S.cuentas.filter(c=>c.auth&&c.enabled&&!c.bloqueada);
+ if(!listas.length){
+  $('c-consultar').innerHTML=`<div class="empty"><div class="ei">◎</div>
+   <h3>Nada que consultar todavía</h3><p>Conecta al menos una cuenta primero.</p>
+   <button class="b p" onclick="irA('cuentas')">Ir a Cuentas</button></div>`;
+  return;
+ }
+ if($('q')) return;  // no repintar mientras escribe
+ const multi=listas.length>1;
+ $('c-consultar').innerHTML=`<div class="sec">
+  <div class="f"><label for="q">Qué necesitas</label>
+   <textarea id="q" placeholder="Escribe tu consulta…"></textarea>
+   <div class="hint">Ctrl+Enter para enviar</div></div>
+  <div class="gr">
+   <div class="f"><label for="q_modo">Cómo</label><select id="q_modo" onchange="hintModo()">
+     <option value="ask">Delegar a la mejor cuenta</option>
+     ${multi?'<option value="fan">Preguntar a todas</option>':''}
+     ${multi?'<option value="audit">Auditoría cruzada</option>':''}</select></div>
+   <div class="f"><label for="q_tarea">Tipo de tarea</label><select id="q_tarea">
+     ${S.tareas.map(t=>`<option${t==='reasoning'?' selected':''}>${t}</option>`).join('')}</select></div>
+   <div class="f"><label for="q_perfil">Cuenta</label><select id="q_perfil">
+     <option value="">Automático</option>
+     ${listas.map(c=>`<option value="${esc(c.id)}">${esc(c.id)}</option>`).join('')}</select></div>
+  </div>
+  <p class="hint" id="q_hint" style="margin-bottom:14px"></p>
+  <button class="b p" id="q_run" onclick="correr()">Enviar</button>
+ </div><div id="q_res"></div>`;
+ hintModo();
+ $('q').addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter')correr()});
 }
-$('q').addEventListener('keydown', e => {
-  if((e.ctrlKey || e.metaKey) && e.key === 'Enter') correr();
-});
-
+function irA(t){const b=[...$('tabs').children].find(x=>x.dataset.t===t); if(b)b.click()}
+function hintModo(){
+ const m=$('q_modo'); if(!m)return;
+ $('q_perfil').disabled = m.value!=='ask';
+ $('q_hint').textContent = m.value==='audit'
+  ? 'Todas responden y luego cada una audita a las otras. Gasta de cada cuenta.'
+  : m.value==='fan' ? 'La misma pregunta a todas a la vez, para comparar.'
+  : 'El router elige según el tipo de tarea y el cupo que le queda a cada una.';
+}
 async function correr(){
-  const prompt = $('q').value.trim();
-  if(!prompt){ toast('escribe algo primero'); return; }
-  $('q_run').disabled = true;
-  $('q_res_sec').hidden = false;
-  $('q_res').innerHTML = '<p class="mut"><span class="spin"></span> encolando…</p>';
-  const r = await P('/api/run', {prompt, tarea:$('q_tarea').value, modo:$('q_modo').value,
-    perfil:$('q_perfil').value || null, timeout:parseInt($('q_to').value) || 300});
-  if(!r.job){ $('q_run').disabled = false; $('q_res').innerHTML = '<p class="mut">no se pudo iniciar</p>'; return; }
-  JOB = r.job;
-  clearInterval(TICK);
-  TICK = setInterval(poll, 1500);
-  poll();
+ const p=$('q').value.trim(); if(!p){toast('escribe algo primero');return}
+ $('q_run').disabled=true;
+ $('q_res').innerHTML='<p style="color:var(--tx2);display:flex;gap:9px;align-items:center"><span class="spin"></span> preparando…</p>';
+ const r=await P('/api/run',{prompt:p,tarea:$('q_tarea').value,modo:$('q_modo').value,
+   perfil:$('q_perfil').value||null,timeout:300});
+ if(!r.job){$('q_run').disabled=false;return}
+ JOB=r.job; clearInterval(TICK); TICK=setInterval(poll,1400); poll();
 }
-
+async function verificar(id){ lanzarVerif({id}) }
+async function verificarTodas(){ lanzarVerif({}) }
+async function lanzarVerif(body){
+ const r=await P('/api/verificar',body);
+ if(!r.job)return;
+ toast('probando cuentas…',1);
+ irA('consultar');
+ $('q_res')&&($('q_res').innerHTML='<p style="color:var(--tx2);display:flex;gap:9px;align-items:center"><span class="spin"></span> probando…</p>');
+ JOB=r.job; clearInterval(TICK); TICK=setInterval(poll,1400); poll();
+}
 async function poll(){
-  if(!JOB) return;
-  let j;
-  try{ j = await (await fetch('/api/job/' + JOB)).json(); }catch(e){ return; }
-  pintaJob(j);
-  if(j.estado === 'listo' || j.estado === 'error'){
-    clearInterval(TICK); TICK = null; JOB = null;
-    $('q_run').disabled = false;
-    if(j.estado === 'listo') toast(`listo · ${nf(j.total)} tokens`, 1);
-    cargar();
-  }
+ if(!JOB)return;
+ let j; try{ j=await (await fetch('/api/job/'+JOB)).json(); }catch(e){return}
+ pintaJob(j);
+ if(j.estado==='listo'||j.estado==='error'){
+  clearInterval(TICK);TICK=null;JOB=null;
+  const b=$('q_run'); if(b)b.disabled=false;
+  if(j.estado==='listo'&&j.total!=null) toast(`listo · ${nf(j.total)} tokens`,1);
+  cargar(true);
+ }
 }
-
-function bloque(r, esAud){
-  const err = r.rc !== 0;
-  return `<div class="res"><div class="rh${esAud ? ' aud' : ''}">
-      <b>${esAud ? 'auditoría por ' : ''}${esc(r.perfil)}</b>
-      <span class="mut">${nf(r.tokens)} tok · ${r.seg}s</span>
-      ${err ? '<span class="pill no">error</span>' : ''}
-      ${r.limitado ? `<span class="pill wa">límite → ${esc(r.limitado)}</span>` : ''}
-      <span style="flex:1"></span>
-      <span class="mut">nota:</span>
-      ${[0,3,5,7,8,9,10].map(n => `<button class="sm" onclick="nota('${esc(r.run_id)}',${n},this)">${n}</button>`).join('')}
-    </div><pre>${esc(r.texto || '(sin texto)')}</pre></div>`;
+function bloque(r,aud){
+ const err=r.rc!==0;
+ return `<div class="res"><div class="rh">
+   <span class="dot ${err?'err':'on'}" style="margin:0"></span>
+   <b>${aud?'auditoría de ':''}${esc(r.perfil)}</b>
+   <span style="color:var(--tx3)">${nf(r.tokens)} tok · ${r.seg}s</span>
+   ${r.limitado?`<span class="tag wa">límite ${esc(r.limitado)}</span>`:''}
+   <span style="flex:1"></span>
+   <span style="color:var(--tx3);font-size:11.5px">nota</span>
+   ${[3,5,7,9,10].map(n=>`<button class="b sm gh" onclick="nota('${esc(r.run_id)}',${n},this)">${n}</button>`).join('')}
+  </div><pre class="out">${esc(r.texto||'(sin respuesta)')}</pre></div>`;
 }
-
 function pintaJob(j){
-  if(j.estado === 'error'){
-    $('q_res').innerHTML = `<p class="pill no" style="display:block;padding:11px">${esc(j.error)}</p>`; return;
-  }
-  let h = '';
-  if(j.estado !== 'listo'){
-    h += `<p class="mut"><span class="spin"></span> ${esc(j.fase || j.estado)}` +
-         (j.cuentas ? ` · ${esc(j.cuentas.join(', '))}` : '') + `…</p>`;
-  }
-  (j.respuestas || []).forEach(r => h += bloque(r, false));
-  (j.auditorias || []).forEach(r => h += bloque(r, true));
-  if(j.estado === 'listo'){
-    h += `<p class="mut">total de esta consulta: <b>${nf(j.total)}</b> tokens`
-       + ` · ${(j.respuestas||[]).length} respuestas`
-       + ((j.auditorias||[]).length ? ` + ${j.auditorias.length} auditorías` : '') + `</p>`;
-  }
-  $('q_res').innerHTML = h;
+ const box=$('q_res'); if(!box)return;
+ if(j.estado==='error'){
+  box.innerHTML=`<div class="res"><div class="rh"><span class="dot err" style="margin:0"></span>
+   <b>Error</b></div><pre class="out">${esc(j.error)}</pre></div>`; return;
+ }
+ let h='';
+ if(j.estado!=='listo') h+=`<p style="color:var(--tx2);display:flex;gap:9px;align-items:center;margin-bottom:12px">
+   <span class="spin"></span> ${esc(j.fase||j.estado)}${j.cuentas?' · '+esc(j.cuentas.join(', ')):''}…</p>`;
+ (j.respuestas||[]).forEach(r=>h+=bloque(r,false));
+ (j.auditorias||[]).forEach(r=>h+=bloque(r,true));
+ if(j.estado==='listo'&&j.total!=null)
+  h+=`<p class="hint">Total: <b>${nf(j.total)}</b> tokens</p>`;
+ box.innerHTML=h;
+}
+async function nota(run_id,n,btn){
+ const t=$('q_tarea')?$('q_tarea').value:'reasoning';
+ const r=await P('/api/score',{run_id,nota:n,tarea:t});
+ if(r.ok){toast(`nota ${n} · promedio ${r.promedio}`,1);
+  btn.parentElement.querySelectorAll('button').forEach(b=>b.disabled=true);cargar(true)}
 }
 
-async function nota(run_id, n, btn){
-  const r = await P('/api/score', {run_id, nota:n, tarea:$('q_tarea').value});
-  if(r.ok){
-    toast(`nota ${n} guardada · promedio ${r.promedio} (n=${r.n})`, 1);
-    btn.parentElement.querySelectorAll('button.sm').forEach(b => b.disabled = true);
-    cargar();
-  }
-}
+/* ═══ USO ═══ */
+function vistaUso(){
+ if(!S.total_llamadas){
+  $('c-uso').innerHTML=`<div class="empty"><div class="ei">◎</div>
+   <h3>Sin actividad todavía</h3><p>Cuando hagas consultas aparecerá aquí el gasto de cada cuenta.</p></div>`;
+  return;
+ }
+ let h=`<div class="sec"><div class="sh"><h2>Gasto por cuenta</h2></div><div class="tw"><table>
+  <thead><tr><th>Cuenta</th><th class="num">Llamadas</th><th class="num">Tokens</th>
+  <th class="num">Por llamada</th><th class="num">Segundos</th></tr></thead><tbody>`;
+ S.gasto.forEach(g=>h+=`<tr><td><b>${esc(g.pid)}</b></td><td class="num">${nf(g.n)}</td>
+   <td class="num">${nf(g.tokens)}</td><td class="num">${nf(g.por)}</td>
+   <td class="num">${g.seg}</td></tr>`);
+ h+=`</tbody></table></div></div>`;
 
-modoCambio(); cargar(); setInterval(() => { if(!JOB) cargar(); }, 25000);
+ if(S.ranking&&S.ranking.length){
+  h+=`<div class="sec"><div class="sh"><h2>A quién delega</h2>
+   <select onchange="cambiarTarea(this.value)" style="width:auto;min-height:30px;padding:4px 9px;font-size:12.5px">
+    ${S.tareas.map(t=>`<option${t===S._tarea?' selected':''}>${t}</option>`).join('')}</select></div>
+   <div class="tw"><table><thead><tr><th>#</th><th>Cuenta</th><th class="num">Puntaje</th>
+   <th>Cupo</th></tr></thead><tbody>`;
+  S.ranking.forEach((r,i)=>h+=`<tr><td>${i+1}</td>
+   <td>${i===0?'<b>'+esc(r.pid)+'</b>':esc(r.pid)}</td>
+   <td class="num">${r.pts.toFixed(2)}</td>
+   <td style="color:var(--tx2)">${esc(r.nota)}</td></tr>`);
+  h+=`</tbody></table></div></div>`;
+ }
+
+ if(S.recientes&&S.recientes.length){
+  h+=`<div class="sec"><div class="sh"><h2>Últimas llamadas</h2></div><div class="tw"><table>
+   <thead><tr><th>Hora</th><th>Cuenta</th><th>Tarea</th><th class="num">Tokens</th>
+   <th class="num">Seg</th></tr></thead><tbody>`;
+  S.recientes.slice(0,14).forEach(r=>h+=`<tr><td style="color:var(--tx2)">${esc((r.ts||'').slice(11,19))}</td>
+   <td>${esc(r.perfil)}</td><td style="color:var(--tx2)">${esc(r.tarea||'')}</td>
+   <td class="num">${nf(r.tokens)}</td><td class="num">${r.seg}</td></tr>`);
+  h+=`</tbody></table></div></div>`;
+ }
+ $('c-uso').innerHTML=h;
+}
+async function cambiarTarea(t){ S._tarea=t; await cargar(true) }
+
+cargar();
+setInterval(()=>{if(!JOB && !$('modal').innerHTML) cargar(true)},22000);
 </script></body></html>

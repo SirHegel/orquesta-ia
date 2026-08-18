@@ -28,6 +28,7 @@ def estado(tarea="code"):
             "hoy": L.gastado_hoy(pid), "ventana": L.gastado_ventana(pid, horas),
             "cupo": p.get("cupo_ventana", 0), "budget": p.get("budget_tokens_dia", 0),
             "horas": horas, "model": p.get("model", ""),
+            "navegador": p.get("navegador", ""), "auth_modo": p.get("auth", ""),
             "weights": p.get("weights", {}), "login": L.cmd_login(pid, p),
         })
     gasto = []
@@ -41,6 +42,8 @@ def estado(tarea="code"):
     for pid, t in L.scores().items():
         sc[pid] = {k: round(v["suma"] / v["n"], 2) for k, v in t.items() if v.get("n")}
     return {"cuentas": cuentas, "gasto": gasto, "scores": sc, "tareas": L.TAREAS,
+            "navegadores": L.navegadores(), "terminal": L.terminal_disponible()[0],
+            "activas": L.activas(),
             "ranking": [{"pid": x["pid"], "pts": round(x["pts"], 2), "nota": x["nota"]}
                         for x in L.ranking(tarea)],
             "recientes": rows[-25:][::-1],
@@ -183,7 +186,7 @@ class H(BaseHTTPRequestHandler):
                 if not pr:
                     return self._j(404, {"error": "no existe"})
                 for k, cast in (("label", str), ("plan", str), ("proposito", str),
-                                ("model", str), ("ventana_horas", float),
+                                ("model", str), ("navegador", str), ("ventana_horas", float),
                                 ("cupo_ventana", int), ("budget_tokens_dia", int),
                                 ("enabled", bool)):
                     if k in d:
@@ -232,6 +235,50 @@ class H(BaseHTTPRequestHandler):
                 L._escribir(L.SCORES, s)
             e = L.scores()[pid][tarea]
             return self._j(200, {"ok": True, "promedio": round(e["suma"] / e["n"], 2), "n": e["n"]})
+
+        if p == "/api/usar":
+            ok, msg = L.usar(d.get("id"))
+            return self._j(200 if ok else 400, {"ok": ok, "mensaje": msg})
+
+        if p == "/api/login-launch":
+            pid = d.get("id")
+            pr = L.cfg().get("profiles", {}).get(pid)
+            if not pr:
+                return self._j(404, {"error": "no existe"})
+            if d.get("navegador") is not None:
+                with L.bloqueo():
+                    cf = L.cfg(); cf["profiles"][pid]["navegador"] = d["navegador"]
+                    L.guardar_cfg(cf)
+                pr = L.cfg()["profiles"][pid]
+            ok, msg = L.lanzar_login(pid, pr)
+            return self._j(200 if ok else 500,
+                           {"ok": ok, "mensaje": msg, "comando": L.cmd_login(pid, pr)})
+
+        if p == "/api/verificar":
+            pid = d.get("id")
+            ps = L.cfg().get("profiles", {})
+            objetivo = ({pid: ps[pid]} if pid in ps else
+                        {k: v for k, v in ps.items()
+                         if v.get("enabled", True) and L.autenticado(k, v)})
+            if not objetivo:
+                return self._j(400, {"error": "nada que verificar"})
+            jid = uuid.uuid4().hex[:12]
+            _job_set(jid, estado="encolado", modo="verificar")
+
+            def _ver():
+                try:
+                    _job_set(jid, estado="corriendo", fase="probando",
+                             cuentas=list(objetivo))
+                    with ThreadPoolExecutor(max_workers=len(objetivo)) as ex:
+                        res = list(ex.map(
+                            lambda kv: L.correr(kv[0], kv[1], "di solo: ok",
+                                                "reasoning", 90), objetivo.items()))
+                    _job_set(jid, estado="listo", respuestas=res, auditorias=[],
+                             total=sum(r["tokens"] for r in res))
+                except Exception as e:
+                    _job_set(jid, estado="error", error=str(e))
+            threading.Thread(target=_ver, daemon=True).start()
+            return self._j(200, {"job": jid})
 
         if p == "/api/run":
             prompt = (d.get("prompt") or "").strip()
