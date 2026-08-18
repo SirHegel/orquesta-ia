@@ -83,7 +83,13 @@ orqyo() {
 # tendrias que acordarte del flag cada vez (antes hacias 'codex --yolo').
 # Para una llamada puntual sin permisos: 'command claude ...'
 if [ "${ORQ_PERMISOS_TOTALES:-1}" = "1" ]; then
-  claude() { command claude --dangerously-skip-permissions "$@"; }
+  # Respeta tu lanzador claude-vagabond (el del logo de Musashi) si existe,
+  # solo le añade los permisos.
+  if [ -x "$HOME/.config/kitty/claude-vagabond" ]; then
+    claude() { "$HOME/.config/kitty/claude-vagabond" --dangerously-skip-permissions "$@"; }
+  else
+    claude() { command claude --dangerously-skip-permissions "$@"; }
+  fi
   codex()  {
     case "$1" in
       exec|login|logout|mcp|sandbox|apply|resume)
