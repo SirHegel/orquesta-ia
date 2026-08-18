@@ -36,11 +36,14 @@ printf '#!/usr/bin/env bash\nexec "$(git rev-parse --show-toplevel)/tools/scan-s
 
 ## Superficie de red
 
-El panel escucha **solo en `127.0.0.1`**. No hay bind a `0.0.0.0`, no hay autenticación
-remota porque no hay acceso remoto. Si necesitas llegar desde otra máquina, usa un túnel
-SSH (`ssh -L 8787:127.0.0.1:8787 …`) en vez de exponer el puerto.
+El panel escucha **solo en `127.0.0.1`**. Además, la API valida `Host`, rechaza un
+`Origin` ajeno y exige `application/json` en todos los POST. Estas comprobaciones
+evitan solicitudes desde páginas externas y ataques de DNS rebinding contra el servicio
+local. Si necesitas llegar desde otra máquina, usa un túnel SSH
+(`ssh -L 8787:127.0.0.1:8787 …`) en vez de exponer el puerto.
 
-Las respuestas de la API van con `X-Content-Type-Options: nosniff` y `Cache-Control: no-store`.
+Las respuestas de la API van con CSP, `X-Frame-Options: DENY`,
+`X-Content-Type-Options: nosniff` y `Cache-Control: no-store`.
 La interfaz escapa todo el contenido que viene del servidor antes de insertarlo en el DOM,
 para que una respuesta de un modelo no pueda inyectar HTML en el panel.
 

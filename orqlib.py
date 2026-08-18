@@ -3,7 +3,7 @@
 Estado en disco con bloqueo fcntl: cualquier numero de terminales puede usar
 el sistema a la vez sin corromper el ledger ni los contadores.
 """
-import json, os, re, shutil, subprocess, sys, threading, time, datetime, fcntl, contextlib
+import json, os, re, shlex, shutil, subprocess, sys, threading, time, datetime, fcntl, contextlib
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 BASE = os.environ.get("ORQ_HOME") or os.path.dirname(os.path.abspath(__file__))
@@ -13,12 +13,59 @@ LEDGER = os.path.join(BASE, "state", "ledger.jsonl")
 LIMITS = os.path.join(BASE, "state", "limits.json")
 SCORES = os.path.join(BASE, "state", "scores.json")
 LOCK = os.path.join(BASE, "state", ".lock")
+CLAVE_LIMITE_ANTIGRAVITY = "@antigravity-global"
 
 TAREAS = ["code", "agentic", "reasoning", "review", "writing",
           "research", "edicion", "imagen", "bulk"]
 
-# Solo estos proveedores saben generar imagenes.
+# Capacidades por motor. El chat de maxima potencia es Claude/Codex;
+# Antigravity se reserva para generar recursos visuales con Nano Banana.
+PROVEEDORES_TEXTO = {"claude", "gpt"}
 PROVEEDORES_IMAGEN = {"antigravity"}
+
+# Potencia del motor efectivo, no del nombre de la cuenta. Claude Opus y el
+# Codex configurado compiten en el nivel maximo; AGY tiene ese nivel solo para
+# su capacidad visual. Un perfil puede ajustar ``power`` (numero o por tarea).
+POTENCIA_BASE = {"claude": 10.0, "gpt": 10.0, "antigravity": 10.0}
+ID_PERFIL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+MIN_MUESTRA_REPARTO = 10_000
+
+
+def id_perfil_valido(pid):
+    return bool(ID_PERFIL_RE.fullmatch(str(pid or "")))
+
+
+def admite_tarea(p, tarea):
+    """Indica si un perfil puede recibir la tarea, antes de puntuarlo.
+
+    ``allowed_tasks`` permite restringir un perfil. No puede ampliar la
+    capacidad real del motor: uno visual nunca termina contestando el chat
+    normal solo porque los motores de texto tengan menos cuota.
+    """
+    prov = p.get("provider")
+    capacidad_motor = (prov in PROVEEDORES_IMAGEN if tarea == "imagen"
+                       else prov in PROVEEDORES_TEXTO)
+    if not capacidad_motor:
+        return False
+    explicitas = p.get("allowed_tasks")
+    if explicitas is None:
+        return True
+    if isinstance(explicitas, str):
+        explicitas = [explicitas]
+    # La configuracion puede restringir capacidades, nunca inventarlas.
+    return tarea in explicitas
+
+
+def potencia_perfil(p, tarea):
+    valor = p.get("power")
+    if isinstance(valor, dict):
+        valor = valor.get(tarea)
+    if valor is None:
+        valor = POTENCIA_BASE.get(p.get("provider"), 0)
+    try:
+        return max(0.0, float(valor))
+    except (TypeError, ValueError):
+        return 0.0
 
 # Ventana de recarga tipica por plan (horas). Ajustable por perfil.
 VENTANA_PLAN = {"max": 5, "pro": 5, "team": 5, "api": 1, "free": 5, "desconocido": 5}
@@ -202,8 +249,10 @@ def comando(p, prompt):
         return base + [prompt]
     if prov == "antigravity":
         base = ["agy", "--output-format", "json"] + perm
-        if p.get("model"):
-            base += ["--model", p["model"]]
+        if modelo:
+            base += ["--model", modelo]
+        if mx.get("effort"):
+            base += ["--effort", mx["effort"]]
         return base + ["-p", prompt]
     if prov == "gemini":
         base = ["gemini", "--skip-trust"] + perm
@@ -238,30 +287,35 @@ def cmd_login(pid, p):
     prov = p.get("provider")
     h = home_de(pid, p)
     nav = p.get("navegador")
-    pre = f'BROWSER={nav} ' if nav else ""
+    pre = f"BROWSER={shlex.quote(nav)} " if nav else ""
+    hq = shlex.quote(h)
     if prov == "claude":
-        return f'{pre}CLAUDE_CONFIG_DIR="{h}" claude   # dentro escribe: /login'
+        return f'{pre}CLAUDE_CONFIG_DIR={hq} claude   # dentro escribe: /login'
     if prov == "gpt":
-        return f'{pre}CODEX_HOME="{h}" codex login'
-    if prov == "antigravity":
-        import shutil
-        return shutil.which("agy") is not None
+        return f'{pre}CODEX_HOME={hq} codex login'
     if prov == "antigravity":
         return "agy   # si pide sesion, autoriza en el navegador"
     if prov == "gemini":
         if p.get("auth") == "oauth":
-            return (f'GEMINI_CLI_HOME="{h}" GOOGLE_GENAI_USE_GCA=true '
-                    f'BROWSER={nav or "firefox"} gemini   # autoriza con la cuenta de Google')
-        return (f'mkdir -p "{h}" && printf %s "TU_API_KEY" > "{h}/api_key" '
-                f'&& chmod 600 "{h}/api_key"')
+            return (f'GEMINI_CLI_HOME={hq} GOOGLE_GENAI_USE_GCA=true '
+                    f'BROWSER={shlex.quote(nav or "firefox")} gemini'
+                    '   # autoriza con la cuenta de Google')
+        k = shlex.quote(os.path.join(h, "api_key"))
+        return (f'mkdir -p {hq} && printf %s TU_API_KEY > {k} '
+                f'&& chmod 600 {k}')
     return "proveedor desconocido"
 
 
 # ---------------- limites de uso ----------------
 PAT_LIMITE = re.compile(
-    r"(rate.?limit|usage limit|limit reached|too many requests|quota|429|"
+    r"(rate.?limit|usage limit|limit reached|too many requests|quota|"
+    r"resource_exhausted|"
     r"limite de uso|has alcanzado)", re.I)
 PAT_RESET = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", re.I)
+PAT_RESET_EN = re.compile(
+    r"resets?\s+in\s+(?:(\d+)\s*h(?:ours?)?)?\s*"
+    r"(?:(\d+)\s*m(?:in(?:utes?)?)?)?\s*"
+    r"(?:(\d+)\s*s(?:ec(?:onds?)?)?)?", re.I)
 
 
 def detectar_limite(pid, p, texto):
@@ -270,8 +324,18 @@ def detectar_limite(pid, p, texto):
         return None
     horas = p.get("ventana_horas") or VENTANA_PLAN.get(p.get("plan", "desconocido"), 5)
     hasta = ahora() + datetime.timedelta(hours=horas)
-    m = PAT_RESET.search(texto)
-    if m:
+    relativo = PAT_RESET_EN.search(texto)
+    if relativo and any(relativo.groups()):
+        try:
+            hh, mm, ss = (int(x or 0) for x in relativo.groups())
+            hasta = ahora() + datetime.timedelta(hours=hh, minutes=mm, seconds=ss)
+        except Exception:
+            pass
+    else:
+        m = PAT_RESET.search(texto)
+        if not m:
+            m = None
+    if not (relativo and any(relativo.groups())) and m:
         try:
             hh = int(m.group(1)); mm = int(m.group(2) or 0); ap = (m.group(3) or "").lower()
             if ap == "pm" and hh < 12: hh += 12
@@ -284,33 +348,70 @@ def detectar_limite(pid, p, texto):
             pass
     with bloqueo():
         L = limites()
-        L[pid] = {"bloqueado_hasta": hasta.isoformat(timespec="seconds"),
-                  "detectado": ahora().isoformat(timespec="seconds"),
-                  "motivo": texto.strip()[:200]}
+        clave = (CLAVE_LIMITE_ANTIGRAVITY
+                 if p.get("provider") == "antigravity" else pid)
+        L[clave] = {"bloqueado_hasta": hasta.isoformat(timespec="seconds"),
+                    "detectado": ahora().isoformat(timespec="seconds"),
+                    "motivo": texto.strip()[:200]}
         _escribir(LIMITS, L)
     return hasta
 
 
 def bloqueado(pid):
-    L = limites().get(pid)
-    if not L:
-        return None
-    try:
-        hasta = datetime.datetime.fromisoformat(L["bloqueado_hasta"])
-    except Exception:
-        return None
-    return hasta if hasta > ahora() else None
+    todos = limites()
+    claves = [pid]
+    perfiles = cfg().get("profiles", {})
+    if (perfiles.get(pid) or {}).get("provider") == "antigravity":
+        # Todos los perfiles AGY comparten la misma sesion y, por tanto, la
+        # misma cuota. Un alias no puede eludir el limite de otro.
+        claves = [CLAVE_LIMITE_ANTIGRAVITY] + [
+            k for k, v in perfiles.items() if v.get("provider") == "antigravity"]
+    vigentes = []
+    for clave in claves:
+        dato = todos.get(clave)
+        if not dato:
+            continue
+        try:
+            hasta = datetime.datetime.fromisoformat(dato["bloqueado_hasta"])
+        except Exception:
+            continue
+        if hasta > ahora():
+            vigentes.append(hasta)
+    return max(vigentes) if vigentes else None
 
 
 def limpiar_limite(pid):
     with bloqueo():
         L = limites()
-        L.pop(pid, None)
+        perfiles = cfg().get("profiles", {})
+        if (perfiles.get(pid) or {}).get("provider") == "antigravity":
+            L.pop(CLAVE_LIMITE_ANTIGRAVITY, None)
+            for k, v in perfiles.items():
+                if v.get("provider") == "antigravity":
+                    L.pop(k, None)
+        else:
+            L.pop(pid, None)
         _escribir(LIMITS, L)
 
 
 # ---------------- extraccion ----------------
+def _texto_error(error):
+    if not error:
+        return ""
+    if isinstance(error, str):
+        return error.strip()
+    if isinstance(error, dict):
+        partes = []
+        for k in ("status", "code", "message", "detail", "error"):
+            v = error.get(k)
+            if v not in (None, ""):
+                partes.append(str(v))
+        return " · ".join(dict.fromkeys(partes))
+    return str(error).strip()
+
+
 def extraer(provider, stdout, stderr=""):
+    """Devuelve (respuesta, tokens, diagnostico_del_proveedor)."""
     if provider == "claude":
         try:
             d = json.loads(stdout)
@@ -318,25 +419,64 @@ def extraer(provider, stdout, stderr=""):
             tok = (u.get("input_tokens", 0) + u.get("output_tokens", 0)
                    + u.get("cache_read_input_tokens", 0)
                    + u.get("cache_creation_input_tokens", 0))
-            return (d.get("result") or ""), tok
+            texto = d.get("result") or ""
+            diag = _texto_error(d.get("error"))
+            if d.get("is_error") and not diag:
+                diag = str(texto).strip()
+            return texto, tok, diag
         except Exception:
-            return (stdout or "").strip(), 0
+            return (stdout or "").strip(), 0, (stderr or "").strip()
     if provider == "antigravity":
         try:
             d = json.loads(stdout)
             u = d.get("usage", {}) or {}
-            return (d.get("response") or "").strip(), u.get("total_tokens", 0)
+            texto = (d.get("response") or "").strip()
+            diag = _texto_error(d.get("error"))
+            if str(d.get("status", "")).upper() == "ERROR" and not diag:
+                diag = "Antigravity termino con estado ERROR"
+            return texto, u.get("total_tokens", 0), diag
         except Exception:
-            return (stdout or "").strip(), 0
+            return (stdout or "").strip(), 0, (stderr or "").strip()
     if provider == "gpt":
         m = re.findall(r"tokens used\s*\n\s*([\d.,\s]*\d)", stderr or "")
         tok = sum(int(re.sub(r"\D", "", x)) for x in m if re.sub(r"\D", "", x))
-        return (stdout or "").strip(), tok
-    return (stdout or "").strip(), 0
+        return (stdout or "").strip(), tok, (stderr or "").strip()
+    return (stdout or "").strip(), 0, (stderr or "").strip()
+
+
+def _error_estructurado(provider, stdout):
+    """Distingue un error JSON de avisos normales escritos en stderr."""
+    if provider not in ("claude", "antigravity"):
+        return False
+    try:
+        d = json.loads(stdout)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(d, dict):
+        return False
+    if provider == "claude":
+        return bool(d.get("is_error") or d.get("error"))
+    return bool(d.get("error") or str(d.get("status", "")).upper() == "ERROR")
 
 
 # ---------------- ejecucion ----------------
 def correr(pid, p, prompt, tarea="reasoning", timeout=300, carpeta=None):
+    if not admite_tarea(p, tarea):
+        t0 = time.time()
+        run_id = f"{pid}-{time.time_ns()}"
+        texto = (f"[ERROR capacidad] {pid} ({p.get('provider', '?')}) no admite "
+                 f"la tarea '{tarea}'")
+        log({"ts": ahora().isoformat(timespec="seconds"), "fecha": hoy(),
+             "semana": ahora().strftime("%G-S%V"), "mes": ahora().strftime("%Y-%m"),
+             "perfil": pid, "provider": p.get("provider", "?"), "tarea": tarea,
+             "tokens": 0, "seg": 0.0, "rc": 2, "limite": False,
+             "sesion": os.environ.get("ORQ_SESION", "sin-sesion"),
+             "term": os.environ.get("ORQ_SESION_TERM", ""),
+             "carpeta": carpeta or "", "prompt": prompt[:200], "run_id": run_id})
+        return {"perfil": pid, "label": p.get("label", pid), "texto": texto,
+                "tokens": 0, "seg": 0.0, "rc": 2, "run_id": run_id,
+                "limitado": None}
+
     env = entorno(pid, p)
     cmd = comando(p, prompt)
     prov = p.get("provider")
@@ -349,8 +489,14 @@ def correr(pid, p, prompt, tarea="reasoning", timeout=300, carpeta=None):
         r = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=timeout, env=env, cwd=destino)
         out, err, rc = r.stdout, r.stderr, r.returncode
-    except subprocess.TimeoutExpired:
-        out, err, rc = "", f"timeout tras {timeout}s", 124
+    except subprocess.TimeoutExpired as e:
+        out, err = e.stdout or "", e.stderr or ""
+        if isinstance(out, bytes):
+            out = out.decode(errors="replace")
+        if isinstance(err, bytes):
+            err = err.decode(errors="replace")
+        err = (err.rstrip() + f"\ntimeout tras {timeout}s").strip()
+        rc = 124
     except FileNotFoundError as e:
         out, err, rc = "", f"binario no encontrado: {e}", 127
     finally:
@@ -360,11 +506,22 @@ def correr(pid, p, prompt, tarea="reasoning", timeout=300, carpeta=None):
             finally:
                 f_lock.close()
     dur = round(time.time() - t0, 1)
-    texto, tok = extraer(p["provider"], out, err)
-    lim = detectar_limite(pid, p, (texto or "") + "\n" + (err or ""))
-    if rc != 0 and not texto:
-        texto = f"[ERROR rc={rc}] {(err or '').strip()[:400]}"
-    run_id = f"{pid}-{int(t0)}"
+    texto, tok, diagnostico = extraer(p["provider"], out, err)
+    error_estructurado = _error_estructurado(p["provider"], out)
+    if rc != 0 and not diagnostico:
+        diagnostico = ((out or "") + "\n" + (err or "")).strip()
+    if rc == 0 and (error_estructurado or not (texto or "").strip()):
+        rc = 1
+        diagnostico = diagnostico or "el proveedor termino sin respuesta"
+    # Stderr de Codex puede contener el texto normal del trabajo (incluidos
+    # numeros o la palabra quota). Solo es evidencia de limite si la llamada
+    # fallo o el JSON del proveedor declara explicitamente un error.
+    lim = detectar_limite(pid, p, diagnostico) if (rc != 0 or error_estructurado) else None
+    if rc != 0:
+        detalle = "\n".join(x for x in (diagnostico, texto) if x).strip()
+        detalle = detalle or "sin detalle del proveedor"
+        texto = f"[ERROR rc={rc}] {detalle.strip()[:400]}"
+    run_id = f"{pid}-{time.time_ns()}"
     log({"ts": ahora().isoformat(timespec="seconds"), "fecha": hoy(),
          "semana": ahora().strftime("%G-S%V"), "mes": ahora().strftime("%Y-%m"),
          "perfil": pid, "provider": p["provider"], "tarea": tarea,
@@ -378,23 +535,33 @@ def correr(pid, p, prompt, tarea="reasoning", timeout=300, carpeta=None):
 
 
 # ---------------- routing ----------------
-def disponibles(incluir_bloqueados=False):
+def disponibles(incluir_bloqueados=False, tarea=None):
     out = {}
+    globales = set()
     for pid, p in cfg().get("profiles", {}).items():
         if not p.get("enabled", True):
+            continue
+        if tarea and not admite_tarea(p, tarea):
             continue
         if not autenticado(pid, p):
             continue
         if not incluir_bloqueados and bloqueado(pid):
             continue
+        # AGY usa una sola sesion global. Perfiles adicionales serian alias de
+        # la misma cuenta y falsearian el reparto y la cuota.
+        if p.get("provider") == "antigravity":
+            if "antigravity" in globales:
+                continue
+            globales.add("antigravity")
         out[pid] = p
     return out
 
 
 def puntuar(pid, p, tarea):
-    if tarea == "imagen" and p.get("provider") not in PROVEEDORES_IMAGEN:
-        return 0.0, "no genera imagenes"
-    base = (p.get("weights") or {}).get(tarea, 5)
+    if not admite_tarea(p, tarea):
+        return 0.0, ("solo imagen/diseno" if p.get("provider") == "antigravity"
+                     else f"no admite {tarea}")
+    base = potencia_perfil(p, tarea)
     s = scores().get(pid, {}).get(tarea)
     mult = 1.0
     if s and s.get("n"):
@@ -426,14 +593,24 @@ def puntuar(pid, p, tarea):
         if os.environ.get("ORQ_DEBUG"):
             print(f"[orq] cuota({pid}) fallo: {e!r}", file=sys.stderr)
     pct = q.get("usado_pct")
-    if pct is None:
-        g = cuota_global(pid, p)
-        if g.get("fuente") == "declarado" and g.get("pct") is not None:
-            pct = g["pct"]
-            q = dict(q); q["fuente"] = "proveedor"      # se trata como dato firme
-            q["ventana_min"] = (p.get("ventana_horas") or 5) * 60
-    if pct is not None and q.get("fuente") == "proveedor":
-        if pct >= 97:
+    g = ({"pct": pct, "fuente": "proveedor",
+          "reinicia": q.get("reinicia"), "ventana_min": q.get("ventana_min")}
+         if q.get("fuente") == "proveedor" and pct is not None
+         else cuota_global(pid, p))
+    # Un dato oficial o declarado es global y manda sobre la estimacion local,
+    # que solo ve las sesiones de esta maquina.
+    if (g.get("fuente") in ("proveedor", "declarado")
+            and g.get("pct") is not None):
+        pct = g["pct"]
+        q = dict(q)
+        q.update({"fuente": g["fuente"], "reinicia": g.get("reinicia"),
+                  "ventana_min": (g.get("ventana_min")
+                                   or q.get("ventana_min")
+                                   or (g.get("ventana_h") or 0) * 60
+                                   or (p.get("ventana_horas") or 5) * 60)})
+    if pct is not None and q.get("fuente") in ("proveedor", "declarado", "local"):
+        umbral = 100 if q.get("fuente") == "local" else 97
+        if pct >= umbral:
             return 0.0, f"cuota practicamente agotada ({pct:.0f}%)"
         # Penalizacion proporcionada: gastar el 82% de una ventana SEMANAL que
         # recarga manana no es lo mismo que agotar una de 5 horas.
@@ -474,19 +651,37 @@ def puntuar(pid, p, tarea):
             if mplan > 1:
                 gastos[k] = gastos[k] / mplan
         total = sum(gastos.values())
+        periodo_reparto = "ventana"
+        if total < MIN_MUESTRA_REPARTO:
+            # Una ventana recien recargada o con unas pocas llamadas de prueba
+            # no debe producir un 100/0 artificial. El uso del dia da una
+            # muestra estable y ayuda a repartir tambien limites semanales.
+            for k, v in hermanas:
+                try:
+                    d = uso_real(k, v).get("dias", {}).get(hoy(), {})
+                    gastos[k] = d.get("entrada", 0) + d.get("salida", 0)
+                except Exception:
+                    gastos[k] = gastado_hoy(k)
+                mplan = ((plan_claude(k, v) or {}).get("multiplicador", 1)
+                         if v.get("provider") == "claude" else 1)
+                if mplan > 1:
+                    gastos[k] = gastos[k] / mplan
+            total = sum(gastos.values())
+            periodo_reparto = "dia"
         if total > 0:
             parte = gastos.get(pid, 0) / total          # 0 = sin usar, 1 = se lo lleva todo
             justo = 1.0 / len(hermanas)
             # quien va por debajo de su parte justa sube; quien va por encima baja
             factor *= max(0.45, min(1.55, 1 + (justo - parte)))
-            notas.append(f"reparto {parte*100:.0f}% de {p.get('provider')}")
+            notas.append(f"reparto {periodo_reparto} {parte*100:.0f}% de "
+                         f"{p.get('provider')}")
     if not notas:
         notas.append("sin tope")
     return base * mult * factor, " · ".join(notas)
 
 
 def ranking(tarea, proposito=None, incluir_bloqueados=False):
-    disp = disponibles(incluir_bloqueados)
+    disp = disponibles(incluir_bloqueados, tarea=tarea)
     if proposito:
         f = {k: v for k, v in disp.items()
              if v.get("proposito") in (proposito, "general")}
@@ -521,6 +716,11 @@ def navegadores():
     return out
 
 
+def navegador_valido(valor):
+    return (valor in (None, "")
+            or (isinstance(valor, str) and valor in {b for b, _ in NAVEGADORES}))
+
+
 def terminal_disponible():
     import shutil
     for t, plantilla in TERMINALES:
@@ -531,6 +731,12 @@ def terminal_disponible():
 
 def lanzar_login(pid, p, titulo=None):
     """Abre una terminal con el entorno listo para autenticar esa cuenta."""
+    if not id_perfil_valido(pid):
+        return False, "id de cuenta invalido"
+    if p.get("provider") not in ("claude", "gpt", "antigravity", "gemini"):
+        return False, "proveedor no permitido"
+    if not navegador_valido(p.get("navegador")):
+        return False, "navegador no permitido"
     t, plantilla = terminal_disponible()
     if not t:
         return False, "no encontre ninguna terminal grafica instalada"
@@ -707,20 +913,42 @@ def extension_real(ruta):
 
 def generar_imagen(pid, p, prompt, destino=None, timeout=420):
     """Genera una imagen y la deja en 'destino' con la extension correcta."""
+    if not admite_tarea(p, "imagen"):
+        return {"perfil": pid, "texto": f"[ERROR capacidad] {pid} no genera imagenes",
+                "tokens": 0, "seg": 0.0, "rc": 2, "run_id": "", "archivos": [],
+                "origen": [], "limitado": None}
     antes = _imagenes_en(SCRATCH_AGY)
     antes_dst = _imagenes_en(destino) if destino and os.path.isdir(destino) else {}
     env = entorno(pid, p)
-    cmd = ["agy", "--dangerously-skip-permissions", "--output-format", "json",
-           "-p", prompt]
+    cmd = comando(p, prompt)
     t0 = time.time()
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
                            env=env, cwd=destino or BASE)
         out, err, rc = r.stdout, r.stderr, r.returncode
-    except subprocess.TimeoutExpired:
-        out, err, rc = "", f"timeout tras {timeout}s", 124
+    except subprocess.TimeoutExpired as e:
+        out, err = e.stdout or "", e.stderr or ""
+        if isinstance(out, bytes):
+            out = out.decode(errors="replace")
+        if isinstance(err, bytes):
+            err = err.decode(errors="replace")
+        err = (err.rstrip() + f"\ntimeout tras {timeout}s").strip()
+        rc = 124
+    except FileNotFoundError as e:
+        out, err, rc = "", f"binario no encontrado: {e}", 127
     dur = round(time.time() - t0, 1)
-    texto, tok = extraer("antigravity", out, err)
+    texto, tok, diagnostico = extraer(p["provider"], out, err)
+    error_estructurado = _error_estructurado(p["provider"], out)
+    if rc != 0 and not diagnostico:
+        diagnostico = ((out or "") + "\n" + (err or "")).strip()
+    if rc == 0 and (error_estructurado or not (texto or "").strip()):
+        rc = 1
+        diagnostico = diagnostico or "el proveedor termino sin respuesta"
+    lim = detectar_limite(pid, p, diagnostico) if (rc != 0 or error_estructurado) else None
+    if rc != 0:
+        detalle = "\n".join(x for x in (diagnostico, texto) if x).strip()
+        detalle = detalle or "sin detalle del proveedor"
+        texto = f"[ERROR rc={rc}] {detalle.strip()[:400]}"
 
     # 1) lo que el modelo dejo directamente en el destino
     guardadas = []
@@ -751,16 +979,17 @@ def generar_imagen(pid, p, prompt, destino=None, timeout=420):
             shutil.copy2(f, dst)
             guardadas.append(dst)
 
-    run_id = f"{pid}-{int(t0)}"
+    run_id = f"{pid}-{time.time_ns()}"
     log({"ts": ahora().isoformat(timespec="seconds"), "fecha": hoy(),
          "semana": ahora().strftime("%G-S%V"), "mes": ahora().strftime("%Y-%m"),
          "perfil": pid, "provider": p["provider"], "tarea": "imagen",
-         "tokens": tok, "seg": dur, "rc": rc, "limite": False,
+         "tokens": tok, "seg": dur, "rc": rc, "limite": bool(lim),
          "sesion": os.environ.get("ORQ_SESION", "sin-sesion"),
          "term": os.environ.get("ORQ_SESION_TERM", ""),
          "prompt": prompt[:200], "run_id": run_id})
     return {"perfil": pid, "texto": texto, "tokens": tok, "seg": dur, "rc": rc,
-            "run_id": run_id, "archivos": guardadas, "origen": creadas[:4]}
+            "run_id": run_id, "archivos": guardadas, "origen": creadas[:4],
+            "limitado": lim.isoformat(timespec="seconds") if lim else None}
 
 # ---------------- sesiones externas y serializacion ----------------
 # Los CLIs de suscripcion no toleran bien varias sesiones a la vez: si tienes
@@ -911,7 +1140,8 @@ def deliberar(plan, encargo, timeout=240):
     Si coinciden en que conviene hacerlo con una sola cuenta, se hace asi.
     """
     disp = disponibles()
-    if len(disp) < 2:
+    votantes_disp = disponibles(tarea="reasoning")
+    if len(votantes_disp) < 2:
         return None, "una sola cuenta disponible; no hay nada que deliberar"
     resumen_plan = "\n".join(f"- {t['id']} [{t.get('tipo','code')}] {t['titulo']}"
                              for t in plan["tareas"])
@@ -929,7 +1159,7 @@ def deliberar(plan, encargo, timeout=240):
                       f"{', '.join(k for k, _ in fuerte)}; {resto}")
     prompt = DELIBERAR.format(encargo=encargo[:600], plan=resumen_plan,
                               cuentas="\n".join(fichas))
-    votantes = list(disp.items())[:3]
+    votantes = list(votantes_disp.items())[:3]
     with ThreadPoolExecutor(max_workers=len(votantes)) as ex:
         votos = list(ex.map(lambda kv: (kv[0], correr(kv[0], kv[1], prompt,
                                                       "reasoning", timeout)),
@@ -954,10 +1184,13 @@ def deliberar(plan, encargo, timeout=240):
     # consenso por mayoria tarea a tarea
     final, validas = {}, set(disp)
     for t in plan["tareas"]:
+        tipo = t.get("tipo", "code")
+        if tipo not in TAREAS:
+            tipo = "code"
         conteo = {}
         for a in props:
             v = a.get(t["id"])
-            if v in validas:
+            if v in validas and admite_tarea(disp[v], tipo):
                 conteo[v] = conteo.get(v, 0) + 1
         if conteo:
             final[t["id"]] = max(conteo.items(), key=lambda x: x[1])[0]
@@ -982,7 +1215,8 @@ def ejecutar_proyecto(plan, carpeta, timeout=600, callback=None,
             tipo = "code"
         pid = (asignacion or {}).get(t["id"])
         p = cfg().get("profiles", {}).get(pid) if pid else None
-        if not pid or not p or not autenticado(pid, p) or bloqueado(pid):
+        if (not pid or not p or not admite_tarea(p, tipo)
+                or not autenticado(pid, p) or bloqueado(pid)):
             r = ranking(tipo)
             libre = next((x for x in r if x["pid"] not in ocupadas), r[0] if r else None)
             if not libre:
@@ -1070,6 +1304,7 @@ def integrar_proyecto(plan, carpeta, resultados, timeout=600):
 # manuales (claude, codex --yolo, agy) consumen de la MISMA cuota. Aqui se
 # leen los registros que cada CLI deja en disco para ver el consumo real.
 CACHE_REAL = os.path.join(BASE, "state", "uso_real.json")
+USO_CACHE_VERSION = 2
 
 
 def _dirs_sesiones(pid, p):
@@ -1082,6 +1317,19 @@ def _dirs_sesiones(pid, p):
     if prov == "antigravity":
         return [os.path.join(h, "conversations")]
     return []
+
+
+def _claves_tiempo_local(ts):
+    """Convierte un timestamp ISO (incluido ``Z``/UTC) a fecha y hora locales."""
+    if not ts:
+        return "", ""
+    try:
+        d = datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if d.tzinfo is not None:
+            d = d.astimezone()
+        return d.strftime("%Y-%m-%d"), d.strftime("%Y-%m-%dT%H")
+    except (TypeError, ValueError):
+        return str(ts)[:10], str(ts)[:13]
 
 
 def _uso_archivo_claude(f):
@@ -1103,8 +1351,7 @@ def _uso_archivo_claude(f):
                 sal = u.get("output_tokens", 0) or 0
                 cache = (u.get("cache_read_input_tokens", 0) or 0) + \
                         (u.get("cache_creation_input_tokens", 0) or 0)
-                ts = d.get("timestamp") or ""
-                dia, hora = ts[:10], ts[:13]
+                dia, hora = _claves_tiempo_local(d.get("timestamp"))
                 for k, dic in ((dia, dias), (hora, horas)):
                     if not k:
                         continue
@@ -1120,6 +1367,7 @@ def _uso_archivo_codex(f):
     dias, horas = {}, {}
     ult = 0
     ts_ult = ""
+    uso_ult = {}
     try:
         with open(f, errors="ignore") as fh:
             for linea in fh:
@@ -1138,18 +1386,25 @@ def _uso_archivo_codex(f):
                     v for k, v in u.items() if isinstance(v, int) and k != "total_tokens")
                 if tot and tot >= ult:          # el registro es acumulativo
                     ult = tot
+                    uso_ult = u
                     ts_ult = d.get("timestamp") or pl.get("timestamp") or ts_ult
     except OSError:
         pass
     if ult and ts_ult:
-        dia, hora = ts_ult[:10], ts_ult[:13]
+        dia, hora = _claves_tiempo_local(ts_ult)
+        ent = (uso_ult.get("input_tokens") or uso_ult.get("input_token_count") or 0)
+        sal = (uso_ult.get("output_tokens") or uso_ult.get("output_token_count") or 0)
+        cache = (uso_ult.get("cached_input_tokens") or
+                 uso_ult.get("cache_read_input_tokens") or 0)
+        if not (ent or sal or cache):
+            ent = ult
         for k, dic in ((dia, dias), (hora, horas)):
-            dic[k] = {"entrada": 0, "salida": 0, "cache": 0, "msgs": 1, "total": ult}
+            dic[k] = {"entrada": ent, "salida": sal, "cache": cache, "msgs": 1}
     return dias, horas
 
 
 def uso_real(pid, p, refrescar=False):
-    """Consumo real de esa cuenta leyendo los registros del propio CLI."""
+    """Consumo real leyendo los registros, con cache idempotente por mtime."""
     prov = p.get("provider")
     cache = _leer(CACHE_REAL, {})
     entrada = cache.get(pid, {})
@@ -1165,13 +1420,15 @@ def uso_real(pid, p, refrescar=False):
                         archivos[ruta] = os.path.getmtime(ruta)
                     except OSError:
                         pass
+    if (not refrescar and entrada.get("version") == USO_CACHE_VERSION
+            and entrada.get("archivos") == archivos):
+        return {"dias": entrada.get("dias", {}), "horas": entrada.get("horas", {}),
+                "archivos": len(archivos)}
+
+    # Si un JSONL crece se relee el conjunto completo. Sumar el archivo nuevo
+    # sobre su agregado anterior duplicaba todos los eventos ya contabilizados.
     dias, horas = {}, {}
-    vistos = entrada.get("archivos", {})
-    parcial = entrada.get("dias", {}), entrada.get("horas", {})
-    nuevos = {}
     for ruta, m in archivos.items():
-        if not refrescar and vistos.get(ruta) == m and ruta in entrada.get("hechos", []):
-            continue
         d1, h1 = (_uso_archivo_claude(ruta) if prov == "claude"
                   else _uso_archivo_codex(ruta) if prov == "gpt" else ({}, {}))
         for src, dst in ((d1, dias), (h1, horas)):
@@ -1179,18 +1436,10 @@ def uso_real(pid, p, refrescar=False):
                 a = dst.setdefault(k, {"entrada": 0, "salida": 0, "cache": 0, "msgs": 0})
                 for kk in ("entrada", "salida", "cache", "msgs"):
                     a[kk] += v.get(kk, 0)
-        nuevos[ruta] = m
-    # combina con lo cacheado
-    for src, dst in ((parcial[0], dias), (parcial[1], horas)):
-        for k, v in (src or {}).items():
-            a = dst.setdefault(k, {"entrada": 0, "salida": 0, "cache": 0, "msgs": 0})
-            for kk in ("entrada", "salida", "cache", "msgs"):
-                a[kk] += v.get(kk, 0)
     with bloqueo():
         c = _leer(CACHE_REAL, {})
-        c[pid] = {"dias": dias, "horas": horas,
-                  "archivos": {**vistos, **nuevos},
-                  "hechos": list({**vistos, **nuevos}.keys()),
+        c[pid] = {"version": USO_CACHE_VERSION, "dias": dias, "horas": horas,
+                  "archivos": archivos,
                   "actualizado": ahora().isoformat(timespec="seconds")}
         _escribir(CACHE_REAL, c)
     return {"dias": dias, "horas": horas, "archivos": len(archivos)}
@@ -1547,9 +1796,12 @@ def cuota_manual_leer():
 
 
 def cuota_manual_fijar(pid, pct, nota=""):
+    pct = float(pct)
+    if not 0 <= pct <= 100:
+        raise ValueError("el porcentaje debe estar entre 0 y 100")
     with bloqueo():
         d = _leer(MANUAL, {})
-        d[pid] = {"usado_pct": float(pct),
+        d[pid] = {"usado_pct": pct,
                   "declarado": ahora().isoformat(timespec="minutes"),
                   "nota": nota}
         _escribir(MANUAL, d)
@@ -1579,7 +1831,16 @@ def cuota_global(pid, p):
                     "edad_h": 0}
     m = cuota_manual_leer().get(pid)
     if m:
-        return {"pct": m["usado_pct"], "fuente": "declarado",
-                "declarado": m["declarado"], "nota": m.get("nota", ""),
-                "edad_h": antiguedad_horas(m["declarado"])}
+        edad = antiguedad_horas(m["declarado"])
+        ventana = p.get("ventana_horas") or VENTANA_PLAN.get(
+            p.get("plan", "desconocido"), 5)
+        base = {"declarado": m["declarado"], "nota": m.get("nota", ""),
+                "edad_h": edad, "ventana_h": ventana,
+                "pct_declarado": m["usado_pct"]}
+        # Una medicion manual describe la ventana que estaba visible en ese
+        # momento. Al cumplirse esa ventana ya no puede seguir bloqueando para
+        # siempre una cuenta que se recargo.
+        if edad is not None and edad >= ventana:
+            return {"pct": None, "fuente": "caducado", **base}
+        return {"pct": m["usado_pct"], "fuente": "declarado", **base}
     return {"pct": None, "fuente": "sin dato", "edad_h": None}

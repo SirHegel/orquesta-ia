@@ -1,27 +1,31 @@
 # Orquesta IA
 
-Orquestador local de varias cuentas de IA (Claude, GPT/Codex, Gemini) desde una sola
-terminal o un panel web. Reparte cada tarea a la cuenta que mejor rinde en ese tipo de
-trabajo y que todavía tiene cupo, lleva la contabilidad de tokens, y permite que los
-modelos se auditen entre ellos.
+Orquestador local de varias cuentas de IA (Claude, GPT/Codex y Antigravity) desde una
+sola terminal o un panel web. Primero filtra por capacidad del motor, luego usa la
+máxima potencia configurada y reparte entre cuentas equivalentes según su cupo y uso.
+También lleva la contabilidad de tokens y permite auditorías cruzadas.
 
 ## Qué hace
 
 - **Multi-cuenta real.** Cada cuenta vive en su propio directorio aislado
   (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`), así que varias cuentas del mismo proveedor
   conviven sin pisarse.
-- **Routing por tarea.** `code`, `agentic`, `reasoning`, `review`, `writing`,
-  `research`, `edicion`, `bulk`. El puntaje combina el peso técnico que le asignes,
-  el rendimiento que hayas medido, y la holgura de cupo que le quede a la cuenta.
+- **Capacidades antes que puntajes.** Claude y Codex compiten en las tareas de texto;
+  Antigravity/Nano Banana queda reservado para `imagen`. Los pesos de especialidad
+  solo ayudan a repartir un proyecto y nunca convierten un motor visual en chat.
+- **Potencia parametrizada.** `power` define la potencia efectiva por perfil o tarea.
+  A igual potencia, decide el rendimiento medido, la cuota disponible y el reparto de
+  consumo entre cuentas del mismo proveedor.
 - **Ventanas de recarga.** Registra el gasto dentro de la ventana de cada plan
   (5 h en los planes de suscripción) y baja el puntaje de las cuentas que se están
   quedando sin cupo, antes de que choquen el límite.
-- **Detección de límite.** Si un proveedor responde con un límite de uso, la cuenta
-  queda excluida del routing hasta la hora de recarga, y vuelve sola.
+- **Detección de límite y continuidad.** Conserva errores estructurados como 429 y
+  `RESOURCE_EXHAUSTED`, bloquea la cuenta hasta la recarga y Kitti prueba el siguiente
+  motor de texto cuando el fallo fue temprano y seguro de reintentar.
 - **Auditoría cruzada.** Todas responden la misma pregunta y luego cada una audita
   las respuestas de las otras señalando errores, omisiones y una nota.
 - **Contabilidad.** Cada llamada queda en `state/ledger.jsonl` con cuenta, tokens,
-  segundos y tarea.
+  segundos, tarea, sesión, carpeta y una vista previa de 200 caracteres del prompt.
 
 ## Instalación
 
@@ -33,7 +37,7 @@ ln -sf "$PWD/orq" ~/.local/bin/orq
 echo '[ -f "$HOME/Documentos/ia/orquesta/shell.sh" ] && . "$HOME/Documentos/ia/orquesta/shell.sh"' >> ~/.bashrc
 ```
 
-Requiere Python 3.9+ y los CLIs que vayas a usar (`claude`, `codex`, `gemini`).
+Requiere Python 3.9+ y los CLIs que vayas a usar (`claude`, `codex`, `agy`).
 
 ## Uso
 
@@ -44,6 +48,7 @@ orq route code               # a quién delegaría (no gasta tokens)
 
 orq ask "arregla este bug" --tarea code
 orq ask "..." --perfil claude-personal      # forzar una cuenta
+orq imagen "ilustración del producto"        # Antigravity / Nano Banana
 orq fan "..."                               # preguntar a todas a la vez
 orq audit "..."                             # responden y se auditan entre ellas
 
@@ -76,8 +81,8 @@ excluido de git.
 ## Panel web
 
 `orq web` levanta el panel en `127.0.0.1:8787` — solo loopback, nunca expuesto a la
-red. Tiene pestañas de Panel, Consultar, Ajustes e Historial: editar pesos por tarea,
-cupos, topes diarios, lanzar consultas y calificar resultados.
+red. Tiene vistas de Cuentas, Consultar y Uso para administrar perfiles, lanzar
+consultas, ver consumo y calificar resultados.
 
 Para dejarlo permanente hay un servicio de usuario en
 `~/.config/systemd/user/orquesta.service`.
@@ -87,9 +92,12 @@ Para dejarlo permanente hay un servicio de usuario en
 ```
 orq                  CLI
 orqlib.py            núcleo compartido (estado con bloqueo fcntl)
+orqchat.py           conversación de lenguaje natural en Kitti
 orqweb.py            panel web (API + jobs asíncronos)
+orquesta-app.py      envoltorio GTK4/WebKit del panel
 web/index.html       interfaz
 shell.sh             integración de terminal
+tests/               regresiones de routing, Kitti, cuotas, uso y seguridad web
 tools/scan-secretos.sh   escáner de credenciales (corre en pre-commit)
 profiles.json        tu configuración real        ← NO versionado
 accounts/<id>/       credenciales por cuenta      ← NO versionado
@@ -99,10 +107,17 @@ state/               ledger, límites, puntajes    ← NO versionado
 ## Sobre usar varias cuentas
 
 Tener cuentas separadas por propósito (personal, empresa, cliente) y elegir la que
-corresponde a cada trabajo es su uso previsto. Agrupar varias suscripciones para
-sortear los límites de uso va contra los términos de servicio de los proveedores;
-esta herramienta no rota cuentas automáticamente al chocar un límite, precisamente
-por eso: cuando una cuenta se bloquea, lo dice y espera la recarga.
+corresponde a cada trabajo es su uso previsto. Kitti puede continuar con otra cuenta
+compatible cuando una falla antes de producir trabajo; no repite automáticamente un
+timeout que pudo haber modificado archivos.
+
+## Pruebas
+
+```sh
+python3 -m unittest discover -v
+bash -n shell.sh tools/scan-secretos.sh
+tools/scan-secretos.sh
+```
 
 Ver [SECURITY.md](SECURITY.md).
 

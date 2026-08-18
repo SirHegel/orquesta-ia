@@ -10,6 +10,8 @@
       "cupo_ventana": 0,
       "proposito": "personal",
       "enabled": true,
+      "allowed_tasks": ["code", "agentic", "reasoning", "review", "writing", "research", "edicion", "bulk"],
+      "power": 10,
       "budget_tokens_dia": 0,
       "weights": {"code": 10, "agentic": 10, "reasoning": 9, "review": 9,
                   "writing": 8, "research": 7, "edicion": 9, "bulk": 4}
@@ -23,9 +25,24 @@
       "cupo_ventana": 0,
       "proposito": "personal",
       "enabled": true,
+      "allowed_tasks": ["code", "agentic", "reasoning", "review", "writing", "research", "edicion", "bulk"],
+      "power": 10,
       "budget_tokens_dia": 0,
       "weights": {"code": 9, "agentic": 8, "reasoning": 10, "review": 9,
                   "writing": 8, "research": 7, "edicion": 7, "bulk": 6}
+    },
+    "gemini-visual": {
+      "label": "Gemini · Antigravity / Nano Banana",
+      "provider": "antigravity",
+      "home": "~/.gemini/antigravity-cli",
+      "plan": "pro",
+      "ventana_horas": 5,
+      "proposito": "visual",
+      "enabled": true,
+      "allowed_tasks": ["imagen"],
+      "power": {"imagen": 10},
+      "budget_tokens_dia": 0,
+      "weights": {"imagen": 10}
     }
   }
 }

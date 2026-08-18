@@ -202,7 +202,7 @@ let S=null, JOB=null, TICK=null, TAB='cuentas';
 const $=i=>document.getElementById(i);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const nf=n=>(n??0).toLocaleString('es');
-const PROV={claude:'Claude',gpt:'GPT',gemini:'Gemini'};
+const PROV={claude:'Claude',gpt:'GPT',antigravity:'Antigravity · Gemini visual'};
 
 async function P(u,d){
  try{
@@ -262,7 +262,7 @@ function vistaCuentas(){
 
  if(!con.length && !pend.length){
   h+=`<div class="empty"><div class="ei">◎</div><h3>Todavía no hay cuentas</h3>
-   <p>Conecta tu primera cuenta de Claude, GPT o Gemini. Solo necesitas un nombre
+   <p>Conecta tu primera cuenta de Claude, GPT o Antigravity. Solo necesitas un nombre
    y hacer el login una vez.</p>
    <button class="b p" onclick="modalNueva()">Conectar una cuenta</button></div>`;
  }
@@ -356,7 +356,7 @@ function modalNueva(){
   <div class="gr">
    <div class="f"><label for="n_prov">Proveedor</label><select id="n_prov">
      <option value="claude">Claude</option><option value="gpt">GPT (Codex)</option>
-     <option value="gemini">Gemini</option></select></div>
+     <option value="antigravity">Antigravity (Gemini visual)</option></select></div>
    <div class="f"><label for="n_prop">Para qué es</label>
      <input id="n_prop" value="general" placeholder="personal, empresa…"></div>
   </div>
@@ -422,8 +422,8 @@ function modalAjustes(id){
      <input id="a_cupo_ventana" type="number" value="${c.cupo}"><div class="hint">0 = sin tope</div></div>
   </div>
   <div class="f"><label for="a_navegador">Navegador para el login</label>${selNav('a_navegador',c.navegador)}</div>
-  <label style="margin-top:6px">Qué tan bueno es en cada tarea (0-10)</label>
-  <div class="hint" style="margin-bottom:9px">En rojo, la nota real que le has puesto tú.</div>
+  <label style="margin-top:6px">Especialidades para repartir proyectos (0-10)</label>
+  <div class="hint" style="margin-bottom:9px">No cambia capacidad ni potencia. En rojo, tu nota real.</div>
   <div class="gr" style="grid-template-columns:repeat(auto-fit,minmax(96px,1fr))">${pesos}</div>
   <div class="acts" style="margin-top:20px">
    <button class="b p" onclick="guardar('${esc(id)}')">Guardar</button>

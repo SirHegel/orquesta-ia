@@ -74,10 +74,16 @@ def cmd_cuentas(a):
     print()
 
 def cmd_cuenta_add(a):
+    if not L.id_perfil_valido(a.id):
+        print(c("red", "id invalido: usa minusculas, numeros, guion o guion bajo")); sys.exit(1)
     with L.bloqueo():
         cf = L.cfg(); ps = cf.setdefault("profiles", {})
         if a.id in ps and not a.force:
             print(c("red", f"'{a.id}' ya existe (usa --force para sobreescribir)")); sys.exit(1)
+        if (a.provider == "antigravity" and any(
+                p.get("provider") == "antigravity" for k, p in ps.items()
+                if k != a.id)):
+            print(c("red", "Antigravity usa una sesion global; ya existe un perfil")); sys.exit(1)
         home = os.path.expanduser(a.home) if a.home else os.path.join(L.ACCOUNTS, a.id)
         os.makedirs(home, exist_ok=True); os.chmod(home, 0o700)
         ps[a.id] = {"label": a.label or f"{a.provider} · {a.id}",
@@ -86,8 +92,14 @@ def cmd_cuenta_add(a):
                     "cupo_ventana": a.cupo, "proposito": a.proposito,
                     "enabled": True, "budget_tokens_dia": a.budget,
                     "weights": dict(PESOS_BASE)}
+        if a.provider == "antigravity":
+            ps[a.id]["allowed_tasks"] = ["imagen"]
+            ps[a.id]["power"] = {"imagen": 10}
+            ps[a.id]["weights"] = {"imagen": 10}
+        else:
+            ps[a.id]["allowed_tasks"] = [t for t in L.TAREAS if t != "imagen"]
+            ps[a.id]["power"] = 10
         if a.model: ps[a.id]["model"] = a.model
-        if a.provider == "gemini": ps[a.id]["api_key_file"] = os.path.join(home, "api_key")
         L.guardar_cfg(cf)
     print(c("g", f"cuenta '{a.id}' creada") + f"  ({a.provider}, home={home})")
     print(f"\n{c('b','Ahora autentícala corriendo esto:')}\n  {L.cmd_login(a.id, L.cfg()['profiles'][a.id])}\n")
@@ -228,12 +240,13 @@ def cmd_route(a):
              for i, x in enumerate(rk)]
     t = f"DELEGACION · tarea={a.tarea}" + (f" · proposito={a.proposito}" if a.proposito else "")
     tabla([("cuenta", 0), ("puntaje", 1), ("cupo", 0)], filas, t)
-    print("\n  " + c("d", "puntaje = peso tecnico x rendimiento medido x holgura de cupo") + "\n")
+    print("\n  " + c("d", "primero capacidad del motor; despues potencia, rendimiento y cupo") + "\n")
 
 def _elegir(a):
     if a.perfil:
-        d = L.disponibles(incluir_bloqueados=True)
-        if a.perfil not in d: print(c("red", f"'{a.perfil}' no existe o no esta autenticada")); sys.exit(1)
+        d = L.disponibles(incluir_bloqueados=True, tarea=a.tarea)
+        if a.perfil not in d:
+            print(c("red", f"'{a.perfil}' no esta disponible para {a.tarea}")); sys.exit(1)
         return a.perfil, d[a.perfil]
     rk = L.ranking(a.tarea, getattr(a,"proposito",None))
     if not rk: print(c("red","ninguna cuenta disponible (¿todas con limite?)  orq limites")); sys.exit(1)
@@ -261,7 +274,7 @@ def cmd_ask(a):
     print("\n" + c("d", pie) + extra)
 
 def _fan(prompt, tarea, timeout, perfiles=None):
-    d = L.disponibles()
+    d = L.disponibles(tarea=tarea)
     if perfiles: d = {k:v for k,v in d.items() if k in perfiles}
     if not d: print(c("red","sin cuentas disponibles")); sys.exit(1)
     with ThreadPoolExecutor(max_workers=len(d)) as ex:
@@ -273,9 +286,11 @@ def cmd_fan(a):
         print(r["texto"], "\n")
 
 def cmd_audit(a):
-    d = L.disponibles()
-    if len(d) < 2:
-        print(c("red", f"se necesitan >=2 cuentas activas. Hay: {list(d)}")); sys.exit(1)
+    d = L.disponibles(tarea=a.tarea)
+    revisores = L.disponibles(tarea="review")
+    if (not d or not revisores
+            or not any(pid != rid for pid in d for rid in revisores)):
+        print(c("red", "se necesita una cuenta para responder y otra compatible con review")); sys.exit(1)
     print(c("b", f"FASE 1 · respuestas en paralelo ({', '.join(d)})\n"))
     res = _fan(a.prompt, a.tarea, a.timeout, list(d))
     for r in res:
@@ -283,14 +298,14 @@ def cmd_audit(a):
         print((r["texto"] or "")[:1800], "\n")
     print(c("b","FASE 2 · auditoria cruzada\n"))
     trab = []
-    for aud in res:
-        otros = [x for x in res if x["perfil"]!=aud["perfil"] and x["texto"]]
+    for rid, rp in revisores.items():
+        otros = [x for x in res if x["perfil"] != rid and x["texto"]]
         if not otros: continue
         bloques = "\n\n".join(f"### Respuesta de {o['perfil']}\n{o['texto'][:3000]}" for o in otros)
         pa = (f"Eres auditor tecnico. Pregunta original:\n{a.prompt}\n\n{bloques}\n\n"
               "Para CADA respuesta ajena indica: (1) errores factuales concretos, "
               "(2) omisiones importantes, (3) nota de 0 a 10. Breve y directo.")
-        trab.append((aud["perfil"], d[aud["perfil"]], pa))
+        trab.append((rid, rp, pa))
     with ThreadPoolExecutor(max_workers=max(1,len(trab))) as ex:
         auds = list(ex.map(lambda t: L.correr(t[0], t[1], t[2], "review", a.timeout), trab))
     for r in auds:
@@ -309,8 +324,9 @@ def cmd_verificar(a):
     print("\n  " + c("d", f"probando {len(objetivo)} cuenta(s) con una llamada minima..."))
     filas = []
     with ThreadPoolExecutor(max_workers=len(objetivo)) as ex:
-        res = list(ex.map(lambda kv: (kv[0], L.correr(kv[0], kv[1], "di solo: ok",
-                                                      "reasoning", a.timeout)),
+        res = list(ex.map(lambda kv: (kv[0], L.correr(
+            kv[0], kv[1], "di solo: ok",
+            "reasoning" if L.admite_tarea(kv[1], "reasoning") else "imagen", a.timeout)),
                           objetivo.items()))
     for pid, r in res:
         txt = (r["texto"] or "").strip()
@@ -366,7 +382,7 @@ BREVE = ("\n\nResponde de forma compacta: ve al grano, sin preambulos ni resumen
 def cmd_imagen(a):
     rk = L.ranking("imagen")
     if a.perfil:
-        d = L.disponibles(incluir_bloqueados=True)
+        d = L.disponibles(incluir_bloqueados=True, tarea="imagen")
         if a.perfil not in d:
             print(c("red", f"'{a.perfil}' no disponible")); sys.exit(1)
         pid, p = a.perfil, d[a.perfil]
@@ -439,7 +455,7 @@ def cmd_proyecto(a):
         print("  " + c("red", err) + "\n"); sys.exit(1)
 
     asignacion = None
-    if not a.sin_deliberar and len(L.disponibles()) > 1:
+    if not a.sin_deliberar and len(L.disponibles(tarea="reasoning")) > 1:
         print("  " + c("y", "2 · consenso") + c("d", " · las IA deciden quien hace que…"), flush=True)
         asignacion, motivo = L.deliberar(plan, a.prompt, a.timeout)
         print("  " + c("d", "   " + (motivo or "")))
@@ -487,7 +503,7 @@ def cmd_proyecto(a):
     print("\n  " + c("y", "3 · construccion") + c("d", " · integra segun terminan\n"))
     res = L.ejecutar_proyecto(plan, carpeta, a.timeout, cb, asignacion, ctx_term)
 
-    if not a.sin_auditar and len(L.disponibles()) > 1:
+    if not a.sin_auditar and len(L.disponibles(tarea="review")) > 1:
         print("\n  " + c("y", "4 · auditoria cruzada")
               + c("d", " · cada modelo revisa lo ajeno…\n"), flush=True)
 
@@ -596,6 +612,8 @@ def cmd_global(a):
             v = float(str(pct).rstrip("%"))
         except ValueError:
             print(c("red", "el porcentaje debe ser un numero")); sys.exit(1)
+        if not 0 <= v <= 100:
+            print(c("red", "el porcentaje debe estar entre 0 y 100")); sys.exit(1)
         L.cuota_manual_fijar(pid, v, " ".join(a.fijar[2:]))
         print("\n  " + c("g", f"{pid} = {v:.0f}% consumido") +
               c("d", "  (declarado por ti; el router ya lo usa)") + "\n")
@@ -610,7 +628,11 @@ def cmd_global(a):
         usd = p.get("plan_usd")
         plan = (p.get("plan") or "") + (f" ${usd}" if usd else "")
         if pct is None:
-            sin_dato.append((pid, plan))
+            detalle = ""
+            if g.get("fuente") == "caducado":
+                detalle = (f"{g.get('pct_declarado', 0):.0f}% vencido "
+                           f"hace {g.get('edad_h', 0):.0f}h")
+            sin_dato.append((pid, plan, detalle))
             continue
         col = "red" if pct >= 90 else ("y" if pct >= 70 else "g")
         libre = 100 - pct
@@ -627,8 +649,8 @@ def cmd_global(a):
 
     if sin_dato:
         print("\n  " + c("y", "SIN DATO GLOBAL"))
-        for pid, plan in sin_dato:
-            print(f"    {pid:<22} {c('d', plan)}")
+        for pid, plan, detalle in sin_dato:
+            print(f"    {pid:<22} {c('d', plan + ((' · ' + detalle) if detalle else ''))}")
         print("  " + c("d", "estos proveedores no publican el porcentaje. Decláralo tú:"))
         print("  " + c("d", f"    orq global --fijar {sin_dato[0][0]} 97") + "\n")
     else:
@@ -668,7 +690,8 @@ def main():
 
     cu = sub.add_parser("cuenta", help="gestionar cuentas"); cs = cu.add_subparsers(dest="sc", required=True)
     ad = cs.add_parser("add", help="registrar una cuenta nueva")
-    ad.add_argument("id"); ad.add_argument("--provider", required=True, choices=["claude","gpt","gemini"])
+    ad.add_argument("id"); ad.add_argument(
+        "--provider", required=True, choices=["claude", "gpt", "antigravity"])
     ad.add_argument("--label"); ad.add_argument("--home"); ad.add_argument("--model")
     ad.add_argument("--plan", default="pro"); ad.add_argument("--proposito", default="general")
     ad.add_argument("--ventana", type=float, default=5); ad.add_argument("--cupo", type=int, default=0)

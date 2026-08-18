@@ -30,6 +30,18 @@ CTX = os.path.join(DIR_SES, f"{SESION}.json")
 CARPETA = os.path.abspath(os.environ.get("ORQ_CARPETA") or os.getcwd())
 
 
+def prompt_entrada():
+    """Prompt visible de tres columnas, sin confundir el cursor de Readline.
+
+    Readline necesita \001/\002 alrededor de cada secuencia ANSI no imprimible.
+    Sin esos marcadores calcula mal el ancho, vuelve al inicio antes de tiempo y
+    sobreescribe los prompts largos al envolverlos en Kitty.
+    """
+    if readline:
+        return f" \001{R}\002▍\001{N}\002 "
+    return f" {R}▍{N} "
+
+
 def ancho():
     return shutil.get_terminal_size((100, 30)).columns
 
@@ -94,6 +106,7 @@ AYUDA = f"""
  {B}Comandos{N}   {D}(todo lo demas es una pregunta para la IA){N}
    {C}/cuentas{N}        estado y cuota real de cada cuenta
    {C}/cuota{N}          auditoria de consumo real
+   {C}/global{N}         porcentaje global y vigencia de cada cuota
    {C}/uso{N}            gasto por dia, semana y mes
    {C}/usar <id>{N}      fijar la cuenta activa de su proveedor
    {C}/en <cuenta>{N}    responder con esa cuenta en vez de la elegida
@@ -238,18 +251,48 @@ def marco_carpeta():
 
 def responder(pregunta, ctx, tarea, forzado):
     if forzado:
-        d = L.disponibles(incluir_bloqueados=True)
+        d = L.disponibles(incluir_bloqueados=True, tarea=tarea)
         if forzado not in d:
-            print(f" {R}·{N} '{forzado}' no esta disponible\n"); return None
-        pid, p = forzado, d[forzado]
+            print(f" {R}·{N} '{forzado}' no esta disponible para {tarea}\n"); return None
+        candidatos = [{"pid": forzado, "p": d[forzado]}]
     else:
-        rk = L.ranking(tarea)
-        if not rk:
+        candidatos = L.ranking(tarea)
+        if not candidatos:
             print(f" {R}·{N} ninguna cuenta disponible ahora mismo\n"); return None
-        pid, p = rk[0]["pid"], rk[0]["p"]
-    with Girador(f"{pid} pensando…"):
-        r = L.correr(pid, p, marco_carpeta() + con_contexto(ctx, pregunta),
-                     tarea, 600, carpeta=CARPETA)
+
+    prompt = marco_carpeta() + con_contexto(ctx, pregunta)
+    fallos = []
+    r = None
+    for i, candidato in enumerate(candidatos):
+        pid, p = candidato["pid"], candidato["p"]
+        with Girador(f"{pid} pensando…"):
+            intento = L.correr(pid, p, prompt, tarea, 600, carpeta=CARPETA)
+        texto = (intento.get("texto") or "").strip()
+        if intento.get("rc") == 0 and texto and not texto.startswith("[ERROR"):
+            r = intento
+            break
+        fallos.append((pid, texto or f"rc={intento.get('rc', '?')}"))
+        if forzado:
+            break
+        # Solo cambiar de motor ante un fallo temprano y sin consumo. Un
+        # timeout pudo alcanzar a modificar archivos; repetirlo seria riesgoso.
+        reintentable = (bool(intento.get("limitado"))
+                        or (intento.get("rc") in (1, 2, 127)
+                            and not intento.get("tokens")
+                            and float(intento.get("seg") or 0) < 30))
+        if not reintentable:
+            break
+        if i + 1 < len(candidatos):
+            print(f" {Y}·{N} {pid} no respondio; probando {candidatos[i + 1]['pid']}…")
+
+    if r is None:
+        print(f" {R}▍{N} ninguna cuenta pudo responder")
+        for pid, detalle in fallos:
+            print(f"   {D}{pid}: {detalle[:180]}{N}")
+        print()
+        return None
+
+    pid = r["perfil"]
     print(f" {R}▍{N} {D}{pid}{N}")
     print(envolver(r["texto"] or "(sin respuesta)"))
     print(f"   {D}{r['tokens']:,} tok · {r['seg']}s{N}\n")
@@ -271,7 +314,7 @@ def principal():
     try:
         while True:
             try:
-                linea = input(f" {R}▍{N} ").strip()
+                linea = input(prompt_entrada()).strip()
             except EOFError:
                 print(); break
             except KeyboardInterrupt:
@@ -364,7 +407,7 @@ def principal():
                     subprocess.run([os.path.join(L.BASE, "orq"), "proyecto", arg,
                                     "--en", CARPETA, "--si", "--contexto", tmp])
                     print(); continue
-                if cmd in ("cuentas", "cuota", "uso", "usar", "imagen",
+                if cmd in ("cuentas", "cuota", "global", "uso", "usar", "imagen",
                            "route", "verificar", "permisos", "equipo"):
                     sub = [os.path.join(L.BASE, "orq"), cmd]
                     if arg:
