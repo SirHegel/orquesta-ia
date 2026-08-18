@@ -113,35 +113,31 @@ ia() {
 }
 
 # ── Modo kitty: abrir y promptear ───────────────────────────────────────
-# Solo en kitty. La terminal por defecto (Ptyxis) queda intacta: comandos
-# normales, y la IA solo si la invocas tu con 'ia' u 'orq'.
-if [ -n "$KITTY_WINDOW_ID" ] && [ -z "$ORQ_SIN_MODO_PROMPT" ]; then
+# Solo en kitty. La terminal por defecto queda intacta: comandos normales,
+# y la IA solo si la invocas tu con 'ia' u 'orq'.
+if [ -n "$KITTY_WINDOW_ID" ] && [ "$TERM" != "dumb" ] && [ -z "$ORQ_SIN_MODO_PROMPT" ]; then
   export ORQ_MODO=kitty
 
-  # Si escribes algo que no es un comando pero parece lenguaje natural,
-  # va al orquestador. Si parece un comando mal escrito, se comporta normal.
+  # TODO lo que no sea un comando va a la IA. Sin heuristicas, sin minimos
+  # de palabras: si escribes 'hola', responde.
   command_not_found_handle() {
-    local linea="$*" palabras
-    palabras=$#
-    # Heuristica: >=3 palabras, o lleva ? ¿ o tildes -> es un prompt
-    if [ "$palabras" -ge 3 ] || printf '%s' "$linea" | grep -qiE '[?¿áéíóúñ]'; then
-      printf '\033[2m  → orquestando…\033[0m\n'
-      orq ask "$linea" --tarea reasoning --lineas 24
-      return $?
-    fi
-    printf '\033[31m%s\033[0m: no es un comando\n' "$1" >&2
-    printf '\033[2m  (para preguntarle a la IA: ia "%s")\033[0m\n' "$linea" >&2
-    return 127
+    local linea="$*"
+    printf '\033[38;2;224;50;46m▍\033[0m\033[2m orquesta\033[0m\n'
+    orq ask "$linea" --tarea reasoning --lineas 30
+    return $?
   }
 
-  # Cabecera al abrir kitty
-  _orq_bienvenida() {
-    [ -n "$ORQ_BIENVENIDA_HECHA" ] && return
-    export ORQ_BIENVENIDA_HECHA=1
-    printf '\n  \033[1mORQUESTA IA\033[0m \033[2m· potencia maxima · permisos dados\033[0m\n'
-    printf '  \033[2mclaude:\033[0m %s   \033[2mgpt:\033[0m %s   \033[2mgemini:\033[0m %s\n' \
-      "${ORQ_CLAUDE_CUENTA:--}" "${ORQ_GPT_CUENTA:--}" "${ORQ_ANTIGRAVITY_CUENTA:--}"
-    printf '  \033[2mescribe tu pregunta directo, o:  ia -p "proyecto..." --en carpeta\033[0m\n\n'
+  # Una sola linea, debajo de tu fastfetch de Musashi. Sin cajas ni ruido.
+  _orq_linea() {
+    [ -n "$ORQ_LINEA_HECHA" ] && return
+    export ORQ_LINEA_HECHA=1
+    local R=$'\033[38;2;224;50;46m' D=$'\033[2m' N=$'\033[0m' B=$'\033[1m'
+    printf '%s▍%s%s orquesta ia%s %spotencia maxima · permisos dados · escribe y ya%s\n' \
+      "$R" "$N" "$B" "$N" "$D" "$N"
+    printf '  %sclaude%s %s   %sgpt%s %s   %sgemini%s %s\n\n' \
+      "$D" "$N" "${ORQ_CLAUDE_CUENTA:-—}" \
+      "$D" "$N" "${ORQ_GPT_CUENTA:-—}" \
+      "$D" "$N" "${ORQ_ANTIGRAVITY_CUENTA:-—}"
   }
-  _orq_bienvenida
+  _orq_linea
 fi
