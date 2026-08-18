@@ -137,10 +137,13 @@ def entorno(pid, p):
     elif prov == "gpt":
         env["CODEX_HOME"] = h
     elif prov == "gemini":
+        env["GEMINI_CLI_HOME"] = h
+        env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
         k = p.get("api_key_file")
-        if k and os.path.exists(os.path.expanduser(k)):
+        if p.get("auth") == "oauth":
+            env["GOOGLE_GENAI_USE_GCA"] = "true"
+        elif k and os.path.exists(os.path.expanduser(k)):
             env["GEMINI_API_KEY"] = open(os.path.expanduser(k)).read().strip()
-        env["GEMINI_CONFIG_DIR"] = h
     for k, v in (p.get("env") or {}).items():
         env[k] = v
     return env
@@ -159,10 +162,10 @@ def comando(p, prompt):
             base += ["-m", p["model"]]
         return base + [prompt]
     if prov == "gemini":
-        base = ["gemini", "-p"]
+        base = ["gemini", "--skip-trust"]
         if p.get("model"):
-            base = ["gemini", "-m", p["model"], "-p"]
-        return base + [prompt]
+            base += ["-m", p["model"]]
+        return base + ["-p", prompt]
     raise ValueError(f"proveedor desconocido: {prov}")
 
 
@@ -174,10 +177,12 @@ def autenticado(pid, p):
     if prov == "gpt":
         return os.path.exists(os.path.join(h, "auth.json"))
     if prov == "gemini":
+        if p.get("auth") == "oauth":
+            return os.path.exists(os.path.join(h, ".gemini", "oauth_creds.json"))
         k = p.get("api_key_file")
         if k and os.path.exists(os.path.expanduser(k)):
             return True
-        return os.path.exists(os.path.join(h, "settings.json"))
+        return os.path.exists(os.path.join(h, ".gemini", "settings.json"))
     return False
 
 
@@ -190,8 +195,11 @@ def cmd_login(pid, p):
     if prov == "gpt":
         return f'CODEX_HOME="{h}" codex login'
     if prov == "gemini":
+        if p.get("auth") == "oauth":
+            return (f'GEMINI_CLI_HOME="{h}" GOOGLE_GENAI_USE_GCA=true BROWSER=firefox gemini'
+                    f'   # autoriza con la cuenta de Google')
         return (f'mkdir -p "{h}" && printf %s "TU_API_KEY" > "{h}/api_key" '
-                f'&& chmod 600 "{h}/api_key"   # o: gemini  (y elegir metodo de auth)')
+                f'&& chmod 600 "{h}/api_key"')
     return "proveedor desconocido"
 
 
