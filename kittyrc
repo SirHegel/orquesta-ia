@@ -1,0 +1,4 @@
+# Perfil de shell exclusivo de kitty: bash normal + Orquesta IA encima.
+[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+[ -f "$HOME/Documentos/ia/orquesta/shell.sh" ] && . "$HOME/Documentos/ia/orquesta/shell.sh"

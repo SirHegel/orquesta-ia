@@ -407,6 +407,112 @@ def cmd_ver(a):
         print(c("red", "no hay salida guardada para ese run_id")); sys.exit(1)
     print(open(f).read())
 
+def cmd_permisos(a):
+    with L.bloqueo():
+        cf = L.cfg()
+        if a.estado:
+            cf["_permisos_totales"] = (a.estado == "on")
+            L.guardar_cfg(cf)
+    L.escribir_entorno()
+    on = L.permisos_activos()
+    print("\n  permisos totales: " + (c("g", "ACTIVADOS") if on else c("y", "desactivados")))
+    if on:
+        print("  " + c("d", "las IA ejecutan comandos sin pedirte confirmacion en cada paso"))
+        for prov, fl in sorted(L.PERMISOS.items()):
+            print(f"    {prov:<12} {c('d', ' '.join(fl))}")
+    print("  " + c("d", "cambia con:  orq permisos on|off") + "\n")
+
+def cmd_proyecto(a):
+    carpeta = os.path.abspath(os.path.expanduser(a.en or os.getcwd()))
+    print("\n  " + c("b", "PROYECTO") + "  " + c("d", carpeta))
+    print("  " + c("d", a.prompt[:150]) + "\n")
+
+    print("  " + c("y", "fase 0") + c("d", " · planificando…"), flush=True)
+    plan, err = L.planificar(a.prompt, carpeta, a.timeout)
+    if err:
+        print("  " + c("red", err) + "\n"); sys.exit(1)
+
+    filas = []
+    for t in plan["tareas"]:
+        tipo = t.get("tipo", "code")
+        pid, _ = L._mejor_para(tipo if tipo in L.TAREAS else "code")
+        filas.append([t["id"], t.get("titulo", "")[:38], tipo,
+                      pid or c("red", "sin cuenta"),
+                      ",".join(t.get("depende") or []) or c("d", "—")])
+    tabla([("id", 0), ("tarea", 0), ("tipo", 0), ("la hace", 0), ("tras", 0)], filas,
+          f"PLAN · {plan.get('nombre','?')} · por {plan['_planificador']}")
+    print("  " + c("d", plan.get("resumen", "")))
+    olas = L._ordenar_por_olas(plan["tareas"])
+    print("  " + c("d", f"{len(plan['tareas'])} tareas en {len(olas)} olas "
+                       f"(las de una misma ola corren en paralelo)"))
+
+    if not a.si:
+        try:
+            if input("\n  ¿Ejecuto? [s/N] ").strip().lower() not in ("s", "si", "sí", "y"):
+                print("  cancelado\n"); return
+        except (EOFError, KeyboardInterrupt):
+            print("\n  cancelado\n"); return
+
+    def cb(ev, d):
+        if ev == "ola":
+            print("\n  " + c("y", f"ola {d['n']}") + c("d", " · " + ", ".join(d["tareas"])), flush=True)
+        else:
+            marca = c("g", "✓") if not d["rc"] else c("red", "✗")
+            print(f"    {marca} {d['titulo'][:40]:<42} {c('d', str(d['perfil']))}  "
+                  f"{c('d', f'{d[chr(116)+chr(111)+chr(107)+chr(101)+chr(110)+chr(115)]:,} tok · {d[chr(115)+chr(101)+chr(103)]}s')}", flush=True)
+
+    print("\n  " + c("y", "ejecutando"))
+    res = L.ejecutar_proyecto(plan, carpeta, a.timeout, cb)
+
+    if not a.sin_integrar:
+        print("\n  " + c("y", "fase final") + c("d", " · integrando y escribiendo README…"), flush=True)
+        fin = L.integrar_proyecto(plan, carpeta, res, a.timeout)
+        if fin:
+            print("  " + (fin["texto"] or "")[:600])
+            res.append({"titulo": "integracion", "perfil": fin["perfil"],
+                        "tokens": fin["tokens"], "seg": fin["seg"], "rc": fin["rc"]})
+
+    tot = sum(r["tokens"] for r in res) + plan.get("_tokens_plan", 0)
+    porq = {}
+    for r in res:
+        if r.get("perfil"):
+            porq[r["perfil"]] = porq.get(r["perfil"], 0) + r["tokens"]
+    print("\n  " + c("b", "LISTO") + c("d", f"  ·  {tot:,} tokens en total"))
+    for k, v in sorted(porq.items(), key=lambda x: -x[1]):
+        print(f"    {k:<22} {v:>9,} tok")
+    try:
+        n = len([f for f in os.listdir(carpeta) if not f.startswith(".")])
+        print("  " + c("d", f"{n} archivos en {carpeta}"))
+    except OSError:
+        pass
+    print()
+
+def cmd_cuota(a):
+    ps = L.cfg().get("profiles", {})
+    filas = []
+    for pid, p in ps.items():
+        if not L.autenticado(pid, p):
+            continue
+        q = L.cuota(pid, p)
+        if q.get("fuente") == "proveedor":
+            pct = q.get("usado_pct") or 0
+            col = "red" if pct >= 80 else ("y" if pct >= 50 else "g")
+            barra = _barra(pct, 100, 18)
+            filas.append([pid, c("g", "OFICIAL"), c(col, f"{pct:.0f}%"), barra,
+                          f"{(q.get('ventana_min') or 0)//60}h",
+                          (q.get("reinicia") or "?")[:16].replace("T", " ")])
+        else:
+            det = f"{q.get('facturable', 0):,} tok"
+            if q.get("plan_real"):
+                det += f" · {q['plan_real']}"
+            filas.append([pid, c("y", "estimado"), c("d", "?"), c("d", det),
+                          f"{q.get('ventana_horas', 5):g}h", c("d", "—")])
+    tabla([("cuenta", 0), ("dato", 0), ("usado", 1), ("detalle", 0),
+           ("ventana", 1), ("recarga", 0)], filas, "CUOTA REAL")
+    print("\n  " + c("g", "OFICIAL") + c("d", " = el proveedor publica el porcentaje exacto."))
+    print("  " + c("y", "estimado") + c("d", " = calculado leyendo TODAS las sesiones de esta maquina"))
+    print("  " + c("d", "              (no incluye lo que uses desde el movil, la web u otro equipo)") + "\n")
+
 def cmd_score(a):
     if not 0 <= a.nota <= 10: print("nota de 0 a 10"); sys.exit(1)
     pid = a.run_id.rsplit("-",1)[0]
@@ -465,6 +571,13 @@ def main():
     k.add_argument("--lineas", type=int, default=0, help="corta la salida a N lineas")
     k.set_defaults(f=cmd_ask)
 
+    pr = sub.add_parser("proyecto", help="un prompt -> todas las IA sobre una sola carpeta")
+    pr.add_argument("prompt"); pr.add_argument("--en", help="carpeta del proyecto")
+    pr.add_argument("--si", action="store_true", help="no preguntar antes de ejecutar")
+    pr.add_argument("--sin-integrar", action="store_true", help="saltar la fase final")
+    pr.add_argument("--timeout", type=int, default=600)
+    pr.set_defaults(f=cmd_proyecto)
+
     im = sub.add_parser("imagen", help="generar una imagen o diseno")
     im.add_argument("prompt"); im.add_argument("--en", help="carpeta destino (por defecto, la actual)")
     im.add_argument("--nombre", help="nombre del archivo, sin extension")
@@ -481,6 +594,12 @@ def main():
     au = sub.add_parser("audit", help="responden y se auditan entre ellos")
     au.add_argument("prompt"); au.add_argument("--tarea", choices=L.TAREAS, default="reasoning")
     au.add_argument("--timeout", type=int, default=300); au.set_defaults(f=cmd_audit)
+
+    pm = sub.add_parser("permisos", help="permitir que las IA ejecuten sin preguntar")
+    pm.add_argument("estado", nargs="?", choices=["on", "off"]); pm.set_defaults(f=cmd_permisos)
+
+    cu = sub.add_parser("cuota", help="consumo REAL de cada cuenta, no solo el de Orquesta")
+    cu.set_defaults(f=cmd_cuota)
 
     uz = sub.add_parser("uso", help="informe de consumo por dia / semana / mes / sesion")
     uz.add_argument("--periodo", choices=["dia", "semana", "mes", "todo"], default="mes")

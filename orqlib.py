@@ -3,7 +3,8 @@
 Estado en disco con bloqueo fcntl: cualquier numero de terminales puede usar
 el sistema a la vez sin corromper el ledger ni los contadores.
 """
-import json, os, re, shutil, subprocess, time, datetime, fcntl, contextlib
+import json, os, re, shutil, subprocess, sys, time, datetime, fcntl, contextlib
+from concurrent.futures import ThreadPoolExecutor
 
 BASE = os.environ.get("ORQ_HOME") or os.path.dirname(os.path.abspath(__file__))
 ACCOUNTS = os.path.join(BASE, "accounts")
@@ -154,25 +155,58 @@ def entorno(pid, p):
     return env
 
 
+# Maxima potencia: modelo y esfuerzo mas altos de cada proveedor.
+POTENCIA_MAX = {
+    "claude": {"model": "claude-opus-5", "effort": "xhigh"},
+    "gpt": {"reasoning": "high"},
+    "antigravity": {"model": "gemini-3.1-pro-high", "effort": "high"},
+    "gemini": {},
+}
+
+
+def potencia_maxima():
+    return cfg().get("_potencia_maxima", True)
+
+
+PERMISOS = {
+    "claude": ["--dangerously-skip-permissions"],
+    "gpt": ["--dangerously-bypass-approvals-and-sandbox"],
+    "antigravity": ["--dangerously-skip-permissions"],
+    "gemini": ["--yolo"],
+}
+
+
+def permisos_activos():
+    return cfg().get("_permisos_totales", True)
+
+
 def comando(p, prompt):
     prov = p.get("provider")
+    perm = PERMISOS.get(prov, []) if permisos_activos() else []
+    mx = POTENCIA_MAX.get(prov, {}) if potencia_maxima() else {}
+    # el perfil manda sobre el ajuste global
+    modelo = p.get("model") or mx.get("model")
     if prov == "claude":
-        base = ["claude", "-p", "--output-format", "json"]
-        if p.get("model"):
-            base += ["--model", p["model"]]
+        base = ["claude", "-p", "--output-format", "json"] + perm
+        if modelo:
+            base += ["--model", modelo]
+        if mx.get("effort"):
+            base += ["--effort", mx["effort"]]
         return base + [prompt]
     if prov == "gpt":
-        base = ["codex", "exec", "--skip-git-repo-check"]
-        if p.get("model"):
-            base += ["-m", p["model"]]
+        base = ["codex", "exec", "--skip-git-repo-check"] + perm
+        if modelo:
+            base += ["-m", modelo]
+        if mx.get("reasoning"):
+            base += ["-c", f'model_reasoning_effort="{mx["reasoning"]}"']
         return base + [prompt]
     if prov == "antigravity":
-        base = ["agy", "--output-format", "json"]
+        base = ["agy", "--output-format", "json"] + perm
         if p.get("model"):
             base += ["--model", p["model"]]
         return base + ["-p", prompt]
     if prov == "gemini":
-        base = ["gemini", "--skip-trust"]
+        base = ["gemini", "--skip-trust"] + perm
         if p.get("model"):
             base += ["-m", p["model"]]
         return base + ["-p", prompt]
@@ -295,10 +329,8 @@ def extraer(provider, stdout, stderr=""):
         except Exception:
             return (stdout or "").strip(), 0
     if provider == "gpt":
-        tok = 0
-        m = re.findall(r"tokens used\s*\n\s*([\d,]+)", stderr or "")
-        if m:
-            tok = int(m[-1].replace(",", ""))
+        m = re.findall(r"tokens used\s*\n\s*([\d.,\s]*\d)", stderr or "")
+        tok = sum(int(re.sub(r"\D", "", x)) for x in m if re.sub(r"\D", "", x))
         return (stdout or "").strip(), tok
     return (stdout or "").strip(), 0
 
@@ -385,6 +417,39 @@ def puntuar(pid, p, tarea):
             return 0.0, f"ventana {horas}h agotada ({gv}/{cupo})"
         factor *= 0.3 + 0.7 * (1 - gv / cupo)
         notas.append(f"ventana{horas}h {gv}/{cupo}")
+    # Cuota REAL del proveedor cuando existe (codex la publica).
+    try:
+        q = cuota(pid, p)
+    except Exception as e:
+        q = {}
+        if os.environ.get("ORQ_DEBUG"):
+            print(f"[orq] cuota({pid}) fallo: {e!r}", file=sys.stderr)
+    pct = q.get("usado_pct")
+    if pct is not None and q.get("fuente") == "proveedor":
+        if pct >= 99:
+            return 0.0, f"cuota agotada ({pct:.0f}% real)"
+        factor *= max(0.15, 1 - (pct / 100) ** 1.6)
+        notas.append(f"{pct:.0f}% real de su cuota")
+    elif q.get("fuente") == "local" and q.get("mensajes"):
+        notas.append(f"{q['facturable']:,} tok reales en {q.get('ventana_horas',5)}h")
+
+    # Equilibrio entre cuentas del MISMO proveedor: sin saber el limite exacto
+    # del plan, reparte segun quien ha consumido menos en su ventana.
+    hermanas = [(k, v) for k, v in cfg().get("profiles", {}).items()
+                if v.get("provider") == p.get("provider") and v.get("enabled", True)
+                and autenticado(k, v) and not bloqueado(k)]
+    if len(hermanas) > 1:
+        gastos = {}
+        for k, v in hermanas:
+            hv = v.get("ventana_horas") or VENTANA_PLAN.get(v.get("plan", "desconocido"), 5)
+            gastos[k] = gastado_ventana(k, hv)
+        total = sum(gastos.values())
+        if total > 0:
+            parte = gastos.get(pid, 0) / total          # 0 = sin usar, 1 = se lo lleva todo
+            justo = 1.0 / len(hermanas)
+            # quien va por debajo de su parte justa sube; quien va por encima baja
+            factor *= max(0.45, min(1.55, 1 + (justo - parte)))
+            notas.append(f"reparto {parte*100:.0f}% de {p.get('provider')}")
     if not notas:
         notas.append("sin tope")
     return base * mult * factor, " · ".join(notas)
@@ -497,6 +562,8 @@ def escribir_entorno():
             if k and os.path.exists(os.path.expanduser(k)):
                 lineas.append(f'export GEMINI_API_KEY="$(cat "{k}" 2>/dev/null)"')
         lineas.append(f'export ORQ_{prov.upper()}_CUENTA="{pid}"')
+    lineas.append("")
+    lineas.append(f'export ORQ_PERMISOS_TOTALES={"1" if c.get("_permisos_totales", True) else "0"}')
     lineas.append("")
     with bloqueo():
         os.makedirs(os.path.dirname(ENTORNO_SH), exist_ok=True)
@@ -703,3 +770,395 @@ def _lock_proveedor(prov):
     ruta = os.path.join(BASE, "state", f".lock-{prov}")
     os.makedirs(os.path.dirname(ruta), exist_ok=True)
     return open(ruta, "a+")
+
+# ---------------- proyectos: un prompt, todas las IA ----------------
+ESQUEMA_PLAN = """Devuelve SOLO un JSON valido, sin markdown ni texto alrededor, con esta forma:
+{"nombre":"nombre-corto-en-kebab-case",
+ "resumen":"una frase de que se va a construir",
+ "tareas":[
+   {"id":"t1","titulo":"...","tipo":"code|research|writing|edicion|imagen|review",
+    "depende":[],"instruccion":"instruccion concreta y autocontenida para quien la ejecute"}
+ ]}
+Reglas del plan:
+- Entre 3 y 7 tareas. Ni una mas.
+- 'depende' lista los id que deben terminar antes. La primera tarea no depende de nada.
+- Cada 'instruccion' debe decir exactamente que archivos crear o modificar.
+- Todo vive en UNA sola carpeta de proyecto; nada de estructuras paralelas.
+- No incluyas tareas de instalar dependencias del sistema ni de desplegar."""
+
+
+def _mejor_para(tarea):
+    r = ranking(tarea)
+    return (r[0]["pid"], r[0]["p"]) if r else (None, None)
+
+
+def _json_de(texto):
+    """Extrae el primer objeto JSON de una respuesta, tolerando ```json."""
+    if not texto:
+        return None
+    t = texto.strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t)
+    t = re.sub(r"\s*```$", "", t)
+    i, j = t.find("{"), t.rfind("}")
+    if i < 0 or j <= i:
+        return None
+    try:
+        return json.loads(t[i:j + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def planificar(descripcion, carpeta, timeout=300):
+    """Fase 0: la cuenta mas fuerte en 'agentic' propone el plan."""
+    pid, p = _mejor_para("agentic")
+    if not pid:
+        return None, "no hay ninguna cuenta disponible para planificar"
+    prompt = (f"Eres el arquitecto de un proyecto que se construira en la carpeta "
+              f"{carpeta}. El encargo es:\n\n{descripcion}\n\n{ESQUEMA_PLAN}")
+    r = correr(pid, p, prompt, "agentic", timeout)
+    plan = _json_de(r["texto"])
+    if not plan or not plan.get("tareas"):
+        return None, f"{pid} no devolvio un plan valido: {(r['texto'] or '')[:180]}"
+    plan["_planificador"] = pid
+    plan["_tokens_plan"] = r["tokens"]
+    return plan, None
+
+
+def _ordenar_por_olas(tareas):
+    """Agrupa las tareas en olas: cada ola puede correr en paralelo."""
+    pend = {t["id"]: t for t in tareas}
+    hechas, olas = set(), []
+    while pend:
+        ola = [t for t in pend.values()
+               if all(d in hechas for d in (t.get("depende") or []))]
+        if not ola:                       # dependencia rota o ciclo: corre el resto
+            ola = list(pend.values())
+        olas.append(ola)
+        for t in ola:
+            hechas.add(t["id"]); pend.pop(t["id"], None)
+    return olas
+
+
+def ejecutar_proyecto(plan, carpeta, timeout=600, callback=None):
+    """Fases 1..N: cada tarea va a la cuenta que mejor rinde en su tipo."""
+    os.makedirs(carpeta, exist_ok=True)
+    resultados, contexto = [], []
+    for n, ola in enumerate(_ordenar_por_olas(plan["tareas"]), 1):
+        if callback:
+            callback("ola", {"n": n, "tareas": [t["titulo"] for t in ola]})
+        trabajos = []
+        usados = set()      # reparte la ola entre cuentas distintas
+        for t in ola:
+            tipo = t.get("tipo", "code")
+            if tipo not in TAREAS:
+                tipo = "code"
+            r = ranking(tipo)
+            eleg = next((x for x in r if x["pid"] not in usados), r[0] if r else None)
+            pid, p = (eleg["pid"], eleg["p"]) if eleg else (None, None)
+            if pid:
+                usados.add(pid)
+            if not pid:
+                resultados.append({"id": t["id"], "titulo": t["titulo"], "perfil": None,
+                                   "rc": 1, "tokens": 0, "seg": 0,
+                                   "texto": f"sin cuenta capaz de '{tipo}'"})
+                continue
+            previo = ("\n\nYa esta hecho (no lo repitas):\n" +
+                      "\n".join(f"- {c}" for c in contexto[-8:])) if contexto else ""
+            instr = (
+                f"Proyecto: {plan.get('nombre','proyecto')} — {plan.get('resumen','')}\n"
+                f"Carpeta de trabajo: {carpeta}\n"
+                f"Tu tarea: {t['titulo']}\n{t['instruccion']}{previo}\n\n"
+                f"Reglas: escribe los archivos DENTRO de {carpeta}. No crees carpetas "
+                f"paralelas ni proyectos aparte. Integra con lo que ya exista. "
+                f"Al terminar responde en UNA linea: que archivos creaste o cambiaste.")
+            trabajos.append((t, pid, p, tipo, instr))
+        if trabajos:
+            with ThreadPoolExecutor(max_workers=min(4, len(trabajos))) as ex:
+                salidas = list(ex.map(
+                    lambda w: (w[0], w[1], correr(w[1], w[2], w[4], w[3], timeout)),
+                    trabajos))
+            for t, pid, r in salidas:
+                resultados.append({"id": t["id"], "titulo": t["titulo"], "perfil": pid,
+                                   "tipo": t.get("tipo"), "rc": r["rc"],
+                                   "tokens": r["tokens"], "seg": r["seg"],
+                                   "texto": (r["texto"] or "")[:400],
+                                   "run_id": r["run_id"]})
+                contexto.append(f"{t['titulo']}: {(r['texto'] or '')[:150]}")
+                if callback:
+                    callback("tarea", resultados[-1])
+    return resultados
+
+
+def integrar_proyecto(plan, carpeta, resultados, timeout=600):
+    """Fase final: alguien revisa la carpeta entera y la deja conectada."""
+    pid, p = _mejor_para("review")
+    if not pid:
+        return None
+    hecho = "\n".join(f"- [{r['perfil']}] {r['titulo']}: {r['texto'][:120]}"
+                       for r in resultados)
+    prompt = (
+        f"Revisa la carpeta {carpeta} del proyecto '{plan.get('nombre')}'.\n"
+        f"Lo que hizo cada IA:\n{hecho}\n\n"
+        f"Tu trabajo: recorre los archivos reales de la carpeta y dejala COHERENTE. "
+        f"Arregla importaciones o rutas que no cuadren entre piezas hechas por "
+        f"distintos autores, elimina duplicados y archivos sueltos que no encajen, "
+        f"y escribe o corrige el README.md con que es, como se instala y como se usa. "
+        f"No reescribas lo que ya funciona. Responde en 5 lineas: que arreglaste.")
+    return correr(pid, p, prompt, "review", timeout)
+
+# ---------------- USO REAL (todas las sesiones, no solo las de Orquesta) ----------------
+# El ledger de Orquesta solo ve lo que Orquesta gasta. Pero tus sesiones
+# manuales (claude, codex --yolo, agy) consumen de la MISMA cuota. Aqui se
+# leen los registros que cada CLI deja en disco para ver el consumo real.
+CACHE_REAL = os.path.join(BASE, "state", "uso_real.json")
+
+
+def _dirs_sesiones(pid, p):
+    prov = p.get("provider")
+    h = home_de(pid, p)
+    if prov == "claude":
+        return [os.path.join(h, "projects")]
+    if prov == "gpt":
+        return [os.path.join(h, "sessions")]
+    if prov == "antigravity":
+        return [os.path.join(h, "conversations")]
+    return []
+
+
+def _uso_archivo_claude(f):
+    """Suma el uso de una sesion de Claude Code. Devuelve (por_dia, por_hora)."""
+    dias, horas = {}, {}
+    try:
+        with open(f, errors="ignore") as fh:
+            for linea in fh:
+                if '"usage"' not in linea:
+                    continue
+                try:
+                    d = json.loads(linea)
+                except json.JSONDecodeError:
+                    continue
+                u = (d.get("message") or {}).get("usage") or d.get("usage")
+                if not isinstance(u, dict):
+                    continue
+                ent = u.get("input_tokens", 0) or 0
+                sal = u.get("output_tokens", 0) or 0
+                cache = (u.get("cache_read_input_tokens", 0) or 0) + \
+                        (u.get("cache_creation_input_tokens", 0) or 0)
+                ts = d.get("timestamp") or ""
+                dia, hora = ts[:10], ts[:13]
+                for k, dic in ((dia, dias), (hora, horas)):
+                    if not k:
+                        continue
+                    a = dic.setdefault(k, {"entrada": 0, "salida": 0, "cache": 0, "msgs": 0})
+                    a["entrada"] += ent; a["salida"] += sal
+                    a["cache"] += cache; a["msgs"] += 1
+    except OSError:
+        pass
+    return dias, horas
+
+
+def _uso_archivo_codex(f):
+    dias, horas = {}, {}
+    ult = 0
+    ts_ult = ""
+    try:
+        with open(f, errors="ignore") as fh:
+            for linea in fh:
+                if "token_usage" not in linea and "total_token" not in linea:
+                    continue
+                try:
+                    d = json.loads(linea)
+                except json.JSONDecodeError:
+                    continue
+                pl = d.get("payload") or d
+                info = pl.get("info") if isinstance(pl.get("info"), dict) else {}
+                u = info.get("total_token_usage") or pl.get("token_usage")
+                if not isinstance(u, dict):
+                    continue
+                tot = u.get("total_tokens") or sum(
+                    v for k, v in u.items() if isinstance(v, int) and k != "total_tokens")
+                if tot and tot >= ult:          # el registro es acumulativo
+                    ult = tot
+                    ts_ult = d.get("timestamp") or pl.get("timestamp") or ts_ult
+    except OSError:
+        pass
+    if ult and ts_ult:
+        dia, hora = ts_ult[:10], ts_ult[:13]
+        for k, dic in ((dia, dias), (hora, horas)):
+            dic[k] = {"entrada": 0, "salida": 0, "cache": 0, "msgs": 1, "total": ult}
+    return dias, horas
+
+
+def uso_real(pid, p, refrescar=False):
+    """Consumo real de esa cuenta leyendo los registros del propio CLI."""
+    prov = p.get("provider")
+    cache = _leer(CACHE_REAL, {})
+    entrada = cache.get(pid, {})
+    archivos = {}
+    for d in _dirs_sesiones(pid, p):
+        if not os.path.isdir(d):
+            continue
+        for raiz, _, files in os.walk(d):
+            for f in files:
+                if f.endswith(".jsonl"):
+                    ruta = os.path.join(raiz, f)
+                    try:
+                        archivos[ruta] = os.path.getmtime(ruta)
+                    except OSError:
+                        pass
+    dias, horas = {}, {}
+    vistos = entrada.get("archivos", {})
+    parcial = entrada.get("dias", {}), entrada.get("horas", {})
+    nuevos = {}
+    for ruta, m in archivos.items():
+        if not refrescar and vistos.get(ruta) == m and ruta in entrada.get("hechos", []):
+            continue
+        d1, h1 = (_uso_archivo_claude(ruta) if prov == "claude"
+                  else _uso_archivo_codex(ruta) if prov == "gpt" else ({}, {}))
+        for src, dst in ((d1, dias), (h1, horas)):
+            for k, v in src.items():
+                a = dst.setdefault(k, {"entrada": 0, "salida": 0, "cache": 0, "msgs": 0})
+                for kk in ("entrada", "salida", "cache", "msgs"):
+                    a[kk] += v.get(kk, 0)
+        nuevos[ruta] = m
+    # combina con lo cacheado
+    for src, dst in ((parcial[0], dias), (parcial[1], horas)):
+        for k, v in (src or {}).items():
+            a = dst.setdefault(k, {"entrada": 0, "salida": 0, "cache": 0, "msgs": 0})
+            for kk in ("entrada", "salida", "cache", "msgs"):
+                a[kk] += v.get(kk, 0)
+    with bloqueo():
+        c = _leer(CACHE_REAL, {})
+        c[pid] = {"dias": dias, "horas": horas,
+                  "archivos": {**vistos, **nuevos},
+                  "hechos": list({**vistos, **nuevos}.keys()),
+                  "actualizado": ahora().isoformat(timespec="seconds")}
+        _escribir(CACHE_REAL, c)
+    return {"dias": dias, "horas": horas, "archivos": len(archivos)}
+
+
+def uso_real_ventana(pid, p, horas_ventana=5):
+    """Tokens reales consumidos dentro de la ventana de recarga vigente."""
+    r = uso_real(pid, p)
+    corte = ahora() - datetime.timedelta(hours=horas_ventana)
+    tot = {"entrada": 0, "salida": 0, "cache": 0, "msgs": 0}
+    for hk, v in r["horas"].items():
+        try:
+            t = datetime.datetime.strptime(hk, "%Y-%m-%dT%H")
+        except ValueError:
+            continue
+        if t >= corte.replace(minute=0, second=0, microsecond=0):
+            for k in tot:
+                tot[k] += v.get(k, 0)
+    tot["facturable"] = tot["entrada"] + tot["salida"]
+    tot["bruto"] = tot["facturable"] + tot["cache"]
+    return tot
+
+# ---------------- CUOTA REAL DEL PROVEEDOR ----------------
+# Codex escribe su 'rate_limits' (used_percent real) en cada sesion.
+# Claude no lo hace: ahi se estima desde los registros de sesion locales.
+TIER_CLAUDE = {"default_claude_max_20x": ("Max 20x", 20),
+               "default_claude_max_5x": ("Max 5x", 5),
+               "default_claude_pro": ("Pro", 1)}
+
+
+def cuota_codex(pid, p):
+    """Lee el ultimo rate_limits que dejo codex: es cuota REAL del proveedor."""
+    d = os.path.join(home_de(pid, p), "sessions")
+    if not os.path.isdir(d):
+        return None
+    archivos = []
+    for raiz, _, fs in os.walk(d):
+        for f in fs:
+            if f.startswith("rollout-") and f.endswith(".jsonl"):
+                ruta = os.path.join(raiz, f)
+                try:
+                    archivos.append((os.path.getmtime(ruta), ruta))
+                except OSError:
+                    pass
+    archivos.sort(reverse=True)
+    for _, ruta in archivos[:6]:
+        ult = None
+        try:
+            with open(ruta, errors="ignore") as fh:
+                for linea in fh:
+                    if "rate_limits" not in linea:
+                        continue
+                    try:
+                        d2 = json.loads(linea)
+                    except json.JSONDecodeError:
+                        continue
+                    rl = (d2.get("payload") or {}).get("rate_limits")
+                    if rl:
+                        ult = (d2.get("timestamp"), rl)
+        except OSError:
+            continue
+        if ult:
+            ts, rl = ult
+            pr = rl.get("primary") or {}
+            res = pr.get("resets_at")
+            return {"fuente": "proveedor", "usado_pct": pr.get("used_percent"),
+                    "ventana_min": pr.get("window_minutes"),
+                    "reinicia": datetime.datetime.fromtimestamp(res).isoformat(timespec="minutes")
+                                if res else None,
+                    "plan": rl.get("plan_type"), "medido": ts[:19] if ts else None,
+                    "creditos": (rl.get("credits") or {}).get("balance")}
+    return None
+
+
+def plan_claude(pid, p):
+    """Nivel real del plan segun el token guardado por el CLI."""
+    for ruta in (os.path.join(home_de(pid, p), ".claude.json"),
+                 os.path.expanduser("~/.claude.json") if home_de(pid, p).endswith(".claude") else None):
+        if not ruta or not os.path.exists(ruta):
+            continue
+        try:
+            d = json.load(open(ruta))
+        except Exception:
+            continue
+        oa = d.get("oauthAccount") or {}
+        t = oa.get("organizationRateLimitTier") or oa.get("userRateLimitTier")
+        if t:
+            nom, mult = TIER_CLAUDE.get(t, (t, 1))
+            return {"tier": t, "nombre": nom, "multiplicador": mult,
+                    "correo": oa.get("emailAddress")}
+    try:
+        cr = json.load(open(os.path.join(home_de(pid, p), ".credentials.json")))
+        t = (cr.get("claudeAiOauth") or {}).get("rateLimitTier")
+        if t:
+            nom, mult = TIER_CLAUDE.get(t, (t, 1))
+            return {"tier": t, "nombre": nom, "multiplicador": mult}
+    except Exception:
+        pass
+    return None
+
+
+def cuota(pid, p):
+    """Mejor estimacion disponible del consumo de esa cuenta.
+
+    'fuente' dice de donde sale: 'proveedor' es dato oficial; 'local' es
+    calculado desde los registros de sesion de esta maquina, y por tanto
+    NO incluye lo que uses desde el movil, la web u otro equipo.
+    """
+    prov = p.get("provider")
+    if prov == "gpt":
+        c = cuota_codex(pid, p)
+        if c:
+            return c
+    horas = p.get("ventana_horas") or VENTANA_PLAN.get(p.get("plan", "desconocido"), 5)
+    v = uso_real_ventana(pid, p, horas)
+    out = {"fuente": "local", "ventana_horas": horas,
+           "facturable": v["facturable"], "bruto": v["bruto"], "mensajes": v["msgs"]}
+    if prov == "claude":
+        pl = plan_claude(pid, p)
+        if pl:
+            out["plan_real"] = pl["nombre"]
+            out["multiplicador"] = pl["multiplicador"]
+            cupo = p.get("cupo_ventana") or 0
+            if cupo:
+                out["usado_pct"] = round(100 * v["facturable"] / cupo, 1)
+    else:
+        cupo = p.get("cupo_ventana") or 0
+        if cupo:
+            out["usado_pct"] = round(100 * v["facturable"] / cupo, 1)
+    return out

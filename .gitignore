@@ -20,3 +20,4 @@ __pycache__/
 .DS_Store
 *.swp
 *.tmp
+state/uso_real.json

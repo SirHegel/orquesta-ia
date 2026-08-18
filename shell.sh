@@ -77,3 +77,65 @@ orqyo() {
     echo "  gemini  : ${ORQ_ANTIGRAVITY_CUENTA:-${ORQ_GEMINI_CUENTA:-(sin activa)}}"
   fi
 }
+
+# ── Permisos siempre dados ──────────────────────────────────────────────
+# Escribir 'claude', 'codex' o 'agy' a secas ya trae los flags. Sin esto
+# tendrias que acordarte del flag cada vez (antes hacias 'codex --yolo').
+# Para una llamada puntual sin permisos: 'command claude ...'
+if [ "${ORQ_PERMISOS_TOTALES:-1}" = "1" ]; then
+  claude() { command claude --dangerously-skip-permissions "$@"; }
+  codex()  {
+    case "$1" in
+      exec|login|logout|mcp|sandbox|apply|resume)
+        command codex "$@";;
+      *) command codex --dangerously-bypass-approvals-and-sandbox "$@";;
+    esac
+  }
+  agy()    { command agy --dangerously-skip-permissions "$@"; }
+  gemini() { command gemini --yolo "$@"; }
+fi
+
+# ── Un prompt, todas las IA ─────────────────────────────────────────────
+# 'ia "lo que sea"'            -> lo delega a la mejor cuenta para esa tarea
+# 'ia -p "haz un bot ..."'     -> proyecto completo repartido entre todas
+ia() {
+  if [ "$1" = "-p" ] || [ "$1" = "--proyecto" ]; then
+    shift; orq proyecto "$@"
+  else
+    orq ask "$@"
+  fi
+}
+
+# ── Modo kitty: abrir y promptear ───────────────────────────────────────
+# Solo en kitty. La terminal por defecto (Ptyxis) queda intacta: comandos
+# normales, y la IA solo si la invocas tu con 'ia' u 'orq'.
+if [ -n "$KITTY_WINDOW_ID" ] && [ -z "$ORQ_SIN_MODO_PROMPT" ]; then
+  export ORQ_MODO=kitty
+
+  # Si escribes algo que no es un comando pero parece lenguaje natural,
+  # va al orquestador. Si parece un comando mal escrito, se comporta normal.
+  command_not_found_handle() {
+    local linea="$*" palabras
+    palabras=$#
+    # Heuristica: >=3 palabras, o lleva ? ¿ o tildes -> es un prompt
+    if [ "$palabras" -ge 3 ] || printf '%s' "$linea" | grep -qiE '[?¿áéíóúñ]'; then
+      printf '\033[2m  → orquestando…\033[0m\n'
+      orq ask "$linea" --tarea reasoning --lineas 24
+      return $?
+    fi
+    printf '\033[31m%s\033[0m: no es un comando\n' "$1" >&2
+    printf '\033[2m  (para preguntarle a la IA: ia "%s")\033[0m\n' "$linea" >&2
+    return 127
+  }
+
+  # Cabecera al abrir kitty
+  _orq_bienvenida() {
+    [ -n "$ORQ_BIENVENIDA_HECHA" ] && return
+    export ORQ_BIENVENIDA_HECHA=1
+    printf '\n  \033[1mORQUESTA IA\033[0m \033[2m· potencia maxima · permisos dados\033[0m\n'
+    printf '  \033[2mclaude:\033[0m %s   \033[2mgpt:\033[0m %s   \033[2mgemini:\033[0m %s\n' \
+      "${ORQ_CLAUDE_CUENTA:--}" "${ORQ_GPT_CUENTA:--}" "${ORQ_ANTIGRAVITY_CUENTA:--}"
+    printf '  \033[2mescribe tu pregunta directo, o:  ia -p "proyecto..." --en carpeta\033[0m\n\n'
+  }
+  _orq_bienvenida
+fi
