@@ -136,6 +136,8 @@ def entorno(pid, p):
         env["CLAUDE_CONFIG_DIR"] = h
     elif prov == "gpt":
         env["CODEX_HOME"] = h
+    elif prov == "antigravity":
+        pass
     elif prov == "gemini":
         env["GEMINI_CLI_HOME"] = h
         env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
@@ -161,6 +163,11 @@ def comando(p, prompt):
         if p.get("model"):
             base += ["-m", p["model"]]
         return base + [prompt]
+    if prov == "antigravity":
+        base = ["agy", "--output-format", "json"]
+        if p.get("model"):
+            base += ["--model", p["model"]]
+        return base + ["-p", prompt]
     if prov == "gemini":
         base = ["gemini", "--skip-trust"]
         if p.get("model"):
@@ -176,6 +183,9 @@ def autenticado(pid, p):
         return os.path.exists(os.path.join(h, ".credentials.json"))
     if prov == "gpt":
         return os.path.exists(os.path.join(h, "auth.json"))
+    if prov == "antigravity":
+        import shutil
+        return shutil.which("agy") is not None
     if prov == "gemini":
         if p.get("auth") == "oauth":
             return os.path.exists(os.path.join(h, ".gemini", "oauth_creds.json"))
@@ -196,6 +206,11 @@ def cmd_login(pid, p):
         return f'{pre}CLAUDE_CONFIG_DIR="{h}" claude   # dentro escribe: /login'
     if prov == "gpt":
         return f'{pre}CODEX_HOME="{h}" codex login'
+    if prov == "antigravity":
+        import shutil
+        return shutil.which("agy") is not None
+    if prov == "antigravity":
+        return "agy   # si pide sesion, autoriza en el navegador"
     if prov == "gemini":
         if p.get("auth") == "oauth":
             return (f'GEMINI_CLI_HOME="{h}" GOOGLE_GENAI_USE_GCA=true '
@@ -267,6 +282,13 @@ def extraer(provider, stdout, stderr=""):
                    + u.get("cache_read_input_tokens", 0)
                    + u.get("cache_creation_input_tokens", 0))
             return (d.get("result") or ""), tok
+        except Exception:
+            return (stdout or "").strip(), 0
+    if provider == "antigravity":
+        try:
+            d = json.loads(stdout)
+            u = d.get("usage", {}) or {}
+            return (d.get("response") or "").strip(), u.get("total_tokens", 0)
         except Exception:
             return (stdout or "").strip(), 0
     if provider == "gpt":
