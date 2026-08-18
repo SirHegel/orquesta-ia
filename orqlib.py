@@ -3,8 +3,8 @@
 Estado en disco con bloqueo fcntl: cualquier numero de terminales puede usar
 el sistema a la vez sin corromper el ledger ni los contadores.
 """
-import json, os, re, shutil, subprocess, sys, time, datetime, fcntl, contextlib
-from concurrent.futures import ThreadPoolExecutor
+import json, os, re, shutil, subprocess, sys, threading, time, datetime, fcntl, contextlib
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 BASE = os.environ.get("ORQ_HOME") or os.path.dirname(os.path.abspath(__file__))
 ACCOUNTS = os.path.join(BASE, "accounts")
@@ -876,57 +876,146 @@ def _ordenar_por_olas(tareas):
     return olas
 
 
-def ejecutar_proyecto(plan, carpeta, timeout=600, callback=None):
-    """Fases 1..N: cada tarea va a la cuenta que mejor rinde en su tipo."""
+def deliberar(plan, encargo, timeout=240):
+    """Las IA opinan sobre quien debe hacer que, antes de gastar en construir.
+
+    Si coinciden en que conviene hacerlo con una sola cuenta, se hace asi.
+    """
+    disp = disponibles()
+    if len(disp) < 2:
+        return None, "una sola cuenta disponible; no hay nada que deliberar"
+    resumen_plan = "\n".join(f"- {t['id']} [{t.get('tipo','code')}] {t['titulo']}"
+                             for t in plan["tareas"])
+    fichas = []
+    for pid, p in disp.items():
+        w = p.get("weights") or {}
+        fuerte = sorted(w.items(), key=lambda x: -x[1])[:3]
+        try:
+            q = cuota(pid, p)
+            resto = (f"{100 - q['usado_pct']:.0f}% de cuota libre"
+                     if q.get("usado_pct") is not None else "cuota sin medir")
+        except Exception:
+            resto = "cuota sin medir"
+        fichas.append(f"- {pid} ({p.get('provider')}): fuerte en "
+                      f"{', '.join(k for k, _ in fuerte)}; {resto}")
+    prompt = DELIBERAR.format(encargo=encargo[:600], plan=resumen_plan,
+                              cuentas="\n".join(fichas))
+    votantes = list(disp.items())[:3]
+    with ThreadPoolExecutor(max_workers=len(votantes)) as ex:
+        votos = list(ex.map(lambda kv: (kv[0], correr(kv[0], kv[1], prompt,
+                                                      "reasoning", timeout)),
+                            votantes))
+    props, solos = [], 0
+    for pid, r in votos:
+        j = _json_de(r["texto"])
+        if not j:
+            continue
+        if j.get("una_sola"):
+            solos += 1
+        if isinstance(j.get("asignacion"), dict):
+            props.append(j["asignacion"])
+    if not props:
+        return None, "nadie devolvio una asignacion valida; sigo con el router"
+    if solos > len(props) / 2:
+        # mayoria dice que es mejor una sola cuenta: la mas capaz con cuota
+        rk = ranking("agentic")
+        elegida = rk[0]["pid"] if rk else None
+        return ({t["id"]: elegida for t in plan["tareas"]},
+                f"{solos} de {len(props)} coinciden en hacerlo con una sola cuenta ({elegida})")
+    # consenso por mayoria tarea a tarea
+    final, validas = {}, set(disp)
+    for t in plan["tareas"]:
+        conteo = {}
+        for a in props:
+            v = a.get(t["id"])
+            if v in validas:
+                conteo[v] = conteo.get(v, 0) + 1
+        if conteo:
+            final[t["id"]] = max(conteo.items(), key=lambda x: x[1])[0]
+    return (final or None), (f"consenso de {len(props)} modelos sobre "
+                             f"{len(final)} tareas" if final else "sin consenso")
+
+
+def ejecutar_proyecto(plan, carpeta, timeout=600, callback=None,
+                      asignacion=None, contexto_terminal=""):
+    """Ejecucion progresiva: cada tarea arranca en cuanto sus dependencias
+    terminan, no cuando termina la 'ola' entera. Todas ven el estado vivo."""
     os.makedirs(carpeta, exist_ok=True)
-    resultados, contexto = [], []
-    for n, ola in enumerate(_ordenar_por_olas(plan["tareas"]), 1):
-        if callback:
-            callback("ola", {"n": n, "tareas": [t["titulo"] for t in ola]})
-        # Asignacion de la ola: cada tarea a la cuenta que mejor rinde en su
-        # tipo Y que tenga cuota, sin repetir cuenta mientras queden libres.
-        trabajos = []
-        usados = set()
-        # las tareas mas exigentes eligen primero
-        orden = sorted(ola, key=lambda t: -(len(t.get("instruccion", ""))))
-        for t in orden:
-            tipo = t.get("tipo", "code")
-            if tipo not in TAREAS:
-                tipo = "code"
+    pz = Pizarra(carpeta, plan, contexto_terminal)
+    pendientes = {t["id"]: t for t in plan["tareas"]}
+    hechas, resultados = set(), []
+    ocupadas = set()
+    futuros = {}
+
+    def preparar(t):
+        tipo = t.get("tipo", "code")
+        if tipo not in TAREAS:
+            tipo = "code"
+        pid = (asignacion or {}).get(t["id"])
+        p = cfg().get("profiles", {}).get(pid) if pid else None
+        if not pid or not p or not autenticado(pid, p) or bloqueado(pid):
             r = ranking(tipo)
-            eleg = next((x for x in r if x["pid"] not in usados), r[0] if r else None)
-            pid, p = (eleg["pid"], eleg["p"]) if eleg else (None, None)
-            if pid and len(usados) < len(disponibles()):
-                usados.add(pid)
-            if not pid:
-                resultados.append({"id": t["id"], "titulo": t["titulo"], "perfil": None,
-                                   "rc": 1, "tokens": 0, "seg": 0,
-                                   "texto": f"sin cuenta capaz de '{tipo}'"})
-                continue
-            previo = ("\n\nYa esta hecho (no lo repitas):\n" +
-                      "\n".join(f"- {c}" for c in contexto[-8:])) if contexto else ""
-            instr = (
-                f"Proyecto: {plan.get('nombre','proyecto')} — {plan.get('resumen','')}\n"
-                f"Carpeta de trabajo: {carpeta}\n"
-                f"Tu tarea: {t['titulo']}\n{t['instruccion']}{previo}\n\n"
-                f"Reglas: escribe los archivos DENTRO de {carpeta}. No crees carpetas "
-                f"paralelas ni proyectos aparte. Integra con lo que ya exista. "
-                f"Al terminar responde en UNA linea: que archivos creaste o cambiaste.")
-            trabajos.append((t, pid, p, tipo, instr))
-        if trabajos:
-            with ThreadPoolExecutor(max_workers=min(4, len(trabajos))) as ex:
-                salidas = list(ex.map(
-                    lambda w: (w[0], w[1], correr(w[1], w[2], w[4], w[3], timeout)),
-                    trabajos))
-            for t, pid, r in salidas:
-                resultados.append({"id": t["id"], "titulo": t["titulo"], "perfil": pid,
-                                   "tipo": t.get("tipo"), "rc": r["rc"],
-                                   "tokens": r["tokens"], "seg": r["seg"],
-                                   "texto": (r["texto"] or "")[:400],
-                                   "run_id": r["run_id"]})
-                contexto.append(f"{t['titulo']}: {(r['texto'] or '')[:150]}")
+            libre = next((x for x in r if x["pid"] not in ocupadas), r[0] if r else None)
+            if not libre:
+                return None, None, tipo
+            pid, p = libre["pid"], libre["p"]
+        return pid, p, tipo
+
+    def instruccion(t, pid):
+        estado = pz.foto()
+        arch = pz.archivos_reales()
+        return (
+            f"Proyecto: {plan.get('nombre','proyecto')} — {plan.get('resumen','')}\n"
+            f"Carpeta: {carpeta}\n"
+            + (f"Archivos que ya existen ahi: {', '.join(arch)}\n" if arch else "")
+            + (f"\n{estado}\n" if estado else "")
+            + f"\nTU TAREA: {t['titulo']}\n{t['instruccion']}\n"
+            + (f"Archivos que te tocan: {', '.join(t['archivos'])}\n"
+               if t.get("archivos") else "")
+            + f"\nReglas: escribe dentro de {carpeta}. Integra con lo ya hecho en vez "
+              f"de duplicarlo. No toques lo que otra IA tiene en curso. "
+              f"Calidad de produccion, no un esqueleto. "
+              f"Al terminar responde en UNA linea: que archivos creaste o cambiaste.")
+
+    with ThreadPoolExecutor(max_workers=max(2, len(disponibles()))) as ex:
+        while pendientes or futuros:
+            # lanzar todo lo que ya se pueda
+            listas = [t for t in pendientes.values()
+                      if all(d in hechas for d in (t.get("depende") or []))]
+            if not listas and not futuros:          # dependencia rota: desbloquea
+                listas = list(pendientes.values())
+            for t in listas:
+                pid, p, tipo = preparar(t)
+                if not pid:
+                    continue
+                pendientes.pop(t["id"], None)
+                ocupadas.add(pid)
+                pz.empezar(t, pid)
                 if callback:
-                    callback("tarea", resultados[-1])
+                    callback("empieza", {"titulo": t["titulo"], "perfil": pid, "tipo": tipo})
+                fut = ex.submit(correr, pid, p, instruccion(t, pid), tipo, timeout, carpeta)
+                futuros[fut] = (t, pid)
+            if not futuros:
+                break
+            # integrar en cuanto CUALQUIERA termine
+            done, _ = wait(list(futuros), return_when=FIRST_COMPLETED)
+            for fut in done:
+                t, pid = futuros.pop(fut)
+                try:
+                    r = fut.result()
+                except Exception as e:
+                    r = {"texto": f"[ERROR] {e}", "tokens": 0, "seg": 0, "rc": 1,
+                         "run_id": f"{pid}-error"}
+                ocupadas.discard(pid)
+                hechas.add(t["id"])
+                pz.terminar(t, pid, r.get("texto"))
+                res = {"id": t["id"], "titulo": t["titulo"], "perfil": pid,
+                       "tipo": t.get("tipo"), "rc": r["rc"], "tokens": r["tokens"],
+                       "seg": r["seg"], "texto": (r["texto"] or "")[:400],
+                       "run_id": r.get("run_id")}
+                resultados.append(res)
+                if callback:
+                    callback("termina", res)
     return resultados
 
 
@@ -1287,3 +1376,132 @@ def contexto_equipo():
         f"- Carpetas: {', '.join(d.get('carpetas') or [])}\n"
         f"- Herramientas: {', '.join(sorted((d.get('herramientas') or {}).keys()))}\n"
         f"- IA conectadas por Orquesta: {', '.join(cuentas)}\n")
+
+# ---------------- ESTADO VIVO DEL PROYECTO ----------------
+# Cada IA ve, dentro de su prompt, que esta terminado, que esta en curso en
+# este momento y quien lo hace. Asi no duplican trabajo ni pisan archivos.
+class Pizarra:
+    def __init__(self, carpeta, plan, contexto_terminal=""):
+        self.carpeta = carpeta
+        self.plan = plan
+        self.ctx_term = contexto_terminal
+        self.hechas = []          # [{id,titulo,perfil,resumen,archivos}]
+        self.en_curso = {}        # id -> {titulo, perfil, desde}
+        self.lock = threading.Lock()
+
+    def empezar(self, t, perfil):
+        with self.lock:
+            self.en_curso[t["id"]] = {"titulo": t["titulo"], "perfil": perfil,
+                                      "desde": time.time()}
+
+    def terminar(self, t, perfil, resumen, archivos=None):
+        with self.lock:
+            self.en_curso.pop(t["id"], None)
+            self.hechas.append({"id": t["id"], "titulo": t["titulo"],
+                                "perfil": perfil, "resumen": (resumen or "")[:300],
+                                "archivos": archivos or t.get("archivos") or []})
+
+    def foto(self):
+        """Texto que se inyecta a quien esta trabajando ahora mismo."""
+        with self.lock:
+            partes = []
+            if self.ctx_term:
+                partes.append(f"Contexto de la conversacion con el usuario:\n{self.ctx_term}")
+            if self.hechas:
+                partes.append("YA TERMINADO (no lo rehagas, integra con ello):\n" +
+                              "\n".join(f"- [{h['perfil']}] {h['titulo']}"
+                                         + (f" -> {', '.join(h['archivos'])}" if h["archivos"] else "")
+                                         + (f": {h['resumen'][:160]}" if h["resumen"] else "")
+                                         for h in self.hechas))
+            if self.en_curso:
+                partes.append("EN CURSO AHORA MISMO por otra IA (NO toques esos archivos):\n" +
+                              "\n".join(f"- [{v['perfil']}] {v['titulo']}"
+                                         for v in self.en_curso.values()))
+            return "\n\n".join(partes)
+
+    def archivos_reales(self):
+        try:
+            return sorted(f for f in os.listdir(self.carpeta) if not f.startswith("."))
+        except OSError:
+            return []
+
+
+DELIBERAR = """Eres uno de varios modelos que van a construir esto en equipo.
+Encargo: {encargo}
+
+Plan propuesto:
+{plan}
+
+Modelos disponibles y en que destaca cada uno:
+{cuentas}
+
+Responde SOLO un JSON:
+{{"asignacion":{{"t1":"nombre-de-cuenta", "t2":"..."}},
+  "una_sola":false,
+  "motivo":"una frase"}}
+
+Criterios:
+- "una_sola" es true SOLO si el trabajo es tan acoplado que repartirlo lo
+  empeoraria; en ese caso asigna todas las tareas a la misma cuenta.
+- Si repartir ayuda, reparte de verdad: no pongas todo en una sola cuenta.
+- Respeta que una cuenta con poca cuota restante reciba menos carga."""
+
+# ---------------- AUDITORIA CRUZADA SOBRE ARCHIVOS REALES ----------------
+def _mas_potentes(n=3, tarea="review"):
+    """Las cuentas mas capaces con cuota, para que se auditen entre ellas."""
+    return ranking(tarea)[:n]
+
+
+def auditar_proyecto(plan, carpeta, resultados, timeout=600, callback=None,
+                     arreglar=True):
+    """Cada modelo fuerte revisa lo que escribieron los OTROS y lo corrige.
+
+    No es una opinion sobre un texto: leen los archivos del disco, buscan
+    defectos concretos y, si 'arreglar', los arreglan ahi mismo.
+    """
+    fuertes = _mas_potentes(3)
+    if len(fuertes) < 2:
+        return [], "hacen falta al menos 2 cuentas para auditarse entre si"
+
+    # quien escribio que
+    autoria = {}
+    for r in resultados:
+        if r.get("perfil"):
+            autoria.setdefault(r["perfil"], []).append(r.get("titulo", ""))
+
+    trabajos = []
+    for x in fuertes:
+        pid = x["pid"]
+        ajenos = {k: v for k, v in autoria.items() if k != pid}
+        if not ajenos:
+            continue
+        lista = "\n".join(f"- {k} hizo: {'; '.join(v)}" for k, v in ajenos.items())
+        prompt = (
+            f"Auditoria tecnica del proyecto en {carpeta}.\n"
+            f"Encargo original: {plan.get('resumen','')}\n\n"
+            f"Trabajo hecho por OTROS modelos (tu no lo escribiste):\n{lista}\n\n"
+            f"Lee de verdad los archivos de esa carpeta y audita SOLO el trabajo "
+            f"ajeno. Busca: errores que rompan la ejecucion, promesas del encargo "
+            f"que no se cumplieron, inconsistencias entre piezas de distintos "
+            f"autores, y calidad por debajo de lo pedido.\n"
+            + (f"Corrige lo que encuentres directamente en los archivos.\n"
+               if arreglar else "No modifiques nada, solo reporta.\n")
+            + f"Responde en maximo 8 lineas: cada defecto con su archivo, y si lo "
+              f"arreglaste o no. Si el trabajo ajeno esta bien, dilo en una linea "
+              f"en vez de inventar problemas.")
+        trabajos.append((pid, x["p"], prompt))
+
+    if callback:
+        callback("auditoria", {"cuentas": [t[0] for t in trabajos]})
+    with ThreadPoolExecutor(max_workers=len(trabajos)) as ex:
+        salidas = list(ex.map(
+            lambda t: (t[0], correr(t[0], t[1], t[2], "review", timeout, carpeta)),
+            trabajos))
+    out = []
+    for pid, r in salidas:
+        out.append({"perfil": pid, "texto": (r["texto"] or "").strip(),
+                    "tokens": r["tokens"], "seg": r["seg"], "rc": r["rc"],
+                    "run_id": r.get("run_id")})
+        if callback:
+            callback("auditor", out[-1])
+    return out, None

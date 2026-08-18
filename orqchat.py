@@ -352,7 +352,19 @@ def principal():
                     if arg:
                         subprocess.run(arg, shell=True)
                     print(); continue
-                if cmd in ("cuentas", "cuota", "uso", "usar", "imagen", "proyecto",
+                if cmd == "proyecto":
+                    if not arg:
+                        print(f" {D}que quieres construir?{N}\n"); continue
+                    # el proyecto hereda lo que se ha hablado en esta ventana
+                    tmp = os.path.join(DIR_SES, f"{SESION}.ctx.txt")
+                    with open(tmp, "w") as f:
+                        f.write("\n".join(
+                            f"{'Usuario' if t['rol']=='u' else 'IA'}: {t['txt'][:500]}"
+                            for t in ctx[-10:]))
+                    subprocess.run([os.path.join(L.BASE, "orq"), "proyecto", arg,
+                                    "--en", CARPETA, "--si", "--contexto", tmp])
+                    print(); continue
+                if cmd in ("cuentas", "cuota", "uso", "usar", "imagen",
                            "route", "verificar", "permisos", "equipo"):
                     sub = [os.path.join(L.BASE, "orq"), cmd]
                     if arg:

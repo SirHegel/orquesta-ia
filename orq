@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """orq — orquestador multi-cuenta de IA. Compartido entre todas las terminales."""
-import argparse, json, os, re, sys, subprocess, datetime, shutil
+import argparse, json, os, re, sys, subprocess, time, datetime, shutil
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import orqlib as L
@@ -424,30 +424,44 @@ def cmd_permisos(a):
 
 def cmd_proyecto(a):
     carpeta = os.path.abspath(os.path.expanduser(a.en or os.getcwd()))
+    ctx_term = ""
+    if getattr(a, "contexto", None) and os.path.exists(a.contexto):
+        try:
+            ctx_term = open(a.contexto).read()[:4000]
+        except OSError:
+            pass
     print("\n  " + c("b", "PROYECTO") + "  " + c("d", carpeta))
     print("  " + c("d", a.prompt[:150]) + "\n")
 
-    print("  " + c("y", "fase 0") + c("d", " · planificando…"), flush=True)
+    print("  " + c("y", "1 · plan") + c("d", " · pensando la arquitectura…"), flush=True)
     plan, err = L.planificar(a.prompt, carpeta, a.timeout)
     if err:
         print("  " + c("red", err) + "\n"); sys.exit(1)
 
+    asignacion = None
+    if not a.sin_deliberar and len(L.disponibles()) > 1:
+        print("  " + c("y", "2 · consenso") + c("d", " · las IA deciden quien hace que…"), flush=True)
+        asignacion, motivo = L.deliberar(plan, a.prompt, a.timeout)
+        print("  " + c("d", "   " + (motivo or "")))
+
     filas = []
     for t in plan["tareas"]:
         tipo = t.get("tipo", "code")
-        pid, _ = L._mejor_para(tipo if tipo in L.TAREAS else "code")
-        filas.append([t["id"], t.get("titulo", "")[:38], tipo,
-                      pid or c("red", "sin cuenta"),
+        pid = (asignacion or {}).get(t["id"])
+        if not pid:
+            r = L.ranking(tipo if tipo in L.TAREAS else "code")
+            pid = r[0]["pid"] if r else c("red", "sin cuenta")
+        filas.append([t["id"], t.get("titulo", "")[:36], tipo, pid,
                       ",".join(t.get("depende") or []) or c("d", "—")])
     tabla([("id", 0), ("tarea", 0), ("tipo", 0), ("la hace", 0), ("tras", 0)], filas,
           f"PLAN · {plan.get('nombre','?')} · por {plan['_planificador']}")
     print("  " + c("d", plan.get("resumen", "")))
-    olas = L._ordenar_por_olas(plan["tareas"])
     if plan.get("_aviso"):
         print("  " + c("y", "ajuste") + c("d", " · " + plan["_aviso"]))
-    paralelo = max((len(o) for o in olas), default=1)
-    print("  " + c("d", f"{len(plan['tareas'])} tareas en {len(olas)} olas · "
-                       f"hasta {paralelo} IA trabajando a la vez"))
+    olas = L._ordenar_por_olas(plan["tareas"])
+    print("  " + c("d", f"{len(plan['tareas'])} tareas · hasta "
+                       f"{max((len(o) for o in olas), default=1)} IA a la vez · "
+                       f"cada una arranca en cuanto puede"))
 
     if not a.si:
         try:
@@ -456,39 +470,76 @@ def cmd_proyecto(a):
         except (EOFError, KeyboardInterrupt):
             print("\n  cancelado\n"); return
 
-    def cb(ev, d):
-        if ev == "ola":
-            print("\n  " + c("y", f"ola {d['n']}") + c("d", " · " + ", ".join(d["tareas"])), flush=True)
-        else:
-            marca = c("g", "✓") if not d["rc"] else c("red", "✗")
-            print(f"    {marca} {d['titulo'][:40]:<42} {c('d', str(d['perfil']))}  "
-                  f"{c('d', f'{d[chr(116)+chr(111)+chr(107)+chr(101)+chr(110)+chr(115)]:,} tok · {d[chr(115)+chr(101)+chr(103)]}s')}", flush=True)
+    t0 = time.time()
 
-    print("\n  " + c("y", "ejecutando"))
-    res = L.ejecutar_proyecto(plan, carpeta, a.timeout, cb)
+    def cb(ev, d):
+        t = time.time() - t0
+        if ev == "empieza":
+            print(f"  {c('d', f'{t:6.0f}s')} {c('y', '▸')} {d['titulo'][:42]:<44}"
+                  f"{c('d', d['perfil'])}", flush=True)
+        else:
+            marca = c("g", "✔") if not d["rc"] else c("red", "✘")
+            print(f"  {c('d', f'{t:6.0f}s')} {marca} {d['titulo'][:42]:<44}"
+                  f"{c('d', d['perfil'])}  "
+                  f"{c('d', f'{d[chr(116)+chr(111)+chr(107)+chr(101)+chr(110)+chr(115)]:,} tok')}",
+                  flush=True)
+
+    print("\n  " + c("y", "3 · construccion") + c("d", " · integra segun terminan\n"))
+    res = L.ejecutar_proyecto(plan, carpeta, a.timeout, cb, asignacion, ctx_term)
+
+    if not a.sin_auditar and len(L.disponibles()) > 1:
+        print("\n  " + c("y", "4 · auditoria cruzada")
+              + c("d", " · cada modelo revisa lo ajeno…\n"), flush=True)
+
+        def cba(ev, d):
+            if ev == "auditoria":
+                print("  " + c("d", "   auditan: " + ", ".join(d["cuentas"])), flush=True)
+            else:
+                marca = c("g", "✔") if not d["rc"] else c("red", "✘")
+                print(f"\n  {marca} {c('mg', d['perfil'])} "
+                      f"{c('d', f'({d[chr(116)+chr(111)+chr(107)+chr(101)+chr(110)+chr(115)]:,} tok)')}")
+                print(envolver_simple(d["texto"], "     "))
+
+        auds, err = L.auditar_proyecto(plan, carpeta, res, a.timeout, cba,
+                                       arreglar=not a.sin_arreglar)
+        if err:
+            print("  " + c("d", err))
+        for x in auds:
+            res.append({"titulo": f"auditoria de {x['perfil']}", "perfil": x["perfil"],
+                        "tokens": x["tokens"], "seg": x["seg"], "rc": x["rc"]})
 
     if not a.sin_integrar:
-        print("\n  " + c("y", "fase final") + c("d", " · integrando y escribiendo README…"), flush=True)
-        fin = L.integrar_proyecto(plan, carpeta, res, a.timeout)
-        if fin:
-            print("  " + (fin["texto"] or "")[:600])
-            res.append({"titulo": "integracion", "perfil": fin["perfil"],
-                        "tokens": fin["tokens"], "seg": fin["seg"], "rc": fin["rc"]})
+        print("\n  " + c("y", "5 · cierre") + c("d", " · revision e integracion final…"), flush=True)
+        fin_ = L.integrar_proyecto(plan, carpeta, res, a.timeout)
+        if fin_:
+            print(envolver_simple(fin_["texto"] or "", "     "))
+            res.append({"titulo": "cierre", "perfil": fin_["perfil"],
+                        "tokens": fin_["tokens"], "seg": fin_["seg"], "rc": fin_["rc"]})
 
     tot = sum(r["tokens"] for r in res) + plan.get("_tokens_plan", 0)
     porq = {}
     for r in res:
         if r.get("perfil"):
             porq[r["perfil"]] = porq.get(r["perfil"], 0) + r["tokens"]
-    print("\n  " + c("b", "LISTO") + c("d", f"  ·  {tot:,} tokens en total"))
+    print("\n  " + c("b", "LISTO") + c("d", f"  ·  {tot:,} tokens  ·  {time.time()-t0:.0f}s"))
+    mx = max(porq.values()) if porq else 0
     for k, v in sorted(porq.items(), key=lambda x: -x[1]):
-        print(f"    {k:<22} {v:>9,} tok")
+        print(f"    {k:<22} {v:>10,}  {_barra(v, mx, 16)}")
     try:
         n = len([f for f in os.listdir(carpeta) if not f.startswith(".")])
         print("  " + c("d", f"{n} archivos en {carpeta}"))
     except OSError:
         pass
     print()
+
+
+def envolver_simple(txt, sangria="  "):
+    import textwrap
+    out = []
+    for l in (txt or "").split("\n")[:12]:
+        out += [sangria + x for x in (textwrap.wrap(l, 96) or [""])]
+    return "\n".join(out)
+
 
 def cmd_cuota(a):
     ps = L.cfg().get("profiles", {})
@@ -599,6 +650,10 @@ def main():
     pr.add_argument("prompt"); pr.add_argument("--en", help="carpeta del proyecto")
     pr.add_argument("--si", action="store_true", help="no preguntar antes de ejecutar")
     pr.add_argument("--sin-integrar", action="store_true", help="saltar la fase final")
+    pr.add_argument("--sin-deliberar", action="store_true", help="no votar quien hace que")
+    pr.add_argument("--sin-auditar", action="store_true", help="saltar la auditoria cruzada")
+    pr.add_argument("--sin-arreglar", action="store_true", help="auditar sin corregir")
+    pr.add_argument("--contexto", help="archivo con el contexto de la conversacion")
     pr.add_argument("--timeout", type=int, default=600)
     pr.set_defaults(f=cmd_proyecto)
 
