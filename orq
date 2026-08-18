@@ -585,6 +585,55 @@ def cmd_equipo(a):
     tabla([("", 0), ("", 0)], filas)
     print("\n  " + c("d", f"escaneado {d.get('generado','?')}  ·  refresca con: orq equipo -r") + "\n")
 
+def cmd_global(a):
+    """Reporte global de consumo, en porcentaje, como lo daria cada proveedor."""
+    ps = L.cfg().get("profiles", {})
+    if a.fijar:
+        pid, pct = a.fijar[0], a.fijar[1]
+        if pid not in ps:
+            print(c("red", f"cuenta desconocida: {pid}")); sys.exit(1)
+        try:
+            v = float(str(pct).rstrip("%"))
+        except ValueError:
+            print(c("red", "el porcentaje debe ser un numero")); sys.exit(1)
+        L.cuota_manual_fijar(pid, v, " ".join(a.fijar[2:]))
+        print("\n  " + c("g", f"{pid} = {v:.0f}% consumido") +
+              c("d", "  (declarado por ti; el router ya lo usa)") + "\n")
+        return
+
+    filas, sin_dato = [], []
+    for pid, p in ps.items():
+        if not L.autenticado(pid, p):
+            continue
+        g = L.cuota_global(pid, p)
+        pct = g.get("pct")
+        usd = p.get("plan_usd")
+        plan = (p.get("plan") or "") + (f" ${usd}" if usd else "")
+        if pct is None:
+            sin_dato.append((pid, plan))
+            continue
+        col = "red" if pct >= 90 else ("y" if pct >= 70 else "g")
+        libre = 100 - pct
+        origen = (c("g", "oficial") if g["fuente"] == "proveedor"
+                  else c("y", "declarado"))
+        edad = ""
+        if g["fuente"] == "declarado" and g.get("edad_h") is not None:
+            edad = c("d", f"hace {g['edad_h']:.0f}h" if g["edad_h"] >= 1 else "ahora")
+        filas.append([pid, plan, origen, c(col, f"{pct:.0f}%"),
+                      _barra(pct, 100, 20), c(col, f"{libre:.0f}%"),
+                      g.get("reinicia", "")[5:16].replace("T", " ") if g.get("reinicia") else edad])
+    tabla([("cuenta", 0), ("plan", 0), ("dato", 0), ("consumido", 1), ("", 0),
+           ("libre", 1), ("recarga / edad", 0)], filas, "CONSUMO GLOBAL")
+
+    if sin_dato:
+        print("\n  " + c("y", "SIN DATO GLOBAL"))
+        for pid, plan in sin_dato:
+            print(f"    {pid:<22} {c('d', plan)}")
+        print("  " + c("d", "estos proveedores no publican el porcentaje. Decláralo tú:"))
+        print("  " + c("d", f"    orq global --fijar {sin_dato[0][0]} 97") + "\n")
+    else:
+        print()
+
 def cmd_score(a):
     if not 0 <= a.nota <= 10: print("nota de 0 a 10"); sys.exit(1)
     pid = a.run_id.rsplit("-",1)[0]
@@ -679,6 +728,11 @@ def main():
 
     eq = sub.add_parser("equipo", help="que sabe Orquesta de esta maquina")
     eq.add_argument("-r", "--refrescar", action="store_true"); eq.set_defaults(f=cmd_equipo)
+
+    gl = sub.add_parser("global", help="consumo global en %% de cada cuenta")
+    gl.add_argument("--fijar", nargs="+", metavar="CUENTA PCT",
+                    help="declarar el %% que ves en la configuracion de uso")
+    gl.set_defaults(f=cmd_global)
 
     cu = sub.add_parser("cuota", help="consumo REAL de cada cuenta, no solo el de Orquesta")
     cu.set_defaults(f=cmd_cuota)

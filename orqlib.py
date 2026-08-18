@@ -426,6 +426,12 @@ def puntuar(pid, p, tarea):
         if os.environ.get("ORQ_DEBUG"):
             print(f"[orq] cuota({pid}) fallo: {e!r}", file=sys.stderr)
     pct = q.get("usado_pct")
+    if pct is None:
+        g = cuota_global(pid, p)
+        if g.get("fuente") == "declarado" and g.get("pct") is not None:
+            pct = g["pct"]
+            q = dict(q); q["fuente"] = "proveedor"      # se trata como dato firme
+            q["ventana_min"] = (p.get("ventana_horas") or 5) * 60
     if pct is not None and q.get("fuente") == "proveedor":
         if pct >= 97:
             return 0.0, f"cuota practicamente agotada ({pct:.0f}%)"
@@ -1528,3 +1534,52 @@ def auditar_proyecto(plan, carpeta, resultados, timeout=600, callback=None,
         if callback:
             callback("auditor", out[-1])
     return out, None
+
+# ---------------- CUOTA GLOBAL DECLARADA A MANO ----------------
+# Claude no publica el % consumido por ninguna via (lo verifiqué en la API,
+# los archivos de sesion y el estado local). Codex si lo publica. Para las
+# que no, el usuario declara el porcentaje que ve en la configuracion de uso.
+MANUAL = os.path.join(BASE, "state", "cuota_manual.json")
+
+
+def cuota_manual_leer():
+    return _leer(MANUAL, {})
+
+
+def cuota_manual_fijar(pid, pct, nota=""):
+    with bloqueo():
+        d = _leer(MANUAL, {})
+        d[pid] = {"usado_pct": float(pct),
+                  "declarado": ahora().isoformat(timespec="minutes"),
+                  "nota": nota}
+        _escribir(MANUAL, d)
+    return d[pid]
+
+
+def antiguedad_horas(iso):
+    try:
+        return (ahora() - datetime.datetime.fromisoformat(iso)).total_seconds() / 3600
+    except Exception:
+        return None
+
+
+def cuota_global(pid, p):
+    """Consumo global de la cuenta, en porcentaje, con su procedencia.
+
+    fuente: 'proveedor' (dato oficial) | 'declarado' (lo dijo el usuario)
+            | 'sin dato' (no hay forma de saberlo)
+    """
+    prov = p.get("provider")
+    if prov == "gpt":
+        c = cuota_codex(pid, p)
+        if c and c.get("usado_pct") is not None:
+            return {"pct": c["usado_pct"], "fuente": "proveedor",
+                    "ventana_h": (c.get("ventana_min") or 0) / 60,
+                    "reinicia": c.get("reinicia"), "plan": c.get("plan"),
+                    "edad_h": 0}
+    m = cuota_manual_leer().get(pid)
+    if m:
+        return {"pct": m["usado_pct"], "fuente": "declarado",
+                "declarado": m["declarado"], "nota": m.get("nota", ""),
+                "edad_h": antiguedad_horas(m["declarado"])}
+    return {"pct": None, "fuente": "sin dato", "edad_h": None}

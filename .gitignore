@@ -25,3 +25,4 @@ memoria/*.md
 !memoria/README.md
 state/sesiones/
 state/equipo.json
+state/cuota_manual.json
