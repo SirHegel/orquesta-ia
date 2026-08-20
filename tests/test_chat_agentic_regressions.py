@@ -231,6 +231,33 @@ class IntencionYCarpetaTests(unittest.TestCase):
             with self.subTest(pregunta=pregunta):
                 self.assertEqual(orqchat.clasificar_intencion(pregunta), esperado)
 
+    def test_clasifica_solo_ordenes_directas_de_generacion_visual_como_imagen(self):
+        visuales = (
+            "crea una imagen de un bosque al amanecer",
+            "genera un logo minimalista para la tienda",
+            "diseña un banner profesional para la portada",
+            "hazme una ilustración de un gato astronauta",
+            "puedes generar una foto del producto",
+            "quiero una imagen para el lanzamiento",
+            "necesito un logo para mi marca",
+            "genera una miniatura para el video",
+            "diseña una portada profesional",
+        )
+        for pregunta in visuales:
+            with self.subTest(pregunta=pregunta):
+                self.assertEqual(orqchat.clasificar_intencion(pregunta), "imagen")
+
+        no_visuales = {
+            "analiza esta imagen y dime que ves": "reasoning",
+            "revisa la foto por artefactos": "agentic",
+            "crea un script que genere una imagen": "agentic",
+            "genera un video de diez segundos": "reasoning",
+            "por que esta app genera una imagen negra": "reasoning",
+        }
+        for pregunta, esperado in no_visuales.items():
+            with self.subTest(pregunta=pregunta):
+                self.assertEqual(orqchat.clasificar_intencion(pregunta), esperado)
+
     def test_arreglar_o_solucionar_un_proyecto_hasta_el_final_es_proyecto(self):
         casos = {
             "arregla el repo completo y no pares hasta que funcione": "proyecto",
@@ -337,6 +364,51 @@ class IntencionYCarpetaTests(unittest.TestCase):
             orqchat.principal()
 
         responder.assert_called_once()
+        proyecto.assert_not_called()
+
+    def test_principal_delega_imagen_natural_al_subcomando_con_carpeta_y_perfil(self):
+        descripcion = "diseña un logo minimalista para la tienda"
+        proceso = mock.Mock(returncode=0)
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(os.environ, {"ORQ_CHAT_PERFIL": ""}, clear=False),
+            mock.patch.object(orqchat, "CARPETA", tmp),
+            mock.patch.object(orqchat, "readline", None),
+            mock.patch("builtins.input", side_effect=[
+                "/en gemini-antigravity",
+                descripcion,
+                "/salir",
+            ]),
+            mock.patch.object(orqchat, "limpiar_sesiones_viejas"),
+            mock.patch.object(orqchat, "logo"),
+            mock.patch.object(orqchat, "cabecera"),
+            mock.patch.object(orqchat, "cargar_ctx", return_value=[]),
+            mock.patch.object(orqchat, "cargar_parcial", return_value=None),
+            mock.patch.object(orqchat, "guardar_ctx"),
+            mock.patch.object(orqchat, "quitar_logo"),
+            mock.patch.object(
+                orqchat, "resolver_carpeta_mencionada", return_value=None
+            ),
+            mock.patch.object(orqchat.os, "chdir"),
+            mock.patch.object(
+                orqchat.subprocess, "run", return_value=proceso
+            ) as ejecutar,
+            mock.patch.object(orqchat, "responder") as responder,
+            mock.patch.object(orqchat, "ejecutar_proyecto_chat") as proyecto,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            orqchat.principal()
+
+        ejecutar.assert_called_once_with([
+            os.path.join(orqchat.L.BASE, "orq"),
+            "imagen",
+            descripcion,
+            "--en",
+            tmp,
+            "--perfil",
+            "gemini-antigravity",
+        ])
+        responder.assert_not_called()
         proyecto.assert_not_called()
 
     def test_resuelve_la_carpeta_nombrada_sin_exigir_cd_ni_mayusculas_exactas(self):

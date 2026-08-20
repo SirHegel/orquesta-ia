@@ -65,6 +65,65 @@ def _normalizar(txt):
     return re.sub(r"[^a-z0-9]+", " ", txt).strip()
 
 
+_OBJETO_IMAGEN = (
+    r"(?:imagen(?:es)?|logo(?:s)?|banners?|ilustracion(?:es)?|"
+    r"foto(?:s)?|fotografia(?:s)?|portada(?:s)?|miniatura(?:s)?|"
+    r"posters?|afiche(?:s)?|flyers?|grafico(?:s)?)"
+)
+_INICIO_OBJETO_IMAGEN = (
+    r"(?:(?:por favor|para mi)\s+)?"
+    r"(?:(?:un|una|el|la|los|las|mi|mis|este|esta|estos|estas|"
+    r"dos|tres|varios|varias)\s+)?"
+    r"(?:(?:nuevo|nueva|bonito|bonita|simple|minimalista|profesional|"
+    r"moderno|moderna|elegante|original|fotorrealista|detallado|detallada)\s+){0,2}"
+    + _OBJETO_IMAGEN
+)
+_ORDEN_IMAGEN_DIRECTA = re.compile(
+    r"^(?:(?:por favor|oye|ahora)\s+)*"
+    r"(?:crea(?:me)?|genera(?:me)?|disena(?:me)?|dibuja(?:me)?|"
+    r"haz(?:me)?|produce(?:me)?)\s+" + _INICIO_OBJETO_IMAGEN + r"\b"
+)
+_ORDEN_IMAGEN_MODAL = re.compile(
+    r"^(?:(?:por favor|oye)\s+)?(?:me\s+)?(?:puedes|podrias)\s+"
+    r"(?:crear(?:me)?|generar(?:me)?|disenar(?:me)?|dibujar(?:me)?|"
+    r"hacer(?:me)?|producir(?:me)?)\s+" + _INICIO_OBJETO_IMAGEN + r"\b"
+)
+_ORDEN_IMAGEN_DESEO = re.compile(
+    r"^(?:(?:por favor|oye)\s+)?(?:quiero|necesito|quisiera)\s+que\s+"
+    r"(?:me\s+)?(?:crees|generes|disenes|dibujes|hagas|produzcas)\s+"
+    + _INICIO_OBJETO_IMAGEN + r"\b"
+)
+_SOLICITUD_IMAGEN_DIRECTA = re.compile(
+    r"^(?:(?:por favor|oye)\s+)?(?:quiero|necesito|quisiera)\s+"
+    + _INICIO_OBJETO_IMAGEN + r"\b"
+)
+_ORDEN_IMAGEN_INFINITIVA = re.compile(
+    r"^(?:por favor\s+)?(?:crear|generar|disenar|dibujar|hacer|producir)\s+"
+    + _INICIO_OBJETO_IMAGEN + r"\b"
+)
+
+
+def es_generacion_imagen(pregunta):
+    """Reconoce solo peticiones directas de crear un recurso visual estatico.
+
+    El anclaje al inicio evita confundir una explicacion sobre como generar una
+    imagen, un script que lo haga o una orden de analizar una imagen existente
+    con una solicitud para el backend visual. Video no forma parte de los
+    objetos admitidos porque Orquesta no tiene un backend que produzca ese
+    archivo.
+    """
+    p = _normalizar(pregunta)
+    if not p:
+        return False
+    return any(patron.search(p) for patron in (
+        _ORDEN_IMAGEN_DIRECTA,
+        _ORDEN_IMAGEN_MODAL,
+        _ORDEN_IMAGEN_DESEO,
+        _SOLICITUD_IMAGEN_DIRECTA,
+        _ORDEN_IMAGEN_INFINITIVA,
+    ))
+
+
 def timeout_chat():
     """Limite por intento largo, configurable sin editar codigo."""
     raw = os.environ.get("ORQ_CHAT_TIMEOUT")
@@ -98,6 +157,8 @@ def clasificar_intencion(pregunta):
     p = _normalizar(pregunta)
     if not p:
         return "reasoning"
+    if es_generacion_imagen(pregunta):
+        return "imagen"
     proyecto = re.search(
         r"\b(termina|terminar|completa|completar|construye|construir|desarrolla|"
         r"desarrollar|implementa|implementar|refactoriza|refactorizar|migra|migrar|"
@@ -829,6 +890,24 @@ def ejecutar_proyecto_chat(descripcion, ctx, preferir=None):
         return 1
 
 
+def ejecutar_imagen_chat(descripcion, perfil=None):
+    """Delega al flujo visual del CLI, que verifica el archivo generado."""
+    cmd = [
+        os.path.join(L.BASE, "orq"), "imagen", descripcion,
+        "--en", CARPETA,
+    ]
+    if perfil:
+        cmd += ["--perfil", perfil]
+    try:
+        return subprocess.run(cmd).returncode
+    except KeyboardInterrupt:
+        print(f"\n {Y}·{N} generacion de imagen interrumpida por el usuario\n")
+        return 130
+    except OSError as e:
+        print(f" {R}·{N} no pude iniciar el flujo de imagen: {e}\n")
+        return 1
+
+
 def principal():
     global CARPETA
     if readline:
@@ -973,7 +1052,12 @@ def principal():
                         forzado = arg
                         print(f" {G}·{N} esta conversacion queda fijada a {arg}\n")
                     continue
-                if cmd in ("cuentas", "cuota", "global", "uso", "usar", "imagen",
+                if cmd == "imagen":
+                    if not arg:
+                        print(f" {D}que imagen quieres generar?{N}\n"); continue
+                    ejecutar_imagen_chat(arg, perfil=forzado)
+                    print(); continue
+                if cmd in ("cuentas", "cuota", "global", "uso", "usar",
                            "route", "verificar", "permisos", "equipo"):
                     sub = [os.path.join(L.BASE, "orq"), cmd]
                     if arg:
@@ -1011,6 +1095,15 @@ def principal():
                 continue
             tipo = "agentic" if parcial_reintento else (tarea or clasificar_intencion(operativa))
             ctx.append({"rol": "u", "txt": linea})
+            if tipo == "imagen" and not parcial_reintento:
+                rc = ejecutar_imagen_chat(operativa, perfil=forzado)
+                ctx.append({
+                    "rol": "a",
+                    "txt": ("Flujo de imagen ejecutado; el resultado verificable se "
+                            f"mostro en la terminal (rc={rc})."),
+                })
+                guardar_ctx(ctx)
+                continue
             # /en es una orden de usar una sola cuenta; no se ignora aunque el
             # texto describa un proyecto amplio. /proyecto sigue disponible
             # cuando se desea el flujo multi-IA explicito.

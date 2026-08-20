@@ -450,7 +450,8 @@ def cmd_imagen(a):
         f"Verifica con 'ls -la {destino}/' que el archivo existe y muestra esa salida. "
         f"No afirmes que guardaste nada sin haberlo comprobado con ls. "
         f"Responde en una sola linea.")
-    r = L.generar_imagen(pid, p, prompt, destino, a.timeout)
+    with L.bloqueo_proyecto(destino):
+        r = L.generar_imagen(pid, p, prompt, destino, a.timeout)
     if r["archivos"]:
         print("  " + c("g", "imagen generada"))
         for f in r["archivos"]:

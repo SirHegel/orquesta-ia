@@ -660,6 +660,44 @@ class VerificacionProyectoTests(unittest.TestCase):
         self.assertTrue(any("fallo real rc=1" in h for h in salida["hallazgos"]))
 
 
+class CliImagenTests(unittest.TestCase):
+    def test_generacion_visual_bloquea_la_carpeta_destino(self):
+        perfil = {"provider": "antigravity"}
+        resultado = {
+            "perfil": "gemini-antigravity",
+            "texto": "sin archivo en esta simulacion",
+            "tokens": 0,
+            "seg": 0.1,
+            "rc": 0,
+            "run_id": "run-imagen-simulada",
+            "archivos": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp, (
+            mock.patch.object(
+                ORQ_CLI.L,
+                "ranking",
+                return_value=[{"pid": "gemini-antigravity", "p": perfil}],
+            )
+        ), mock.patch.object(
+            ORQ_CLI.L,
+            "bloqueo_proyecto",
+            return_value=contextlib.nullcontext(),
+        ) as bloqueo, mock.patch.object(
+            ORQ_CLI.L, "generar_imagen", return_value=resultado
+        ) as generar, contextlib.redirect_stdout(io.StringIO()):
+            ORQ_CLI.cmd_imagen(types.SimpleNamespace(
+                prompt="crea un logo",
+                perfil=None,
+                en=tmp,
+                nombre=None,
+                timeout=420,
+            ))
+
+        bloqueo.assert_called_once_with(tmp)
+        generar.assert_called_once()
+        self.assertEqual(generar.call_args.args[3], tmp)
+
+
 class CliProyectoTests(unittest.TestCase):
     def test_parser_de_proyecto_reconoce_preferir(self):
         ruta = os.path.join(os.path.dirname(orqlib.__file__), "orq")
