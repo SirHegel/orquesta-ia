@@ -768,7 +768,15 @@ def correr(pid, p, prompt, tarea="reasoning", timeout=300, carpeta=None,
     cmd = comando(p, prompt, session_id=session_id, resume=resume,
                   **opciones_comando)
     t0 = time.time()
-    f_lock = _lock_proveedor(prov) if prov in SERIALIZAR else None
+    if prov == "claude":
+        # Claude admite cuentas distintas en paralelo, pero dos procesos sobre
+        # el mismo CLAUDE_CONFIG_DIR pueden competir por su estado local. El
+        # path determinista permite que otros procesos locales (por ejemplo el
+        # motor editorial) respeten exactamente el mismo candado sin importar
+        # este modulo ni leer profiles.json.
+        f_lock = _lock_cuenta_claude(pid, p)
+    else:
+        f_lock = _lock_proveedor(prov) if prov in SERIALIZAR else None
     proceso = None
     scope = None
     try:
@@ -1383,6 +1391,37 @@ def _lock_proveedor(prov):
     ruta = os.path.join(BASE, "state", f".lock-{prov}")
     os.makedirs(os.path.dirname(ruta), exist_ok=True)
     return open(ruta, "a+")
+
+
+def ruta_lock_cuenta_claude(pid, p):
+    """Ruta estable y opaca del candado asociado a un CLAUDE_CONFIG_DIR."""
+    cuenta = os.path.realpath(home_de(pid, p))
+    clave = hashlib.sha256(
+        cuenta.encode("utf-8", "surrogateescape")
+    ).hexdigest()
+    return os.path.join(BASE, "state", "account-locks", f"claude-{clave}.lock")
+
+
+def _lock_cuenta_claude(pid, p):
+    ruta = ruta_lock_cuenta_claude(pid, p)
+    directorio = os.path.dirname(ruta)
+    os.makedirs(directorio, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(directorio, 0o700)
+    except OSError:
+        pass
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(ruta, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "a+")
+    except Exception:
+        os.close(fd)
+        raise
 
 
 @contextlib.contextmanager
