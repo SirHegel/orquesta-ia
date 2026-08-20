@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""minimax — abre la CLI de Claude hablando con MiniMax, en este proceso.
+
+MiniMax expone el protocolo de Anthropic, asi que reusamos el binario
+'claude' apuntandolo a su endpoint. Las variables se ponen SOLO en este
+proceso hijo: la cuenta Claude real de la terminal no se toca.
+
+  minimax                 # sesion interactiva
+  minimax -p "hola"       # una pregunta y sale
+  minimax --cuenta otra   # fuerza un perfil concreto
+"""
+import os, sys
+
+BASE = os.environ.get("ORQ_HOME") or os.path.dirname(
+    os.path.dirname(os.path.realpath(__file__))
+)
+sys.path.insert(0, BASE)
+import orqlib as L
+
+
+def elegir(pid=None):
+    ps = L.cfg().get("profiles", {})
+    if pid:
+        p = ps.get(pid)
+        if not p or p.get("provider") != "minimax":
+            sys.exit(f"minimax: cuenta MiniMax desconocida: {pid}")
+        return pid, p
+    activa = L.cfg().get("_activas", {}).get("minimax")
+    orden = ([activa] if activa else []) + sorted(ps)
+    for k in orden:
+        p = ps.get(k)
+        if p and p.get("provider") == "minimax" and p.get("enabled", True):
+            return k, p
+    sys.exit("minimax: no hay ninguna cuenta MiniMax.  "
+             "orq cuenta add minimax --provider minimax")
+
+
+argv = sys.argv[1:]
+pid = None
+if argv and argv[0] in ("--cuenta", "--id"):
+    if len(argv) < 2:
+        sys.exit("minimax: falta el id de cuenta")
+    pid, argv = argv[1], argv[2:]
+
+pid, perfil = elegir(pid)
+if not L.autenticado(pid, perfil):
+    sys.exit(f"minimax: '{pid}' no tiene API key todavia.  orq cuenta key {pid}")
+
+env = L.entorno(pid, perfil)
+env["ORQ_CUENTA"] = pid
+os.execvpe("claude", ["claude"] + argv, env)

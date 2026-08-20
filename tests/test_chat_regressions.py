@@ -71,7 +71,7 @@ class FailoverKittiTests(unittest.TestCase):
             ["gemini-antigravity", "claude-polidinamica"],
         )
         self.assertEqual(correr.call_args_list[0].args[2], "MARCO\nPREGUNTA")
-        self.assertIn("probando claude-polidinamica", salida.getvalue())
+        self.assertIn("relevo seguro a claude-polidinamica", salida.getvalue())
 
 
 if __name__ == "__main__":

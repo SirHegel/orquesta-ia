@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """orq — orquestador multi-cuenta de IA. Compartido entre todas las terminales."""
-import argparse, json, os, re, sys, subprocess, time, datetime, shutil
+import argparse, json, os, re, sys, subprocess, time, datetime, shutil, threading
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import orqlib as L
@@ -10,6 +10,35 @@ C = {"r":"\033[0m","b":"\033[1m","d":"\033[2m","g":"\033[32m","y":"\033[33m",
 def c(k, s): return f"{C[k]}{s}{C['r']}"
 
 RE_ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+class Pulso:
+    """Hace visible que una fase larga sigue viva sin interferir con no-TTY."""
+    def __init__(self, fase, intervalo=20):
+        self.fase, self.intervalo = fase, intervalo
+        self.stop = threading.Event()
+        self.hilo = None
+        self.inicio = 0.0
+
+    def __enter__(self):
+        if sys.stdout.isatty():
+            self.inicio = time.monotonic()
+            self.hilo = threading.Thread(target=self._latir, daemon=True)
+            self.hilo.start()
+        return self
+
+    def _latir(self):
+        while not self.stop.wait(self.intervalo):
+            seg = int(time.monotonic() - self.inicio)
+            print("  " + c("d", f"   {self.fase} sigue activa · "
+                            f"{seg // 60:02d}:{seg % 60:02d}"), flush=True)
+
+    def __exit__(self, *_args):
+        self.stop.set()
+        if self.hilo:
+            self.hilo.join(timeout=0.2)
+
+
 def vw(s):  # ancho visible
     return len(RE_ANSI.sub("", str(s)))
 def pad(s, n, der=False):
@@ -84,7 +113,7 @@ def cmd_cuenta_add(a):
                 p.get("provider") == "antigravity" for k, p in ps.items()
                 if k != a.id)):
             print(c("red", "Antigravity usa una sesion global; ya existe un perfil")); sys.exit(1)
-        home = os.path.expanduser(a.home) if a.home else os.path.join(L.ACCOUNTS, a.id)
+        home = L.home_de(a.id, {"home": a.home} if a.home else {})
         os.makedirs(home, exist_ok=True); os.chmod(home, 0o700)
         ps[a.id] = {"label": a.label or f"{a.provider} · {a.id}",
                     "provider": a.provider, "home": home,
@@ -92,14 +121,20 @@ def cmd_cuenta_add(a):
                     "cupo_ventana": a.cupo, "proposito": a.proposito,
                     "enabled": True, "budget_tokens_dia": a.budget,
                     "weights": dict(PESOS_BASE)}
+        if a.provider == "minimax":
+            ps[a.id]["auth"] = "apikey"
+            ps[a.id]["api_key_file"] = os.path.join(home, "api_key")
+            ps[a.id].setdefault("base_url", L.MINIMAX_BASE_URL)
         if a.provider == "antigravity":
             ps[a.id]["allowed_tasks"] = ["imagen"]
             ps[a.id]["power"] = {"imagen": 10}
             ps[a.id]["weights"] = {"imagen": 10}
         else:
             ps[a.id]["allowed_tasks"] = [t for t in L.TAREAS if t != "imagen"]
-            ps[a.id]["power"] = 10
+            ps[a.id]["power"] = L.POTENCIA_BASE.get(a.provider, 10)
         if a.model: ps[a.id]["model"] = a.model
+        if a.provider == "claude" and a.chrome:
+            ps[a.id]["chrome"] = True
         L.guardar_cfg(cf)
     print(c("g", f"cuenta '{a.id}' creada") + f"  ({a.provider}, home={home})")
     print(f"\n{c('b','Ahora autentícala corriendo esto:')}\n  {L.cmd_login(a.id, L.cfg()['profiles'][a.id])}\n")
@@ -145,8 +180,11 @@ def cmd_cuenta_rm(a):
         L.guardar_cfg(cf)
     print(c("g", f"'{a.id}' eliminada del registro"))
     h = L.home_de(a.id, p)
-    if a.purge and h.startswith(L.ACCOUNTS):
+    if a.purge and L.home_purgable(a.id, p):
         shutil.rmtree(h, ignore_errors=True); print(c("y", f"credenciales borradas: {h}"))
+    elif a.purge:
+        print(c("red", "purga rechazada: la ruta no es el directorio privado directo de esa cuenta"))
+        print(c("d", f"credenciales conservadas en {h}"))
     else:
         print(c("d", f"credenciales conservadas en {h} (usa --purge para borrarlas)"))
 
@@ -256,7 +294,13 @@ def cmd_ask(a):
     pid, p = _elegir(a)
     print(c("d", f"-> {pid} · {p.get('label',pid)}\n"))
     prompt = a.prompt + (BREVE if getattr(a, "corto", False) else "")
-    r = L.correr(pid, p, prompt, a.tarea, a.timeout)
+    carpeta = os.path.abspath(os.path.expanduser(a.en or os.getcwd()))
+    if a.tarea in {"reasoning", "research"}:
+        r = L.correr(pid, p, prompt, a.tarea, a.timeout, carpeta=carpeta,
+                     solo_lectura=True)
+    else:
+        with L.bloqueo_proyecto(carpeta):
+            r = L.correr(pid, p, prompt, a.tarea, a.timeout, carpeta=carpeta)
     txt = r["texto"] or ""
     lim = getattr(a, "lineas", 0)
     if lim and txt.count("\n") + 1 > lim:
@@ -278,7 +322,9 @@ def _fan(prompt, tarea, timeout, perfiles=None):
     if perfiles: d = {k:v for k,v in d.items() if k in perfiles}
     if not d: print(c("red","sin cuentas disponibles")); sys.exit(1)
     with ThreadPoolExecutor(max_workers=len(d)) as ex:
-        return list(ex.map(lambda kv: L.correr(kv[0], kv[1], prompt, tarea, timeout), d.items()))
+        return list(ex.map(lambda kv: L.correr(
+            kv[0], kv[1], prompt, tarea, timeout, solo_lectura=True
+        ), d.items()))
 
 def cmd_fan(a):
     for r in _fan(a.prompt, a.tarea, a.timeout, a.perfiles):
@@ -307,7 +353,9 @@ def cmd_audit(a):
               "(2) omisiones importantes, (3) nota de 0 a 10. Breve y directo.")
         trab.append((rid, rp, pa))
     with ThreadPoolExecutor(max_workers=max(1,len(trab))) as ex:
-        auds = list(ex.map(lambda t: L.correr(t[0], t[1], t[2], "review", a.timeout), trab))
+        auds = list(ex.map(lambda t: L.correr(
+            t[0], t[1], t[2], "review", a.timeout, solo_lectura=True
+        ), trab))
     for r in auds:
         print(c("mg", f"--- auditoria por {r['perfil']} ({r['tokens']} tok) ---"))
         print(r["texto"], "\n")
@@ -440,6 +488,12 @@ def cmd_permisos(a):
 
 def cmd_proyecto(a):
     carpeta = os.path.abspath(os.path.expanduser(a.en or os.getcwd()))
+    with L.bloqueo_proyecto(carpeta):
+        return _cmd_proyecto_bloqueado(a, carpeta)
+
+
+def _cmd_proyecto_bloqueado(a, carpeta):
+    preferir = getattr(a, "preferir", None)
     ctx_term = ""
     if getattr(a, "contexto", None) and os.path.exists(a.contexto):
         try:
@@ -450,14 +504,18 @@ def cmd_proyecto(a):
     print("  " + c("d", a.prompt[:150]) + "\n")
 
     print("  " + c("y", "1 · plan") + c("d", " · pensando la arquitectura…"), flush=True)
-    plan, err = L.planificar(a.prompt, carpeta, a.timeout)
+    with Pulso("planificacion"):
+        plan, err = L.planificar(a.prompt, carpeta, a.timeout, preferir=preferir)
     if err:
         print("  " + c("red", err) + "\n"); sys.exit(1)
 
     asignacion = None
     if not a.sin_deliberar and len(L.disponibles(tarea="reasoning")) > 1:
         print("  " + c("y", "2 · consenso") + c("d", " · las IA deciden quien hace que…"), flush=True)
-        asignacion, motivo = L.deliberar(plan, a.prompt, a.timeout)
+        with Pulso("consenso"):
+            asignacion, motivo = L.deliberar(
+                plan, a.prompt, a.timeout, preferir=preferir
+            )
         print("  " + c("d", "   " + (motivo or "")))
 
     filas = []
@@ -465,7 +523,9 @@ def cmd_proyecto(a):
         tipo = t.get("tipo", "code")
         pid = (asignacion or {}).get(t["id"])
         if not pid:
-            r = L.ranking(tipo if tipo in L.TAREAS else "code")
+            r = L.ranking(
+                tipo if tipo in L.TAREAS else "code", preferir=preferir
+            )
             pid = r[0]["pid"] if r else c("red", "sin cuenta")
         filas.append([t["id"], t.get("titulo", "")[:36], tipo, pid,
                       ",".join(t.get("depende") or []) or c("d", "—")])
@@ -494,14 +554,19 @@ def cmd_proyecto(a):
             print(f"  {c('d', f'{t:6.0f}s')} {c('y', '▸')} {d['titulo'][:42]:<44}"
                   f"{c('d', d['perfil'])}", flush=True)
         else:
-            marca = c("g", "✔") if not d["rc"] else c("red", "✘")
+            marca = (c("y", "↻") if d.get("relevado") else
+                     c("g", "✔") if not d["rc"] else c("red", "✘"))
             print(f"  {c('d', f'{t:6.0f}s')} {marca} {d['titulo'][:42]:<44}"
                   f"{c('d', d['perfil'])}  "
                   f"{c('d', f'{d[chr(116)+chr(111)+chr(107)+chr(101)+chr(110)+chr(115)]:,} tok')}",
                   flush=True)
 
     print("\n  " + c("y", "3 · construccion") + c("d", " · integra segun terminan\n"))
-    res = L.ejecutar_proyecto(plan, carpeta, a.timeout, cb, asignacion, ctx_term)
+    with Pulso("construccion"):
+        res = L.ejecutar_proyecto(
+            plan, carpeta, a.timeout, cb, asignacion, ctx_term,
+            preferir=preferir,
+        )
 
     if not a.sin_auditar and len(L.disponibles(tarea="review")) > 1:
         print("\n  " + c("y", "4 · auditoria cruzada")
@@ -516,28 +581,153 @@ def cmd_proyecto(a):
                       f"{c('d', f'({d[chr(116)+chr(111)+chr(107)+chr(101)+chr(110)+chr(115)]:,} tok)')}")
                 print(envolver_simple(d["texto"], "     "))
 
-        auds, err = L.auditar_proyecto(plan, carpeta, res, a.timeout, cba,
-                                       arreglar=not a.sin_arreglar)
+        with Pulso("auditoria cruzada"):
+            auds, err = L.auditar_proyecto(plan, carpeta, res, a.timeout, cba,
+                                           arreglar=not a.sin_arreglar,
+                                           preferir=preferir)
         if err:
             print("  " + c("d", err))
         for x in auds:
             res.append({"titulo": f"auditoria de {x['perfil']}", "perfil": x["perfil"],
-                        "tokens": x["tokens"], "seg": x["seg"], "rc": x["rc"]})
+                        "tokens": x["tokens"], "seg": x["seg"], "rc": x["rc"],
+                        "texto": x.get("texto", ""), "run_id": x.get("run_id")})
 
     if not a.sin_integrar:
         print("\n  " + c("y", "5 · cierre") + c("d", " · revision e integracion final…"), flush=True)
-        fin_ = L.integrar_proyecto(plan, carpeta, res, a.timeout)
+        with Pulso("integracion"):
+            fin_ = L.integrar_proyecto(
+                plan, carpeta, res, a.timeout, preferir=preferir
+            )
         if fin_:
             print(envolver_simple(fin_["texto"] or "", "     "))
             res.append({"titulo": "cierre", "perfil": fin_["perfil"],
-                        "tokens": fin_["tokens"], "seg": fin_["seg"], "rc": fin_["rc"]})
+                        "tokens": fin_["tokens"], "seg": fin_["seg"], "rc": fin_["rc"],
+                        "texto": fin_.get("texto", ""), "run_id": fin_.get("run_id"),
+                        "session_id": fin_.get("session_id")})
+        else:
+            res.append({"titulo": "cierre", "perfil": "sin-cuenta",
+                        "tokens": 0, "seg": 0, "rc": 127,
+                        "texto": "no habia una cuenta disponible para integrar"})
 
-    tot = sum(r["tokens"] for r in res) + plan.get("_tokens_plan", 0)
+    # Namespace antiguos/embebidos no conocian esta fase: solo se activa
+    # cuando el parser actual aporta explicitamente sin_verificar=False.
+    if not getattr(a, "sin_verificar", True):
+        rondas = max(1, min(5, int(getattr(a, "rondas", 3))))
+        for ronda in range(1, rondas + 1):
+            print("\n  " + c("y", f"6 · verificacion {ronda}/{rondas}")
+                  + c("d", " · pruebas reales y revision independiente…"), flush=True)
+            with Pulso("verificacion"):
+                ver = L.verificar_proyecto(
+                    plan, carpeta, res, a.timeout, preferir=preferir
+                )
+            verificable = bool(ver and ver.get("verificacion_ok"))
+            comprobaciones = (ver or {}).get("comprobaciones") or []
+            for prueba in comprobaciones:
+                marca = c("g", "✔") if prueba.get("rc") == 0 else c("red", "✘")
+                print(f"  {marca} {str(prueba.get('comando', 'comprobacion'))[:72]}"
+                      + c("d", f" · rc={prueba.get('rc')}"))
+            if verificable:
+                res.append({
+                    "titulo": "verificacion final", "perfil": ver.get("perfil", "verificador"),
+                    "tokens": ver.get("tokens", 0), "seg": ver.get("seg", 0), "rc": 0,
+                    "texto": ver.get("texto", ""), "run_id": ver.get("run_id"),
+                })
+                print("  " + c("g", "✔ evidencia limpia; cierre verificable"), flush=True)
+                break
+
+            hallazgos = (ver or {}).get("hallazgos") or [
+                (ver or {}).get("texto", "verificacion sin evidencia")
+            ]
+            intento_ver = {
+                "titulo": f"verificacion {ronda}",
+                "perfil": (ver or {}).get("perfil", "sin-cuenta"),
+                "tokens": (ver or {}).get("tokens", 0),
+                "seg": (ver or {}).get("seg", 0),
+                "rc": (ver or {}).get("rc") or 1,
+                "texto": (ver or {}).get("texto", ""),
+                "run_id": (ver or {}).get("run_id"),
+                "hallazgos": hallazgos,
+                "comprobaciones": comprobaciones,
+            }
+            print("  " + c("y", "hallazgos pendientes: ")
+                  + c("d", " | ".join(str(x)[:180] for x in hallazgos[:5])))
+            if ronda >= rondas:
+                res.append(intento_ver)
+                break
+
+            # Esta verificacion queda superada si la siguiente ronda pasa; no
+            # se cuenta como fallo final, pero conserva tokens y trazabilidad.
+            intento_ver["relevado"] = True
+            intento_ver["estado"] = "requiere-correccion"
+            res.append(intento_ver)
+            print("  " + c("y", "   reparacion")
+                  + c("d", " · corrigiendo los hallazgos antes de repetir…"), flush=True)
+            with Pulso("reparacion"):
+                reparacion = L.integrar_proyecto(
+                    plan, carpeta, res, a.timeout, preferir=preferir
+                )
+            if not reparacion:
+                res.append({"titulo": "reparacion", "perfil": "sin-cuenta",
+                            "tokens": 0, "seg": 0, "rc": 127,
+                            "texto": "sin cuenta para reparar"})
+                break
+            res.append({
+                "titulo": f"reparacion {ronda}",
+                "perfil": reparacion.get("perfil", "integrador"),
+                "tokens": reparacion.get("tokens", 0),
+                "seg": reparacion.get("seg", 0),
+                "rc": reparacion.get("rc", 1),
+                "texto": reparacion.get("texto", ""),
+                "run_id": reparacion.get("run_id"),
+            })
+            if reparacion.get("rc") != 0:
+                break
+
+    # Publicar es una politica local opt-in. Nunca se hace si alguna fase
+    # fallo o si se omitio/no supero la verificacion independiente.
+    fallos = [r for r in res if r.get("rc") != 0 and not r.get("relevado")]
+    publicar = getattr(a, "publicar", None)
+    if publicar is None:
+        publicar = bool(L.cfg().get("_publicar_github", False))
+    if publicar and not fallos:
+        verificada = any(
+            r.get("titulo") == "verificacion final" and r.get("rc") == 0
+            for r in res
+        )
+        if not verificada:
+            res.append({"titulo": "publicacion segura", "perfil": "git",
+                        "tokens": 0, "seg": 0, "rc": 126,
+                        "texto": "publicacion bloqueada: falta verificacion real"})
+        else:
+            print("\n  " + c("y", "7 · GitHub")
+                  + c("d", " · escaneo total, commit y push sin secretos…"), flush=True)
+            publicado = L.publicar_repo(
+                carpeta,
+                mensaje=f"feat: completar {plan.get('nombre') or 'proyecto'}",
+            )
+            res.append({"titulo": "publicacion segura", "perfil": "git",
+                        "tokens": 0, "seg": 0,
+                        "rc": 0 if publicado.get("ok") else 1,
+                        "texto": publicado.get("detalle", ""),
+                        "commit": publicado.get("commit", "")})
+            marca = c("g", "✔") if publicado.get("ok") else c("red", "✘")
+            print(f"  {marca} {publicado.get('detalle', 'sin detalle')}", flush=True)
+
+    tot = sum(r.get("tokens", 0) for r in res) + plan.get("_tokens_plan", 0)
     porq = {}
     for r in res:
         if r.get("perfil"):
-            porq[r["perfil"]] = porq.get(r["perfil"], 0) + r["tokens"]
-    print("\n  " + c("b", "LISTO") + c("d", f"  ·  {tot:,} tokens  ·  {time.time()-t0:.0f}s"))
+            porq[r["perfil"]] = porq.get(r["perfil"], 0) + r.get("tokens", 0)
+    # Un intento fallido que ya fue entregado y terminado por otra cuenta es
+    # historial de continuidad, no un fallo final del proyecto.
+    fallos = [r for r in res if r.get("rc") != 0 and not r.get("relevado")]
+    titulo = "INCOMPLETO" if fallos else "LISTO"
+    color = "red" if fallos else "b"
+    print("\n  " + c(color, titulo) + c("d", f"  ·  {tot:,} tokens  ·  {time.time()-t0:.0f}s"))
+    if fallos:
+        for fallo in fallos:
+            print("  " + c("red", "✘") + " " + fallo.get("titulo", "tarea")[:52]
+                  + c("d", f" · {fallo.get('perfil', 'sin-cuenta')} · rc={fallo.get('rc')}"))
     mx = max(porq.values()) if porq else 0
     for k, v in sorted(porq.items(), key=lambda x: -x[1]):
         print(f"    {k:<22} {v:>10,}  {_barra(v, mx, 16)}")
@@ -547,6 +737,21 @@ def cmd_proyecto(a):
     except OSError:
         pass
     print()
+    if fallos:
+        raise SystemExit(1)
+
+
+def cmd_publicar(a):
+    carpeta = os.path.abspath(os.path.expanduser(a.en or os.getcwd()))
+    print("\n  " + c("b", "PUBLICACION SEGURA") + c("d", f"  ·  {carpeta}"))
+    resultado = L.publicar_repo(carpeta, mensaje=a.mensaje)
+    if resultado.get("ok"):
+        print("  " + c("g", "✔ publicado")
+              + c("d", f" · commit {resultado.get('commit') or '?'}") + "\n")
+        return
+    print("  " + c("red", "✘ bloqueado")
+          + c("d", f" · {resultado.get('fase')}: {resultado.get('detalle')}") + "\n")
+    raise SystemExit(1)
 
 
 def envolver_simple(txt, sangria="  "):
@@ -691,8 +896,11 @@ def main():
     cu = sub.add_parser("cuenta", help="gestionar cuentas"); cs = cu.add_subparsers(dest="sc", required=True)
     ad = cs.add_parser("add", help="registrar una cuenta nueva")
     ad.add_argument("id"); ad.add_argument(
-        "--provider", required=True, choices=["claude", "gpt", "antigravity"])
+        "--provider", required=True,
+        choices=["claude", "gpt", "antigravity", "minimax"])
     ad.add_argument("--label"); ad.add_argument("--home"); ad.add_argument("--model")
+    ad.add_argument("--chrome", action="store_true",
+                    help="habilitar Claude in Chrome para control del navegador")
     ad.add_argument("--plan", default="pro"); ad.add_argument("--proposito", default="general")
     ad.add_argument("--ventana", type=float, default=5); ad.add_argument("--cupo", type=int, default=0)
     ad.add_argument("--budget", type=int, default=0); ad.add_argument("--force", action="store_true")
@@ -714,6 +922,7 @@ def main():
     k = sub.add_parser("ask", help="delega a la mejor cuenta")
     k.add_argument("prompt"); k.add_argument("--tarea", choices=L.TAREAS, default="reasoning")
     k.add_argument("--perfil"); k.add_argument("--proposito"); k.add_argument("--timeout", type=int, default=300)
+    k.add_argument("--en", help="carpeta de trabajo (por defecto, la actual)")
     k.add_argument("--corto", action="store_true", help="pide respuesta compacta")
     k.add_argument("--lineas", type=int, default=0, help="corta la salida a N lineas")
     k.set_defaults(f=cmd_ask)
@@ -725,9 +934,22 @@ def main():
     pr.add_argument("--sin-deliberar", action="store_true", help="no votar quien hace que")
     pr.add_argument("--sin-auditar", action="store_true", help="saltar la auditoria cruzada")
     pr.add_argument("--sin-arreglar", action="store_true", help="auditar sin corregir")
+    pr.add_argument("--sin-verificar", action="store_true", help="saltar las pruebas finales independientes")
+    pr.add_argument("--rondas", type=int, default=3, help="maximo de ciclos verificar/reparar (1-5)")
     pr.add_argument("--contexto", help="archivo con el contexto de la conversacion")
-    pr.add_argument("--timeout", type=int, default=600)
-    pr.set_defaults(f=cmd_proyecto)
+    pr.add_argument("--preferir", help="cuenta que debe liderar si esta disponible")
+    pr.add_argument("--timeout", type=int, default=1800)
+    pub = pr.add_mutually_exclusive_group()
+    pub.add_argument("--publicar", dest="publicar", action="store_true",
+                     help="tras verificar, escanear secretos, commit y push")
+    pub.add_argument("--no-publicar", dest="publicar", action="store_false",
+                     help="no publicar aunque la politica local lo pida")
+    pr.set_defaults(f=cmd_proyecto, publicar=None)
+
+    pu = sub.add_parser("publicar", help="escanear secretos, commit y push seguro")
+    pu.add_argument("--en", help="repositorio (por defecto, carpeta actual)")
+    pu.add_argument("--mensaje", default="chore: cambios verificados por Orquesta IA")
+    pu.set_defaults(f=cmd_publicar)
 
     im = sub.add_parser("imagen", help="generar una imagen o diseno")
     im.add_argument("prompt"); im.add_argument("--en", help="carpeta destino (por defecto, la actual)")

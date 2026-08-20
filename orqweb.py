@@ -197,7 +197,7 @@ class H(BaseHTTPRequestHandler):
             if not L.id_perfil_valido(pid):
                 return self._j(400, {"error": "id invalido"})
             prov = d.get("provider")
-            if prov not in ("claude", "gpt", "antigravity"):
+            if prov not in ("claude", "gpt", "antigravity", "minimax"):
                 return self._j(400, {"error": "proveedor invalido"})
             nav = d.get("navegador")
             if not L.navegador_valido(nav):
@@ -219,13 +219,17 @@ class H(BaseHTTPRequestHandler):
                            "navegador": nav or "",
                            "budget_tokens_dia": int(d.get("budget") or 0),
                            "weights": {t: 7 for t in L.TAREAS}}
+                if prov == "minimax":
+                    ps[pid]["auth"] = "apikey"
+                    ps[pid]["api_key_file"] = os.path.join(home, "api_key")
+                    ps[pid]["base_url"] = L.MINIMAX_BASE_URL
                 if prov == "antigravity":
                     ps[pid]["allowed_tasks"] = ["imagen"]
                     ps[pid]["power"] = {"imagen": 10}
                     ps[pid]["weights"] = {"imagen": 10}
                 else:
                     ps[pid]["allowed_tasks"] = [t for t in L.TAREAS if t != "imagen"]
-                    ps[pid]["power"] = 10
+                    ps[pid]["power"] = L.POTENCIA_BASE.get(prov, 10)
                 L.guardar_cfg(cf)
             return self._j(200, {"ok": True, "login": L.cmd_login(pid, L.cfg()["profiles"][pid])})
 

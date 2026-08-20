@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Gate heredado por todos los proveedores que lanza Orquesta.
+# Git entrega por stdin: <ref local> <sha local> <ref remoto> <sha remoto>.
+set -uo pipefail
+
+ORQ_RAIZ=${ORQ_HOME:-$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)}
+SCANNER="$ORQ_RAIZ/tools/scan-secretos.sh"
+[ -x "$SCANNER" ] || {
+  echo "BLOQUEADO: falta el escaner de secretos de Orquesta" >&2
+  exit 2
+}
+REPO=$(git rev-parse --show-toplevel 2>/dev/null) || {
+  echo "BLOQUEADO: no pude resolver el repositorio" >&2
+  exit 2
+}
+CERO=0000000000000000000000000000000000000000
+REVISADOS=""
+
+while read -r _ref_local sha_local _ref_remota sha_remota; do
+  [ -n "${sha_local:-}" ] || continue
+  [ "$sha_local" = "$CERO" ] && continue
+  if [ "$sha_remota" = "$CERO" ]; then
+    COMMITS=$(git rev-list "$sha_local" --not --remotes 2>/dev/null) || exit 2
+    [ -n "$COMMITS" ] || COMMITS="$sha_local"
+  else
+    COMMITS=$(git rev-list "$sha_remota..$sha_local" 2>/dev/null) || exit 2
+  fi
+  for commit in $COMMITS; do
+    case " $REVISADOS " in *" $commit "*) continue ;; esac
+    REVISADOS="$REVISADOS $commit"
+    if ! "$SCANNER" --commit "$commit" --repo "$REPO"; then
+      echo "BLOQUEADO: el push contiene datos sensibles" >&2
+      exit 1
+    fi
+  done
+done
+
+exit 0

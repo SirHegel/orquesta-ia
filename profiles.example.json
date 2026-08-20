@@ -1,9 +1,12 @@
 {
   "_lee_esto": "Copia este archivo a profiles.json y edítalo. profiles.json NUNCA se sube a git (está en .gitignore). Las credenciales viven en accounts/<id>/ y tampoco se suben.",
+  "_permisos_totales": false,
+  "_publicar_github": false,
   "profiles": {
     "claude-personal": {
       "label": "Claude · cuenta personal",
       "provider": "claude",
+      "chrome": false,
       "home": "~/.claude",
       "plan": "max",
       "ventana_horas": 5,

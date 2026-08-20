@@ -39,6 +39,12 @@ class ScannerStagedTests(unittest.TestCase):
             text=True,
         )
 
+    def scan_args(self, *args):
+        return subprocess.run(
+            ["bash", "tools/scan-secretos.sh", *args], cwd=self.repo,
+            capture_output=True, text=True,
+        )
+
     def test_lee_el_blob_staged_y_no_imprime_el_secreto(self):
         secreto = "sk-" + "proj-" + "A" * 32
         ruta = self.repo / "solo-indice.txt"
@@ -94,6 +100,24 @@ class ScannerStagedTests(unittest.TestCase):
         entorno["GIT_INDEX_FILE"] = "/dev/null"
         resultado = self.scan(entorno)
         self.assertEqual(resultado.returncode, 2)
+
+    def test_todo_incluye_archivos_no_trackeados_y_commit_revisa_su_arbol(self):
+        secreto = "CLIENT_SECRET=" + "D" * 32
+        ruta = self.repo / "nuevo.txt"
+        ruta.write_text(secreto + "\n", encoding="utf-8")
+        todo = self.scan_args("--todo", "--repo", str(self.repo))
+        self.assertEqual(todo.returncode, 1)
+        self.assertNotIn(secreto, todo.stdout + todo.stderr)
+
+        self.git("add", ruta.name)
+        self.git("commit", "-qm", "secreto sintetico")
+        commit = self.git("rev-parse", "HEAD").stdout.strip()
+        ruta.write_text("limpio\n", encoding="utf-8")
+        self.git("add", ruta.name)
+        self.git("commit", "-qm", "quitar del arbol actual")
+        historico = self.scan_args("--commit", commit, "--repo", str(self.repo))
+        self.assertEqual(historico.returncode, 1)
+        self.assertNotIn(secreto, historico.stdout + historico.stderr)
 
 
 if __name__ == "__main__":

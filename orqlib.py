@@ -3,8 +3,11 @@
 Estado en disco con bloqueo fcntl: cualquier numero de terminales puede usar
 el sistema a la vez sin corromper el ledger ni los contadores.
 """
-import json, os, re, shlex, shutil, subprocess, sys, threading, time, datetime, fcntl, contextlib
+import json, os, re, shlex, shutil, subprocess, sys, threading, time, datetime, fcntl, contextlib, uuid, signal, hashlib, glob
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+
+_SUBPROCESS_RUN_ORIGINAL = subprocess.run
+_SYSTEMD_USUARIO_CACHE = {}
 
 BASE = os.environ.get("ORQ_HOME") or os.path.dirname(os.path.abspath(__file__))
 ACCOUNTS = os.path.join(BASE, "accounts")
@@ -15,18 +18,25 @@ SCORES = os.path.join(BASE, "state", "scores.json")
 LOCK = os.path.join(BASE, "state", ".lock")
 CLAVE_LIMITE_ANTIGRAVITY = "@antigravity-global"
 
+# MiniMax habla el protocolo de Anthropic: reusamos el binario "claude"
+# apuntandolo a su endpoint. Por eso nunca exportamos estas variables de
+# forma global: pisarian la cuenta Claude real de las terminales.
+MINIMAX_BASE_URL = "https://api.minimax.io/anthropic"
+MINIMAX_BASE_URL_CN = "https://api.minimaxi.com/anthropic"
+MINIMAX_MODELO = "MiniMax-M3[1m]"
+
 TAREAS = ["code", "agentic", "reasoning", "review", "writing",
           "research", "edicion", "imagen", "bulk"]
 
 # Capacidades por motor. El chat de maxima potencia es Claude/Codex;
 # Antigravity se reserva para generar recursos visuales con Nano Banana.
-PROVEEDORES_TEXTO = {"claude", "gpt"}
+PROVEEDORES_TEXTO = {"claude", "gpt", "minimax"}
 PROVEEDORES_IMAGEN = {"antigravity"}
 
 # Potencia del motor efectivo, no del nombre de la cuenta. Claude Opus y el
 # Codex configurado compiten en el nivel maximo; AGY tiene ese nivel solo para
 # su capacidad visual. Un perfil puede ajustar ``power`` (numero o por tarea).
-POTENCIA_BASE = {"claude": 10.0, "gpt": 10.0, "antigravity": 10.0}
+POTENCIA_BASE = {"claude": 10.0, "gpt": 10.0, "antigravity": 10.0, "minimax": 8.5}
 ID_PERFIL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 MIN_MUESTRA_REPARTO = 10_000
 
@@ -175,18 +185,60 @@ def gastado_ventana(pid, horas):
 def home_de(pid, p):
     h = p.get("home")
     if h:
-        return os.path.expanduser(h)
+        h = os.path.expanduser(h)
+        return os.path.abspath(h if os.path.isabs(h) else os.path.join(BASE, h))
     return os.path.join(ACCOUNTS, pid)
+
+
+def home_purgable(pid, p):
+    """Solo permite purgar el directorio privado directo de ese id."""
+    if not id_perfil_valido(pid):
+        return False
+    actual = os.path.realpath(home_de(pid, p))
+    esperado = os.path.realpath(os.path.join(ACCOUNTS, pid))
+    try:
+        dentro = os.path.commonpath([actual, os.path.realpath(ACCOUNTS)]) \
+            == os.path.realpath(ACCOUNTS)
+    except ValueError:
+        return False
+    return dentro and actual == esperado
 
 
 def entorno(pid, p):
     env = dict(os.environ)
     prov = p.get("provider")
     h = home_de(pid, p)
+    # Nunca heredar credenciales/endpoints de la cuenta elegida manualmente en
+    # otra capa de la terminal. Cada perfil empieza aislado y solo reinyecta lo
+    # que declara en su configuracion privada.
+    for nombre in (
+        "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME",
+        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL", "OPENAI_API_KEY", "CODEX_API_KEY",
+        "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_USE_GCA",
+        "GEMINI_CLI_TRUST_WORKSPACE",
+    ):
+        env.pop(nombre, None)
     if prov == "claude":
         env["CLAUDE_CONFIG_DIR"] = h
     elif prov == "gpt":
         env["CODEX_HOME"] = h
+    elif prov == "minimax":
+        env["CLAUDE_CONFIG_DIR"] = h
+        env["ANTHROPIC_BASE_URL"] = p.get("base_url") or MINIMAX_BASE_URL
+        k = p.get("api_key_file")
+        if k and os.path.exists(os.path.expanduser(k)):
+            with open(os.path.expanduser(k)) as archivo:
+                env["ANTHROPIC_AUTH_TOKEN"] = archivo.read().strip()
+        m = p.get("model") or MINIMAX_MODELO
+        for v in ("ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
+                  "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                  "ANTHROPIC_DEFAULT_HAIKU_MODEL"):
+            env[v] = m
+        env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+        env.setdefault("API_TIMEOUT_MS", "3000000")
     elif prov == "antigravity":
         pass
     elif prov == "gemini":
@@ -196,9 +248,23 @@ def entorno(pid, p):
         if p.get("auth") == "oauth":
             env["GOOGLE_GENAI_USE_GCA"] = "true"
         elif k and os.path.exists(os.path.expanduser(k)):
-            env["GEMINI_API_KEY"] = open(os.path.expanduser(k)).read().strip()
+            with open(os.path.expanduser(k)) as archivo:
+                env["GEMINI_API_KEY"] = archivo.read().strip()
     for k, v in (p.get("env") or {}).items():
         env[k] = v
+    # Todo `git push` iniciado por una IA hereda un pre-push que escanea cada
+    # commit. La publicacion normal de Orquesta vuelve a escanear por su cuenta;
+    # esta capa evita que un modelo se salte accidentalmente el gate.
+    hook = os.path.join(BASE, "tools", "git-hooks")
+    if os.path.isfile(os.path.join(hook, "pre-push")):
+        try:
+            n_git = int(env.get("GIT_CONFIG_COUNT", "0"))
+        except (TypeError, ValueError):
+            n_git = 0
+        env[f"GIT_CONFIG_KEY_{n_git}"] = "core.hooksPath"
+        env[f"GIT_CONFIG_VALUE_{n_git}"] = hook
+        env["GIT_CONFIG_COUNT"] = str(n_git + 1)
+        env["ORQ_HOME"] = BASE
     return env
 
 
@@ -208,6 +274,8 @@ POTENCIA_MAX = {
     "gpt": {"reasoning": "high"},
     "antigravity": {"model": "gemini-3.1-pro-high", "effort": "high"},
     "gemini": {},
+    # sin --effort: el flag es de la CLI de Anthropic, MiniMax no lo negocia
+    "minimax": {"model": MINIMAX_MODELO},
 }
 
 
@@ -220,28 +288,71 @@ PERMISOS = {
     "gpt": ["--dangerously-bypass-approvals-and-sandbox"],
     "antigravity": ["--dangerously-skip-permissions"],
     "gemini": ["--yolo"],
+    "minimax": ["--dangerously-skip-permissions"],
 }
 
 
 def permisos_activos():
-    return cfg().get("_permisos_totales", True)
+    local = os.environ.get("ORQ_PERMISOS_TOTALES")
+    if local not in (None, ""):
+        return str(local).strip().lower() in {"1", "true", "yes", "on"}
+    return cfg().get("_permisos_totales", False)
 
 
-def comando(p, prompt):
+def chrome_claude_instalado():
+    """Detecta la extension oficial sin leer datos ni sesiones del navegador."""
+    extension_id = "fcoeoabgfenejglbffodgkkbkcdhcgfn"
+    patrones = [
+        os.path.expanduser(
+            f"~/.config/google-chrome/*/Extensions/{extension_id}/*/manifest.json"
+        ),
+        os.path.expanduser(
+            f"~/.config/chromium/*/Extensions/{extension_id}/*/manifest.json"
+        ),
+    ]
+    return any(glob.glob(patron) for patron in patrones)
+
+
+def chrome_perfil_habilitado(p):
+    valor = p.get("chrome")
+    if valor is None:
+        valor = os.environ.get("ORQ_CLAUDE_CHROME", "0")
+    if str(valor).strip().lower() == "auto":
+        return chrome_claude_instalado()
+    return str(valor).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def comando(p, prompt, session_id=None, resume=False, solo_lectura=False):
     prov = p.get("provider")
-    perm = PERMISOS.get(prov, []) if permisos_activos() else []
+    perm = PERMISOS.get(prov, []) if permisos_activos() and not solo_lectura else []
     mx = POTENCIA_MAX.get(prov, {}) if potencia_maxima() else {}
     # el perfil manda sobre el ajuste global
     modelo = p.get("model") or mx.get("model")
     if prov == "claude":
         base = ["claude", "-p", "--output-format", "json"] + perm
+        if solo_lectura:
+            base += ["--permission-mode", "plan"]
+        if chrome_perfil_habilitado(p):
+            base += ["--chrome"]
+        if resume and session_id:
+            base += ["--resume", session_id]
+        elif session_id:
+            base += ["--session-id", session_id]
         if modelo:
             base += ["--model", modelo]
         if mx.get("effort"):
             base += ["--effort", mx["effort"]]
         return base + [prompt]
+    if prov == "minimax":
+        base = ["claude", "-p", "--output-format", "json"] + perm
+        if solo_lectura:
+            base += ["--permission-mode", "plan"]
+        base += ["--model", modelo or MINIMAX_MODELO]
+        return base + [prompt]
     if prov == "gpt":
         base = ["codex", "exec", "--skip-git-repo-check"] + perm
+        if solo_lectura:
+            base += ["--sandbox", "read-only"]
         if modelo:
             base += ["-m", modelo]
         if mx.get("reasoning"):
@@ -269,6 +380,10 @@ def autenticado(pid, p):
         return os.path.exists(os.path.join(h, ".credentials.json"))
     if prov == "gpt":
         return os.path.exists(os.path.join(h, "auth.json"))
+    if prov == "minimax":
+        k = p.get("api_key_file") or os.path.join(h, "api_key")
+        k = os.path.expanduser(k)
+        return os.path.exists(k) and os.path.getsize(k) > 0
     if prov == "antigravity":
         import shutil
         return shutil.which("agy") is not None
@@ -293,6 +408,9 @@ def cmd_login(pid, p):
         return f'{pre}CLAUDE_CONFIG_DIR={hq} claude   # dentro escribe: /login'
     if prov == "gpt":
         return f'{pre}CODEX_HOME={hq} codex login'
+    if prov == "minimax":
+        return (f'orq cuenta key {shlex.quote(pid)}'
+                '   # pega la API key de platform.minimax.io (no se ve al escribir)')
     if prov == "antigravity":
         return "agy   # si pide sesion, autoriza en el navegador"
     if prov == "gemini":
@@ -412,7 +530,7 @@ def _texto_error(error):
 
 def extraer(provider, stdout, stderr=""):
     """Devuelve (respuesta, tokens, diagnostico_del_proveedor)."""
-    if provider == "claude":
+    if provider in ("claude", "minimax"):
         try:
             d = json.loads(stdout)
             u = d.get("usage", {}) or {}
@@ -446,7 +564,7 @@ def extraer(provider, stdout, stderr=""):
 
 def _error_estructurado(provider, stdout):
     """Distingue un error JSON de avisos normales escritos en stderr."""
-    if provider not in ("claude", "antigravity"):
+    if provider not in ("claude", "antigravity", "minimax"):
         return False
     try:
         d = json.loads(stdout)
@@ -454,13 +572,178 @@ def _error_estructurado(provider, stdout):
         return False
     if not isinstance(d, dict):
         return False
-    if provider == "claude":
+    if provider in ("claude", "minimax"):
         return bool(d.get("is_error") or d.get("error"))
     return bool(d.get("error") or str(d.get("status", "")).upper() == "ERROR")
 
 
 # ---------------- ejecucion ----------------
-def correr(pid, p, prompt, tarea="reasoning", timeout=300, carpeta=None):
+def _descendientes(pid_raiz):
+    """Obtiene descendientes Linux aun si crearon otra sesion con setsid."""
+    hijos = {}
+    try:
+        entradas = os.listdir("/proc")
+    except OSError:
+        return []
+    for nombre in entradas:
+        if not nombre.isdigit():
+            continue
+        try:
+            with open(f"/proc/{nombre}/status") as estado:
+                ppid = next(
+                    int(linea.split()[1]) for linea in estado
+                    if linea.startswith("PPid:")
+                )
+            hijos.setdefault(ppid, []).append(int(nombre))
+        except (OSError, StopIteration, ValueError):
+            continue
+    salida, pila = [], [int(pid_raiz)]
+    while pila:
+        padre = pila.pop()
+        nuevos = hijos.get(padre, [])
+        salida.extend(nuevos)
+        pila.extend(nuevos)
+    return salida
+
+
+def _terminar_grupo(proceso, gracia=0.5):
+    """Detiene la sesion del proveedor completa, incluidos sus hijos.
+
+    Cada proveedor se inicia como lider de una sesion nueva. En un timeout no
+    basta con matar ese lider: las herramientas que lanzo pueden seguir
+    modificando archivos y conservar abiertos stdout/stderr. Primero les damos
+    una oportunidad breve de cerrar con TERM y despues eliminamos cualquier
+    miembro restante del grupo con KILL.
+    """
+    pgid = proceso.pid
+    descendientes = _descendientes(proceso.pid)
+
+    def enviar_pids(sig, pids):
+        for pid in reversed(pids):
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                pass
+
+    def enviar(sig):
+        try:
+            os.killpg(pgid, sig)
+            return True
+        except ProcessLookupError:
+            return False
+
+    enviar_pids(signal.SIGTERM, descendientes)
+    enviar(signal.SIGTERM)
+    limite = time.monotonic() + gracia
+    grupo_vivo = True
+    while time.monotonic() < limite:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            grupo_vivo = False
+            break
+        time.sleep(0.02)
+    # Un hijo puede haber salido del grupo con setsid aunque el lider ya haya
+    # muerto. Se elimina explicitamente usando la foto tomada antes del TERM.
+    enviar_pids(signal.SIGKILL, list(dict.fromkeys(
+        descendientes + _descendientes(proceso.pid)
+    )))
+    if grupo_vivo:
+        enviar(signal.SIGKILL)
+
+    # Recolectamos al lider para que no quede zombie. El KILL directo es un
+    # ultimo respaldo si el grupo cambio de forma inesperada.
+    try:
+        proceso.wait(timeout=gracia)
+    except subprocess.TimeoutExpired:
+        proceso.kill()
+        try:
+            proceso.wait(timeout=gracia)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _systemd_usuario_disponible():
+    """Comprueba el bus de usuario, no solo la presencia de sus binarios.
+
+    En SSH, WSL y contenedores es comun tener ``systemd-run`` instalado sin
+    una sesion de usuario utilizable. En ese caso envolver el proveedor hace
+    que falle antes de llegar a ejecutarse. La cache se separa por las
+    variables del bus y caduca pronto para tolerar que aparezca una sesion.
+    """
+    if (os.environ.get("ORQ_DISABLE_SYSTEMD_SCOPE")
+            or not shutil.which("systemd-run") or not shutil.which("systemctl")):
+        return False
+    clave = (os.getuid(), os.environ.get("XDG_RUNTIME_DIR", ""),
+             os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""))
+    ahora_mono = time.monotonic()
+    guardado = _SYSTEMD_USUARIO_CACHE.get(clave)
+    if guardado and ahora_mono - guardado[0] < 15:
+        return guardado[1]
+    try:
+        r = _SUBPROCESS_RUN_ORIGINAL(
+            ["systemctl", "--user", "show-environment"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=2, check=False,
+        )
+        disponible = r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        disponible = False
+    _SYSTEMD_USUARIO_CACHE[clave] = (ahora_mono, disponible)
+    return disponible
+
+
+def _scope_systemd(cmd):
+    """Encierra un proveedor en un cgroup solo con bus de usuario operativo."""
+    if not _systemd_usuario_disponible():
+        return cmd, None
+    unidad = f"orq-run-{os.getpid()}-{time.time_ns()}"
+    return (["systemd-run", "--user", "--scope", "--quiet",
+             f"--unit={unidad}", "--", *cmd], unidad + ".scope")
+
+
+def _terminar_aislado(proceso, scope=None, gracia=0.7):
+    """Mata el cgroup completo; usa el grupo POSIX como respaldo portable."""
+    if scope:
+        def matar(senal):
+            _SUBPROCESS_RUN_ORIGINAL(
+                ["systemctl", "--user", "kill", "--kill-whom=all",
+                 f"--signal={senal}", scope],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=2, check=False,
+            )
+        try:
+            matar("TERM")
+            try:
+                proceso.wait(timeout=gracia)
+            except subprocess.TimeoutExpired:
+                matar("KILL")
+        except (OSError, subprocess.SubprocessError):
+            pass
+    _terminar_grupo(proceso, gracia=gracia)
+
+
+def _salida_tras_interrupcion(proceso, espera=1.0):
+    """Recoge la salida ya producida sin poder quedar bloqueado por un pipe."""
+    try:
+        return proceso.communicate(timeout=espera)
+    except subprocess.TimeoutExpired as e:
+        # Un descendiente que se desacoplo pudo heredar los pipes. El grupo
+        # original ya esta muerto; conservamos la salida parcial y los cerramos.
+        out, err = e.stdout or "", e.stderr or ""
+        for pipe in (proceso.stdout, proceso.stderr):
+            if pipe:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        return out, err
+
+
+def correr(pid, p, prompt, tarea="reasoning", timeout=300, carpeta=None,
+           session_id=None, resume=False, solo_lectura=False):
     if not admite_tarea(p, tarea):
         t0 = time.time()
         run_id = f"{pid}-{time.time_ns()}"
@@ -477,26 +760,56 @@ def correr(pid, p, prompt, tarea="reasoning", timeout=300, carpeta=None):
                 "tokens": 0, "seg": 0.0, "rc": 2, "run_id": run_id,
                 "limitado": None}
 
-    env = entorno(pid, p)
-    cmd = comando(p, prompt)
     prov = p.get("provider")
+    if prov == "claude" and not session_id:
+        session_id = str(uuid.uuid4())
+    env = entorno(pid, p)
+    opciones_comando = {"solo_lectura": True} if solo_lectura else {}
+    cmd = comando(p, prompt, session_id=session_id, resume=resume,
+                  **opciones_comando)
     t0 = time.time()
     f_lock = _lock_proveedor(prov) if prov in SERIALIZAR else None
+    proceso = None
+    scope = None
     try:
         if f_lock:
             fcntl.flock(f_lock, fcntl.LOCK_EX)
         destino = carpeta if carpeta and os.path.isdir(carpeta) else BASE
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, env=env, cwd=destino)
-        out, err, rc = r.stdout, r.stderr, r.returncode
+        if subprocess.run is not _SUBPROCESS_RUN_ORIGINAL:
+            # Punto de inyeccion conservado para consumidores que sustituian
+            # el runner (incluida la suite historica) sin arrancar una IA real.
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout, env=env, cwd=destino)
+            out, err, rc = r.stdout, r.stderr, r.returncode
+        else:
+            cmd_aislado, scope = _scope_systemd(cmd)
+            proceso = subprocess.Popen(cmd_aislado, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True,
+                                       env=env, cwd=destino,
+                                       start_new_session=True)
+            out, err = proceso.communicate(timeout=timeout)
+            rc = proceso.returncode
     except subprocess.TimeoutExpired as e:
-        out, err = e.stdout or "", e.stderr or ""
+        if proceso is not None:
+            _terminar_aislado(proceso, scope)
+            out, err = _salida_tras_interrupcion(proceso)
+        else:
+            out, err = e.stdout or "", e.stderr or ""
+        # ``communicate`` reintentado entrega toda la salida acumulada. Si un
+        # pipe desacoplado impidio recogerla, usamos lo que traia el timeout.
+        out = out or e.stdout or ""
+        err = err or e.stderr or ""
         if isinstance(out, bytes):
             out = out.decode(errors="replace")
         if isinstance(err, bytes):
             err = err.decode(errors="replace")
         err = (err.rstrip() + f"\ntimeout tras {timeout}s").strip()
         rc = 124
+    except KeyboardInterrupt:
+        if proceso is not None:
+            _terminar_aislado(proceso, scope)
+            _salida_tras_interrupcion(proceso)
+        raise
     except FileNotFoundError as e:
         out, err, rc = "", f"binario no encontrado: {e}", 127
     finally:
@@ -528,10 +841,12 @@ def correr(pid, p, prompt, tarea="reasoning", timeout=300, carpeta=None):
          "tokens": tok, "seg": dur, "rc": rc, "limite": bool(lim),
          "sesion": os.environ.get("ORQ_SESION", "sin-sesion"),
          "term": os.environ.get("ORQ_SESION_TERM", ""),
-         "carpeta": carpeta or "", "prompt": prompt[:200], "run_id": run_id})
+         "carpeta": carpeta or "", "prompt": prompt[:200], "run_id": run_id,
+         "session_id": session_id})
     return {"perfil": pid, "label": p.get("label", pid), "texto": texto,
             "tokens": tok, "seg": dur, "rc": rc, "run_id": run_id,
-            "limitado": lim.isoformat(timespec="seconds") if lim else None}
+            "limitado": lim.isoformat(timespec="seconds") if lim else None,
+            "session_id": session_id}
 
 
 # ---------------- routing ----------------
@@ -680,7 +995,7 @@ def puntuar(pid, p, tarea):
     return base * mult * factor, " · ".join(notas)
 
 
-def ranking(tarea, proposito=None, incluir_bloqueados=False):
+def ranking(tarea, proposito=None, incluir_bloqueados=False, preferir=None):
     disp = disponibles(incluir_bloqueados, tarea=tarea)
     if proposito:
         f = {k: v for k, v in disp.items()
@@ -691,7 +1006,19 @@ def ranking(tarea, proposito=None, incluir_bloqueados=False):
         pts, nota = puntuar(pid, p, tarea)
         out.append({"pid": pid, "p": p, "pts": pts, "nota": nota})
     out.sort(key=lambda x: -x["pts"])
-    return [x for x in out if x["pts"] > 0]
+    out = [x for x in out if x["pts"] > 0]
+    if preferir:
+        # ``orq usar`` expresa una preferencia explicita. Conservamos el
+        # puntaje para el resto y solo adelantamos esa cuenta si es elegible.
+        out.sort(key=lambda x: x["pid"] != preferir)
+    else:
+        # Las cuentas fijadas con ``orq usar`` son la eleccion del usuario, no
+        # una mera variable para el CLI directo. Entre ellas se conserva el
+        # orden por capacidad/cupo; las hermanas de reserva quedan despues.
+        preferidas = set(activas().values())
+        if preferidas:
+            out.sort(key=lambda x: x["pid"] not in preferidas)
+    return out
 
 # ---------------- navegadores y terminales ----------------
 NAVEGADORES = [("firefox", "Firefox"), ("brave", "Brave"),
@@ -733,7 +1060,7 @@ def lanzar_login(pid, p, titulo=None):
     """Abre una terminal con el entorno listo para autenticar esa cuenta."""
     if not id_perfil_valido(pid):
         return False, "id de cuenta invalido"
-    if p.get("provider") not in ("claude", "gpt", "antigravity", "gemini"):
+    if p.get("provider") not in ("claude", "gpt", "antigravity", "gemini", "minimax"):
         return False, "proveedor no permitido"
     if not navegador_valido(p.get("navegador")):
         return False, "navegador no permitido"
@@ -785,6 +1112,11 @@ def escribir_entorno():
         if not p or not autenticado(pid, p):
             continue
         h = home_de(pid, p)
+        if prov == "minimax":
+            # exportar ANTHROPIC_BASE_URL aqui secuestraria la cuenta Claude
+            # real de todas las terminales. MiniMax se usa con 'minimax' o
+            # con 'orquse <id>' dentro de una sola terminal.
+            continue
         if prov == "claude":
             lineas += [f'export CLAUDE_CONFIG_DIR="{h}"']
         elif prov == "gpt":
@@ -799,7 +1131,7 @@ def escribir_entorno():
                 lineas.append(f'export GEMINI_API_KEY="$(cat "{k}" 2>/dev/null)"')
         lineas.append(f'export ORQ_{prov.upper()}_CUENTA="{pid}"')
     lineas.append("")
-    lineas.append(f'export ORQ_PERMISOS_TOTALES={"1" if c.get("_permisos_totales", True) else "0"}')
+    lineas.append(f'export ORQ_PERMISOS_TOTALES={"1" if c.get("_permisos_totales", False) else "0"}')
     lineas.append("")
     with bloqueo():
         os.makedirs(os.path.dirname(ENTORNO_SH), exist_ok=True)
@@ -922,18 +1254,40 @@ def generar_imagen(pid, p, prompt, destino=None, timeout=420):
     env = entorno(pid, p)
     cmd = comando(p, prompt)
     t0 = time.time()
+    proceso = None
+    scope = None
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           env=env, cwd=destino or BASE)
-        out, err, rc = r.stdout, r.stderr, r.returncode
+        if subprocess.run is not _SUBPROCESS_RUN_ORIGINAL:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                               env=env, cwd=destino or BASE)
+            out, err, rc = r.stdout, r.stderr, r.returncode
+        else:
+            cmd_aislado, scope = _scope_systemd(cmd)
+            proceso = subprocess.Popen(
+                cmd_aislado, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env=env, cwd=destino or BASE, start_new_session=True,
+            )
+            out, err = proceso.communicate(timeout=timeout)
+            rc = proceso.returncode
     except subprocess.TimeoutExpired as e:
-        out, err = e.stdout or "", e.stderr or ""
+        if proceso is not None:
+            _terminar_aislado(proceso, scope)
+            out, err = _salida_tras_interrupcion(proceso)
+        else:
+            out, err = e.stdout or "", e.stderr or ""
+        out = out or e.stdout or ""
+        err = err or e.stderr or ""
         if isinstance(out, bytes):
             out = out.decode(errors="replace")
         if isinstance(err, bytes):
             err = err.decode(errors="replace")
         err = (err.rstrip() + f"\ntimeout tras {timeout}s").strip()
         rc = 124
+    except KeyboardInterrupt:
+        if proceso is not None:
+            _terminar_aislado(proceso, scope)
+            _salida_tras_interrupcion(proceso)
+        raise
     except FileNotFoundError as e:
         out, err, rc = "", f"binario no encontrado: {e}", 127
     dur = round(time.time() - t0, 1)
@@ -1030,6 +1384,36 @@ def _lock_proveedor(prov):
     os.makedirs(os.path.dirname(ruta), exist_ok=True)
     return open(ruta, "a+")
 
+
+@contextlib.contextmanager
+def bloqueo_proyecto(carpeta):
+    """Un solo proyecto escritor por carpeta, incluso desde otras terminales."""
+    real = os.path.realpath(os.path.abspath(carpeta))
+    try:
+        repo = _SUBPROCESS_RUN_ORIGINAL(
+            ["git", "-C", real, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if repo.returncode == 0 and repo.stdout.strip():
+            real = os.path.realpath(repo.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    clave = hashlib.sha256(real.encode("utf-8", "surrogateescape")).hexdigest()
+    directorio = os.path.join(BASE, "state", "project-locks")
+    os.makedirs(directorio, exist_ok=True)
+    archivo = open(os.path.join(directorio, clave + ".lock"), "a+")
+    try:
+        try:
+            fcntl.flock(archivo, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"[orq] otro proyecto esta escribiendo en {real}; esperando su cierre…",
+                  file=sys.stderr, flush=True)
+            fcntl.flock(archivo, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(archivo, fcntl.LOCK_UN)
+        archivo.close()
+
 # ---------------- proyectos: un prompt, todas las IA ----------------
 ESQUEMA_PLAN = """Devuelve SOLO un JSON valido, sin markdown ni texto alrededor, con esta forma:
 {"nombre":"nombre-corto-en-kebab-case",
@@ -1060,28 +1444,19 @@ Reglas del plan (importantes, el trabajo se reparte entre varias IA en paralelo)
 
 
 def _reparar_plan(plan, n_cuentas):
-    """Si el plan salio como cadena lineal, lo reestructura para que haya paralelo."""
+    """Informa sobre un plan secuencial sin alterar dependencias semanticas."""
     tareas = plan.get("tareas") or []
     if len(tareas) < 3:
         return plan, None
     olas = _ordenar_por_olas(tareas)
     if max((len(o) for o in olas), default=0) > 1:
         return plan, None                     # ya tiene paralelo
-    # cadena lineal: la primera queda de cimientos y el resto cuelga de ella
-    base = tareas[0]["id"]
-    for t in tareas[1:]:
-        t["depende"] = [base]
-    # la ultima de tipo review vuelve a depender de todas (cierre)
-    for t in reversed(tareas[1:]):
-        if t.get("tipo") == "review":
-            t["depende"] = [x["id"] for x in tareas if x["id"] != t["id"]]
-            break
-    return plan, (f"el plan venia en cadena lineal; reestructurado a "
-                  f"{len(_ordenar_por_olas(tareas))} olas para repartirlo")
+    return plan, ("el plan es secuencial; se respetan sus dependencias para no "
+                  "ejecutar pruebas, migraciones o integracion antes de tiempo")
 
 
-def _mejor_para(tarea):
-    r = ranking(tarea)
+def _mejor_para(tarea, preferir=None):
+    r = ranking(tarea, preferir=preferir)
     return (r[0]["pid"], r[0]["p"]) if r else (None, None)
 
 
@@ -1101,22 +1476,142 @@ def _json_de(texto):
         return None
 
 
-def planificar(descripcion, carpeta, timeout=300):
+def validar_plan(plan):
+    """Valida el contrato del plan antes de crear hilos o tocar archivos."""
+    if not isinstance(plan, dict):
+        return None, "el plan no es un objeto JSON"
+    tareas = plan.get("tareas")
+    if not isinstance(tareas, list) or not tareas:
+        return None, "'tareas' debe ser una lista no vacia"
+    normalizadas = []
+    ids = set()
+    for indice, original in enumerate(tareas, 1):
+        if not isinstance(original, dict):
+            return None, f"tarea {indice}: debe ser un objeto"
+        t = dict(original)
+        for campo in ("id", "titulo", "instruccion"):
+            if not isinstance(t.get(campo), str) or not t[campo].strip():
+                return None, f"tarea {indice}: '{campo}' debe ser texto no vacio"
+            t[campo] = t[campo].strip()
+        if t["id"] in ids:
+            return None, f"id de tarea duplicado: {t['id']}"
+        ids.add(t["id"])
+        depende = t.get("depende", [])
+        if not isinstance(depende, list) or not all(
+                isinstance(x, str) and x.strip() for x in depende):
+            return None, f"tarea {t['id']}: 'depende' debe ser una lista de ids"
+        t["depende"] = [x.strip() for x in depende]
+        archivos = t.get("archivos", [])
+        if not isinstance(archivos, list) or not all(isinstance(x, str) for x in archivos):
+            return None, f"tarea {t['id']}: 'archivos' debe ser una lista de rutas"
+        rutas = []
+        for ruta in archivos:
+            limpia = os.path.normpath(ruta.strip()).replace("\\", "/")
+            if (not ruta.strip() or os.path.isabs(ruta) or limpia == ".."
+                    or limpia.startswith("../")):
+                return None, f"tarea {t['id']}: ruta fuera del proyecto: {ruta!r}"
+            rutas.append(limpia)
+        t["archivos"] = rutas
+        tipo = t.get("tipo", "code")
+        if tipo not in TAREAS:
+            return None, f"tarea {t['id']}: tipo desconocido '{tipo}'"
+        t["tipo"] = tipo
+        if tipo not in {"reasoning", "research"} and not rutas:
+            return None, (f"tarea {t['id']}: una tarea escritora debe declarar "
+                          "al menos una ruta en 'archivos'")
+        normalizadas.append(t)
+    for t in normalizadas:
+        desconocidas = [x for x in t["depende"] if x not in ids]
+        if desconocidas:
+            return None, (f"tarea {t['id']}: dependencias desconocidas: "
+                          + ", ".join(desconocidas))
+        if t["id"] in t["depende"]:
+            return None, f"tarea {t['id']}: no puede depender de si misma"
+
+    # Detectar ciclos antes del ejecutor; de otro modo terminarian como un
+    # conjunto generico de bloqueos y ocultarian el defecto del planificador.
+    deps = {t["id"]: set(t["depende"]) for t in normalizadas}
+    pendientes, hechas = dict(deps), set()
+    while pendientes:
+        listas = [pid for pid, ds in pendientes.items() if ds <= hechas]
+        if not listas:
+            return None, "el plan contiene un ciclo de dependencias"
+        for pid in listas:
+            hechas.add(pid)
+            pendientes.pop(pid)
+
+    # Dos tareas que pueden correr a la vez nunca deben declarar el mismo
+    # archivo. Si existe una dependencia transitiva entre ellas, el orden las
+    # hace seguras; de lo contrario el plan se rechaza antes de crear hilos.
+    transitivas = {}
+    for tid in deps:
+        vistas, pila = set(), list(deps[tid])
+        while pila:
+            dep = pila.pop()
+            if dep in vistas:
+                continue
+            vistas.add(dep)
+            pila.extend(deps.get(dep, ()))
+        transitivas[tid] = vistas
+    for indice, primera in enumerate(normalizadas):
+        for segunda in normalizadas[indice + 1:]:
+            solape = sorted(set(primera["archivos"]) & set(segunda["archivos"]))
+            ordenadas = (
+                primera["id"] in transitivas[segunda["id"]]
+                or segunda["id"] in transitivas[primera["id"]]
+            )
+            if solape and not ordenadas:
+                return None, (
+                    f"tareas {primera['id']} y {segunda['id']} pueden correr en "
+                    f"paralelo y comparten archivos: {', '.join(solape)}"
+                )
+
+    limpio = dict(plan)
+    limpio["tareas"] = normalizadas
+    return limpio, None
+
+
+def planificar(descripcion, carpeta, timeout=300, preferir=None):
     """Fase 0: la cuenta mas fuerte en 'agentic' propone el plan."""
-    pid, p = _mejor_para("agentic")
-    if not pid:
+    pid_inicial, perfil_inicial = _mejor_para("agentic", preferir)
+    if not pid_inicial:
         return None, "no hay ninguna cuenta disponible para planificar"
+    candidatos = [{"pid": pid_inicial, "p": perfil_inicial}]
+    candidatos += [
+        x for x in ranking("agentic", preferir=preferir)
+        if x["pid"] != pid_inicial
+    ]
     prompt = (f"Eres el arquitecto de un proyecto que se construira en la carpeta "
               f"{carpeta}. El encargo es:\n\n{descripcion}\n\n{ESQUEMA_PLAN}")
-    r = correr(pid, p, prompt, "agentic", timeout)
-    plan = _json_de(r["texto"])
-    if not plan or not plan.get("tareas"):
-        return None, f"{pid} no devolvio un plan valido: {(r['texto'] or '')[:180]}"
-    plan["_planificador"] = pid
-    plan["_tokens_plan"] = r["tokens"]
-    plan, aviso = _reparar_plan(plan, len(disponibles()))
-    plan["_aviso"] = aviso
-    return plan, None
+    errores = []
+    tokens = 0
+    for indice, candidato in enumerate(candidatos):
+        pid, p = candidato["pid"], candidato["p"]
+        intento = prompt
+        if errores:
+            intento += (
+                "\n\nRELEVO DE PLANIFICACION: otra cuenta no pudo producir un plan "
+                "valido. Genera tu propio JSON a partir del encargo original; no "
+                "edites archivos todavia. Fallos anteriores: " + " | ".join(errores[-3:])
+            )
+        r = correr(pid, p, intento, "agentic", timeout, carpeta=carpeta,
+                   solo_lectura=True)
+        tokens += r.get("tokens", 0)
+        plan = _json_de(r.get("texto")) if r.get("rc") == 0 else None
+        if not plan:
+            errores.append(f"{pid}: {(r.get('texto') or 'sin plan')[:180]}")
+            continue
+        plan, error_plan = validar_plan(plan)
+        if error_plan:
+            errores.append(f"{pid}: {error_plan}")
+            continue
+        plan["_planificador"] = pid
+        plan["_tokens_plan"] = tokens
+        plan["_relevos_plan"] = indice
+        plan, aviso = _reparar_plan(plan, len(disponibles()))
+        plan["_aviso"] = aviso
+        return plan, None
+    return None, "ninguna cuenta produjo un plan valido: " + " | ".join(errores)
 
 
 def _ordenar_por_olas(tareas):
@@ -1134,7 +1629,7 @@ def _ordenar_por_olas(tareas):
     return olas
 
 
-def deliberar(plan, encargo, timeout=240):
+def deliberar(plan, encargo, timeout=240, preferir=None):
     """Las IA opinan sobre quien debe hacer que, antes de gastar en construir.
 
     Si coinciden en que conviene hacerlo con una sola cuenta, se hace asi.
@@ -1159,10 +1654,13 @@ def deliberar(plan, encargo, timeout=240):
                       f"{', '.join(k for k, _ in fuerte)}; {resto}")
     prompt = DELIBERAR.format(encargo=encargo[:600], plan=resumen_plan,
                               cuentas="\n".join(fichas))
-    votantes = list(votantes_disp.items())[:3]
+    votantes = sorted(
+        votantes_disp.items(), key=lambda kv: kv[0] != preferir
+    )[:3]
     with ThreadPoolExecutor(max_workers=len(votantes)) as ex:
         votos = list(ex.map(lambda kv: (kv[0], correr(kv[0], kv[1], prompt,
-                                                      "reasoning", timeout)),
+                                                      "reasoning", timeout,
+                                                      solo_lectura=True)),
                             votantes))
     props, solos = [], 0
     for pid, r in votos:
@@ -1177,7 +1675,7 @@ def deliberar(plan, encargo, timeout=240):
         return None, "nadie devolvio una asignacion valida; sigo con el router"
     if solos > len(props) / 2:
         # mayoria dice que es mejor una sola cuenta: la mas capaz con cuota
-        rk = ranking("agentic")
+        rk = ranking("agentic", preferir=preferir)
         elegida = rk[0]["pid"] if rk else None
         return ({t["id"]: elegida for t in plan["tareas"]},
                 f"{solos} de {len(props)} coinciden en hacerlo con una sola cuenta ({elegida})")
@@ -1199,34 +1697,85 @@ def deliberar(plan, encargo, timeout=240):
 
 
 def ejecutar_proyecto(plan, carpeta, timeout=600, callback=None,
-                      asignacion=None, contexto_terminal=""):
+                      asignacion=None, contexto_terminal="", preferir=None):
     """Ejecucion progresiva: cada tarea arranca en cuanto sus dependencias
-    terminan, no cuando termina la 'ola' entera. Todas ven el estado vivo."""
+    terminan con exito. Un fallo nunca libera trabajo dependiente."""
     os.makedirs(carpeta, exist_ok=True)
     pz = Pizarra(carpeta, plan, contexto_terminal)
     pendientes = {t["id"]: t for t in plan["tareas"]}
-    hechas, resultados = set(), []
+    ids_plan = set(pendientes)
+    hechas, fallidas, resultados = set(), set(), []
     ocupadas = set()
     futuros = {}
+    intentos_por_tarea = {t["id"]: [] for t in plan["tareas"]}
+    relevos_por_tarea = {t["id"]: [] for t in plan["tareas"]}
 
     def preparar(t):
         tipo = t.get("tipo", "code")
         if tipo not in TAREAS:
             tipo = "code"
+        # Un escritor tiene acceso total al repo. Se ejecuta en exclusiva aun
+        # cuando declare archivos distintos, porque herramientas auxiliares y
+        # formatters pueden tocar rutas que el planificador no anticipo. Las
+        # tareas puramente lectoras si pueden compartir una ola.
+        lectores = {"reasoning", "research"}
+        hay_escritor = any(
+            (meta[0].get("tipo") if meta[0].get("tipo") in TAREAS else "code")
+            not in lectores for meta in futuros.values()
+        )
+        if futuros and (tipo not in lectores or hay_escritor):
+            return None, None, tipo, "ocupadas"
         pid = (asignacion or {}).get(t["id"])
         p = cfg().get("profiles", {}).get(pid) if pid else None
-        if (not pid or not p or not admite_tarea(p, tipo)
-                or not autenticado(pid, p) or bloqueado(pid)):
-            r = ranking(tipo)
-            libre = next((x for x in r if x["pid"] not in ocupadas), r[0] if r else None)
+        usadas = set(intentos_por_tarea[t["id"]])
+        asignada_valida = (pid and p and admite_tarea(p, tipo)
+                           and autenticado(pid, p) and not bloqueado(pid)
+                           and pid not in usadas)
+        if asignada_valida:
+            if pid in ocupadas:
+                return None, None, tipo, "ocupadas"
+            return pid, p, tipo, None
+        if not asignada_valida:
+            r = ranking(tipo, preferir=preferir)
+            nuevas = [x for x in r if x["pid"] not in usadas]
+            libre = next((x for x in nuevas if x["pid"] not in ocupadas), None)
             if not libre:
-                return None, None, tipo
+                return None, None, tipo, (
+                    "ocupadas" if nuevas else "sin otra cuenta disponible para el relevo"
+                )
             pid, p = libre["pid"], libre["p"]
-        return pid, p, tipo
+        return pid, p, tipo, None
+
+    def registrar_fallo(t, motivo, rc=125, pid="sin-cuenta", tipo=None):
+        tipo = tipo or t.get("tipo", "code")
+        texto = f"[ERROR rc={rc}] {motivo}"
+        r = {"id": t["id"], "titulo": t["titulo"], "perfil": pid,
+             "tipo": tipo, "rc": rc, "tokens": 0, "seg": 0.0,
+             "texto": texto, "run_id": None, "estado": "bloqueado"}
+        pendientes.pop(t["id"], None)
+        fallidas.add(t["id"])
+        pz.fallar(t, pid, texto)
+        resultados.append(r)
+        if callback:
+            callback("termina", r)
 
     def instruccion(t, pid):
-        estado = pz.foto()
+        estado = pz.foto(excluir_id=t["id"])
         arch = pz.archivos_reales()
+        relevos = relevos_por_tarea[t["id"]]
+        entrega = ""
+        if relevos:
+            detalle = "\n".join(
+                f"- {x['perfil']}: rc={x['rc']}, {x['seg']}s, "
+                f"sesion={x.get('session_id') or 'n/a'}; {x['texto'][:180]}"
+                for x in relevos[-6:]
+            )
+            entrega = (
+                "\nRELEVO CONTROLADO: los procesos anteriores ya terminaron. "
+                "No empieces de cero: inspecciona `git status`, `git diff`, los "
+                "archivos reales y las pruebas antes de continuar. Conserva lo "
+                f"correcto y repara lo incompleto.\n{detalle}\n"
+            )
         return (
             f"Proyecto: {plan.get('nombre','proyecto')} — {plan.get('resumen','')}\n"
             f"Carpeta: {carpeta}\n"
@@ -1237,28 +1786,49 @@ def ejecutar_proyecto(plan, carpeta, timeout=600, callback=None,
                if t.get("archivos") else "")
             + f"\nReglas: escribe dentro de {carpeta}. Integra con lo ya hecho en vez "
               f"de duplicarlo. No toques lo que otra IA tiene en curso. "
+              f"No ejecutes git commit ni git push: Orquesta publica al final "
+              f"solo despues de verificar y escanear secretos. "
               f"Calidad de produccion, no un esqueleto. "
-              f"Al terminar responde en UNA linea: que archivos creaste o cambiaste.")
+              f"Al terminar responde en UNA linea: que archivos creaste o cambiaste."
+            + entrega)
 
     with ThreadPoolExecutor(max_workers=max(2, len(disponibles()))) as ex:
         while pendientes or futuros:
-            # lanzar todo lo que ya se pueda
+            # Propagar fallos o dependencias inexistentes antes de lanzar nada.
+            for t in list(pendientes.values()):
+                deps = set(t.get("depende") or [])
+                rotas = sorted((deps - ids_plan) | (deps & fallidas))
+                if rotas:
+                    registrar_fallo(
+                        t, "dependencia fallida o inexistente: " + ", ".join(rotas)
+                    )
+
             listas = [t for t in pendientes.values()
                       if all(d in hechas for d in (t.get("depende") or []))]
-            if not listas and not futuros:          # dependencia rota: desbloquea
-                listas = list(pendientes.values())
+            lanzada = False
             for t in listas:
-                pid, p, tipo = preparar(t)
+                pid, p, tipo, motivo = preparar(t)
                 if not pid:
+                    # Si solo estan ocupadas, se reevalua al acabar un futuro.
+                    if motivo == "ocupadas" and futuros:
+                        continue
+                    registrar_fallo(t, motivo or "sin cuenta disponible", 127,
+                                    tipo=tipo)
                     continue
                 pendientes.pop(t["id"], None)
                 ocupadas.add(pid)
+                intentos_por_tarea[t["id"]].append(pid)
+                lanzada = True
                 pz.empezar(t, pid)
                 if callback:
                     callback("empieza", {"titulo": t["titulo"], "perfil": pid, "tipo": tipo})
                 fut = ex.submit(correr, pid, p, instruccion(t, pid), tipo, timeout, carpeta)
                 futuros[fut] = (t, pid)
             if not futuros:
+                # No hay tarea ejecutable: el resto forma un ciclo o depende de
+                # algo que nunca podra completarse. Antes se ejecutaba a la fuerza.
+                for t in list(pendientes.values()):
+                    registrar_fallo(t, "ciclo o dependencias no satisfechas")
                 break
             # integrar en cuanto CUALQUIERA termine
             done, _ = wait(list(futuros), return_when=FIRST_COMPLETED)
@@ -1270,25 +1840,57 @@ def ejecutar_proyecto(plan, carpeta, timeout=600, callback=None,
                     r = {"texto": f"[ERROR] {e}", "tokens": 0, "seg": 0, "rc": 1,
                          "run_id": f"{pid}-error"}
                 ocupadas.discard(pid)
-                hechas.add(t["id"])
-                pz.terminar(t, pid, r.get("texto"))
+                if r.get("rc") == 0:
+                    hechas.add(t["id"])
+                    pz.terminar(t, pid, r.get("texto"))
+                else:
+                    tipo = t.get("tipo") if t.get("tipo") in TAREAS else "code"
+                    disponibles_relevo = [
+                        x for x in ranking(tipo, preferir=preferir)
+                        if x["pid"] not in set(intentos_por_tarea[t["id"]])
+                    ]
+                    if disponibles_relevo:
+                        pendientes[t["id"]] = t
+                        pz.relevar(t, pid, r.get("texto"))
+                    else:
+                        fallidas.add(t["id"])
+                        pz.fallar(t, pid, r.get("texto"))
                 res = {"id": t["id"], "titulo": t["titulo"], "perfil": pid,
-                       "tipo": t.get("tipo"), "rc": r["rc"], "tokens": r["tokens"],
-                       "seg": r["seg"], "texto": (r["texto"] or "")[:400],
-                       "run_id": r.get("run_id")}
+                       "tipo": t.get("tipo"), "rc": r.get("rc", 1),
+                       "tokens": r.get("tokens", 0), "seg": r.get("seg", 0),
+                       "texto": (r.get("texto") or "")[:400],
+                       "run_id": r.get("run_id"),
+                       "session_id": r.get("session_id")}
+                if r.get("rc") != 0 and disponibles_relevo:
+                    res["estado"] = "relevado"
+                    res["relevado"] = True
+                    relevos_por_tarea[t["id"]].append(res)
                 resultados.append(res)
                 if callback:
                     callback("termina", res)
     return resultados
 
 
-def integrar_proyecto(plan, carpeta, resultados, timeout=600):
+def integrar_proyecto(plan, carpeta, resultados, timeout=600, preferir=None):
     """Fase final: alguien revisa la carpeta entera y la deja conectada."""
-    pid, p = _mejor_para("review")
+    pid, p = _mejor_para("review", preferir)
     if not pid:
         return None
-    hecho = "\n".join(f"- [{r['perfil']}] {r['titulo']}: {r['texto'][:120]}"
-                       for r in resultados)
+    lineas = []
+    presupuesto = 14000
+    for r in resultados[-30:]:
+        hallazgos = r.get("hallazgos")
+        if isinstance(hallazgos, list) and hallazgos:
+            detalle = "HALLAZGOS: " + " | ".join(
+                str(x).replace("\n", " ")[:700] for x in hallazgos[:8]
+            )
+        else:
+            detalle = (r.get("texto") or "").replace("\n", " ")[:500]
+        linea = f"- [{r.get('perfil', '?')}] {r.get('titulo', 'fase')}: {detalle}"
+        if sum(len(x) + 1 for x in lineas) + len(linea) > presupuesto:
+            break
+        lineas.append(linea)
+    hecho = "\n".join(lineas)
     prompt = (
         f"Revisa la carpeta {carpeta} del proyecto '{plan.get('nombre')}'.\n"
         f"Lo que hizo cada IA:\n{hecho}\n\n"
@@ -1297,7 +1899,326 @@ def integrar_proyecto(plan, carpeta, resultados, timeout=600):
         f"distintos autores, elimina duplicados y archivos sueltos que no encajen, "
         f"y escribe o corrige el README.md con que es, como se instala y como se usa. "
         f"No reescribas lo que ya funciona. Responde en 5 lineas: que arreglaste.")
-    return correr(pid, p, prompt, "review", timeout)
+    r = correr(pid, p, prompt, "review", timeout, carpeta=carpeta)
+    if r.get("rc") == 0:
+        return r
+    usados = {pid}
+    for candidato in ranking("review", preferir=preferir):
+        if candidato["pid"] in usados:
+            continue
+        usados.add(candidato["pid"])
+        relevo = (
+            prompt + "\n\nRELEVO CONTROLADO: el integrador anterior termino con "
+            f"rc={r.get('rc')} y ya no esta escribiendo. Audita el estado real y "
+            "continua la integracion sin deshacer cambios correctos."
+        )
+        r = correr(candidato["pid"], candidato["p"], relevo, "review",
+                   timeout, carpeta=carpeta)
+        if r.get("rc") == 0:
+            return r
+    return r
+
+
+def _argv_verificacion(comando):
+    """Convierte una comprobacion propuesta por una IA en argv permitido.
+
+    Nunca se usa un shell. La lista es deliberadamente estrecha: permite
+    pruebas, linters, compilacion y consultas Git, pero no gestores de paquetes,
+    red, redirecciones ni comandos arbitrarios disfrazados de verificacion.
+    """
+    if not isinstance(comando, str) or not comando.strip() or len(comando) > 600:
+        return None
+    if "\n" in comando or "\r" in comando:
+        return None
+    try:
+        argv = shlex.split(comando)
+    except ValueError:
+        return None
+    if not argv or len(argv) > 48 or "/" in argv[0] or "\\" in argv[0]:
+        return None
+    base = os.path.basename(argv[0])
+    args = argv[1:]
+
+    permitido = False
+    if base == "git":
+        permitido = (
+            args in (["diff", "--check"],
+                     ["diff", "--cached", "--check"],
+                     ["diff", "--check", "--cached"])
+            or (args[:1] == ["status"] and all(
+                x in {"--porcelain", "--short", "--branch", "-sb"}
+                for x in args[1:]))
+            or args == ["rev-parse", "--is-inside-work-tree"]
+            or args[:1] == ["ls-files"]
+        )
+    elif base in {"python", "python3"}:
+        permitido = len(args) >= 2 and args[0] == "-m" and args[1] in {
+            "unittest", "pytest", "compileall", "py_compile", "ruff", "mypy"
+        }
+    elif base in {"pytest", "py.test", "ruff", "mypy", "eslint"}:
+        permitido = True
+    elif base == "node":
+        permitido = bool(args) and args[0] == "--check"
+    elif base in {"bash", "sh"}:
+        permitido = bool(args) and args[0] == "-n"
+    elif base in {"npm", "pnpm", "yarn"}:
+        permitido = args[:1] == ["test"] or (
+            len(args) >= 2 and args[0] == "run"
+            and args[1] in {"test", "lint", "check", "build", "typecheck"}
+        )
+    elif base == "cargo":
+        permitido = bool(args) and args[0] in {"test", "check", "clippy", "fmt"}
+    elif base == "go":
+        permitido = bool(args) and args[0] in {"test", "vet"}
+    elif base == "make":
+        permitido = bool(args) and all(
+            not x.startswith("-") and x in {"test", "check", "lint", "build"}
+            for x in args
+        )
+    elif base == "tsc":
+        permitido = not args or "--noEmit" in args
+    elif base == "systemd-analyze":
+        permitido = "verify" in args and "security" not in args
+    return argv if permitido else None
+
+
+def ejecutar_comando_verificacion(comando, carpeta, timeout=600):
+    """Ejecuta una comprobacion permitida y devuelve evidencia propia."""
+    argv = _argv_verificacion(comando)
+    if argv is None:
+        return {"comando": str(comando)[:160], "rc": 126,
+                "resultado": "comando no permitido por la politica de verificacion"}
+    if not shutil.which(argv[0]):
+        return {"comando": comando, "rc": 127,
+                "resultado": "binario de verificacion no disponible"}
+    limite = max(5, min(900, int(timeout or 600)))
+    proceso = None
+    scope = None
+    try:
+        aislado, scope = _scope_systemd(argv)
+        proceso = subprocess.Popen(
+            aislado, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=carpeta, start_new_session=True,
+        )
+        out, err = proceso.communicate(timeout=limite)
+        rc = proceso.returncode
+    except subprocess.TimeoutExpired as e:
+        if proceso is not None:
+            _terminar_aislado(proceso, scope)
+            recogida = _salida_tras_interrupcion(proceso)
+            out, err = recogida if recogida else (e.stdout or "", e.stderr or "")
+        else:
+            out, err = e.stdout or "", e.stderr or ""
+        rc = 124
+    except (OSError, subprocess.SubprocessError) as e:
+        out, err, rc = "", str(e), 127
+    salida = ((out or "") + ("\n" if out and err else "") + (err or "")).strip()
+    if rc == 124:
+        salida = (salida + f"\ntimeout tras {limite}s").strip()
+    return {"comando": " ".join(shlex.quote(x) for x in argv), "rc": int(rc),
+            "resultado": salida[-1600:] or ("sin salida" if rc == 0 else "fallo sin salida")}
+
+
+def verificar_proyecto(plan, carpeta, resultados, timeout=600, preferir=None):
+    """Verificacion final independiente, con pruebas reales y salida estructurada."""
+    candidatos = ranking("review", preferir=preferir)
+    if not candidatos:
+        return {"perfil": "sin-cuenta", "texto": "[ERROR] sin verificador disponible",
+                "tokens": 0, "seg": 0.0, "rc": 127,
+                "verificacion_ok": False, "comprobaciones": [], "hallazgos": []}
+    historial = "\n".join(
+        f"- [{x.get('perfil', '?')}] {x.get('titulo', 'fase')}: "
+        f"{(x.get('texto') or '')[:180]}" for x in resultados[-20:]
+    )
+    base = (
+        f"VERIFICACION FINAL DE SOLO LECTURA del proyecto en {carpeta}.\n"
+        f"Encargo: {plan.get('resumen', '')}\nHistorial de trabajo:\n{historial}\n\n"
+        "No edites archivos. Inspecciona el repositorio y ejecuta de verdad las "
+        "pruebas, linters, compilacion o smoke tests apropiados. Incluye siempre "
+        "al menos una comprobacion objetiva (por ejemplo tests o git diff --check). "
+        "No declares ok si un requisito sigue incompleto o un comando falla.\n"
+        "Devuelve SOLO JSON valido: "
+        '{"ok":true,"comprobaciones":[{"comando":"...","rc":0,'
+        '"resultado":"resumen"}],"hallazgos":[]}'
+    )
+    errores = []
+    ultimo = None
+    for candidato in candidatos:
+        prompt = base
+        if errores:
+            prompt += ("\n\nOtro verificador no entrego evidencia valida: "
+                       + " | ".join(errores[-3:]))
+        ultimo = correr(candidato["pid"], candidato["p"], prompt, "review",
+                        timeout, carpeta=carpeta, solo_lectura=True)
+        if ultimo.get("rc") != 0:
+            errores.append(f"{candidato['pid']}: rc={ultimo.get('rc')}")
+            continue
+        dato = _json_de(ultimo.get("texto"))
+        comprobaciones = dato.get("comprobaciones") if isinstance(dato, dict) else None
+        hallazgos = dato.get("hallazgos") if isinstance(dato, dict) else None
+        valido = (
+            isinstance(dato, dict)
+            and isinstance(dato.get("ok"), bool)
+            and isinstance(comprobaciones, list) and bool(comprobaciones)
+            and len(comprobaciones) <= 8
+            and all(isinstance(x, dict) and isinstance(x.get("comando"), str)
+                    for x in comprobaciones)
+            and isinstance(hallazgos, list)
+        )
+        if not valido:
+            errores.append(f"{candidato['pid']}: evidencia JSON invalida")
+            continue
+        if any(_argv_verificacion(x["comando"]) is None for x in comprobaciones):
+            errores.append(f"{candidato['pid']}: propuso una comprobacion no permitida")
+            continue
+        comprobaciones_reales = [
+            ejecutar_comando_verificacion(x["comando"], carpeta, timeout)
+            for x in comprobaciones
+        ]
+        hallazgos_reales = list(hallazgos)
+        for prueba in comprobaciones_reales:
+            if prueba["rc"] != 0:
+                hallazgos_reales.append(
+                    f"fallo real rc={prueba['rc']}: {prueba['comando']}"
+                )
+        ultimo["verificacion_ok"] = bool(
+            dato["ok"] and all(x["rc"] == 0 for x in comprobaciones_reales)
+            and not hallazgos_reales
+        )
+        ultimo["comprobaciones"] = comprobaciones_reales
+        ultimo["hallazgos"] = hallazgos_reales
+        return ultimo
+    ultimo = ultimo or {"perfil": "sin-cuenta", "tokens": 0, "seg": 0.0}
+    ultimo["rc"] = ultimo.get("rc") or 1
+    ultimo["texto"] = "[ERROR verificacion] " + " | ".join(errores)
+    ultimo["verificacion_ok"] = False
+    ultimo["comprobaciones"] = []
+    ultimo["hallazgos"] = errores
+    return ultimo
+
+
+def _git(carpeta, *args, timeout=120):
+    """Git sin shell; nunca incorpora stdout de error a mensajes publicos."""
+    try:
+        return _SUBPROCESS_RUN_ORIGINAL(
+            ["git", *args], cwd=carpeta, capture_output=True, text=True,
+            timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def publicar_repo(carpeta, mensaje="chore: cambios verificados por Orquesta IA"):
+    """Escanea, confirma y publica un repo sin permitir credenciales.
+
+    Se revisan el arbol completo, los blobs staged y cualquier commit local que
+    aun no exista en el remoto. Nunca se hace force-push ni merge automatico.
+    """
+    carpeta = os.path.realpath(os.path.abspath(os.path.expanduser(carpeta)))
+    raiz_r = _git(carpeta, "rev-parse", "--show-toplevel")
+    if not raiz_r or raiz_r.returncode != 0:
+        return {"ok": False, "fase": "git", "detalle": "la carpeta no es un repositorio Git"}
+    raiz = os.path.realpath(raiz_r.stdout.strip())
+    rama_r = _git(raiz, "symbolic-ref", "--quiet", "--short", "HEAD")
+    if not rama_r or rama_r.returncode != 0 or not rama_r.stdout.strip():
+        return {"ok": False, "fase": "git", "detalle": "HEAD esta separado de una rama"}
+    rama = rama_r.stdout.strip()
+    remoto_r = _git(raiz, "remote", "get-url", "origin")
+    if not remoto_r or remoto_r.returncode != 0:
+        return {"ok": False, "fase": "git", "detalle": "falta el remoto origin"}
+    remoto = remoto_r.stdout.strip()
+    if re.match(r"^[a-z][a-z0-9+.-]*://[^/@\s]+@", remoto, re.I):
+        return {"ok": False, "fase": "seguridad",
+                "detalle": "origin contiene credenciales; usa SSH o un credential helper"}
+
+    fetch = _git(raiz, "fetch", "--quiet", "origin", timeout=180)
+    if not fetch or fetch.returncode != 0:
+        return {"ok": False, "fase": "fetch", "detalle": "no pude actualizar origin"}
+    ref_remota = f"refs/remotes/origin/{rama}"
+    existe = _git(raiz, "show-ref", "--verify", "--quiet", ref_remota)
+    commits_locales = []
+    if existe and existe.returncode == 0:
+        cuenta = _git(raiz, "rev-list", "--left-right", "--count",
+                      f"HEAD...origin/{rama}")
+        if not cuenta or cuenta.returncode != 0:
+            return {"ok": False, "fase": "git", "detalle": "no pude comparar con origin"}
+        try:
+            delante, detras = (int(x) for x in cuenta.stdout.split())
+        except (ValueError, TypeError):
+            return {"ok": False, "fase": "git", "detalle": "comparacion remota invalida"}
+        if detras:
+            return {"ok": False, "fase": "sincronizacion",
+                    "detalle": "origin tiene cambios nuevos; integra antes de publicar"}
+        if delante:
+            lista = _git(raiz, "rev-list", f"origin/{rama}..HEAD")
+            if not lista or lista.returncode != 0:
+                return {"ok": False, "fase": "git", "detalle": "no pude auditar commits locales"}
+            commits_locales = [x for x in lista.stdout.splitlines() if x]
+
+    scanner = os.path.join(BASE, "tools", "scan-secretos.sh")
+    if not os.path.isfile(scanner):
+        return {"ok": False, "fase": "seguridad", "detalle": "falta el escaner de secretos"}
+
+    def escanear(*opciones):
+        try:
+            return _SUBPROCESS_RUN_ORIGINAL(
+                ["bash", scanner, *opciones, "--repo", raiz],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                timeout=180, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    for commit in commits_locales:
+        revisado = escanear("--commit", commit)
+        if not revisado or revisado.returncode != 0:
+            return {"ok": False, "fase": "seguridad",
+                    "detalle": "un commit local no supero el escaneo de secretos"}
+    completo = escanear("--todo")
+    if not completo or completo.returncode != 0:
+        return {"ok": False, "fase": "seguridad",
+                "detalle": "el arbol de trabajo no supero el escaneo de secretos"}
+
+    add = _git(raiz, "add", "-A")
+    if not add or add.returncode != 0:
+        return {"ok": False, "fase": "stage", "detalle": "git add fallo"}
+    staged = escanear("--staged")
+    if not staged or staged.returncode != 0:
+        return {"ok": False, "fase": "seguridad",
+                "detalle": "el indice no supero el escaneo de secretos"}
+
+    hay_stage = _git(raiz, "diff", "--cached", "--quiet")
+    creado = False
+    if hay_stage is None:
+        return {"ok": False, "fase": "git", "detalle": "no pude leer el indice"}
+    if hay_stage.returncode == 1:
+        commit = _git(raiz, "commit", "-m", str(mensaje)[:200], timeout=180)
+        if not commit or commit.returncode != 0:
+            return {"ok": False, "fase": "commit", "detalle": "git commit fallo"}
+        creado = True
+        ultimo = _git(raiz, "rev-parse", "HEAD")
+        if not ultimo or ultimo.returncode != 0:
+            return {"ok": False, "fase": "git", "detalle": "no pude verificar el commit"}
+        revisado = escanear("--commit", ultimo.stdout.strip())
+        if not revisado or revisado.returncode != 0:
+            return {"ok": False, "fase": "seguridad",
+                    "detalle": "el commit nuevo no supero el escaneo"}
+    elif hay_stage.returncode != 0:
+        return {"ok": False, "fase": "git", "detalle": "estado del indice invalido"}
+
+    push_args = ["push"]
+    if not existe or existe.returncode != 0:
+        push_args += ["--set-upstream", "origin", rama]
+    else:
+        push_args += ["origin", rama]
+    push = _git(raiz, *push_args, timeout=300)
+    if not push or push.returncode != 0:
+        return {"ok": False, "fase": "push",
+                "detalle": "el commit es local y seguro, pero git push fallo"}
+    head = _git(raiz, "rev-parse", "--short", "HEAD")
+    return {"ok": True, "fase": "listo", "detalle": "publicado sin secretos",
+            "commit": head.stdout.strip() if head and head.returncode == 0 else "",
+            "creado": creado, "raiz": raiz}
 
 # ---------------- USO REAL (todas las sesiones, no solo las de Orquesta) ----------------
 # El ledger de Orquesta solo ve lo que Orquesta gasta. Pero tus sesiones
@@ -1521,7 +2442,8 @@ def plan_claude(pid, p):
         if not ruta or not os.path.exists(ruta):
             continue
         try:
-            d = json.load(open(ruta))
+            with open(ruta) as archivo:
+                d = json.load(archivo)
         except Exception:
             continue
         oa = d.get("oauthAccount") or {}
@@ -1531,7 +2453,8 @@ def plan_claude(pid, p):
             return {"tier": t, "nombre": nom, "multiplicador": mult,
                     "correo": oa.get("emailAddress")}
     try:
-        cr = json.load(open(os.path.join(home_de(pid, p), ".credentials.json")))
+        with open(os.path.join(home_de(pid, p), ".credentials.json")) as archivo:
+            cr = json.load(archivo)
         t = (cr.get("claudeAiOauth") or {}).get("rateLimitTier")
         if t:
             nom, mult = TIER_CLAUDE.get(t, (t, 1))
@@ -1664,6 +2587,7 @@ class Pizarra:
         self.plan = plan
         self.ctx_term = contexto_terminal
         self.hechas = []          # [{id,titulo,perfil,resumen,archivos}]
+        self.fallidas = []        # no se presentan a dependientes como terminadas
         self.en_curso = {}        # id -> {titulo, perfil, desde}
         self.lock = threading.Lock()
 
@@ -1679,7 +2603,18 @@ class Pizarra:
                                 "perfil": perfil, "resumen": (resumen or "")[:300],
                                 "archivos": archivos or t.get("archivos") or []})
 
-    def foto(self):
+    def fallar(self, t, perfil, resumen):
+        with self.lock:
+            self.en_curso.pop(t["id"], None)
+            self.fallidas.append({"id": t["id"], "titulo": t["titulo"],
+                                  "perfil": perfil, "resumen": (resumen or "")[:300]})
+
+    def relevar(self, t, perfil, resumen):
+        """Cierra el escritor fallido sin declarar fallida la tarea recuperable."""
+        with self.lock:
+            self.en_curso.pop(t["id"], None)
+
+    def foto(self, excluir_id=None):
         """Texto que se inyecta a quien esta trabajando ahora mismo."""
         with self.lock:
             partes = []
@@ -1691,10 +2626,16 @@ class Pizarra:
                                          + (f" -> {', '.join(h['archivos'])}" if h["archivos"] else "")
                                          + (f": {h['resumen'][:160]}" if h["resumen"] else "")
                                          for h in self.hechas))
-            if self.en_curso:
+            if self.fallidas:
+                partes.append("FALLIDO O BLOQUEADO (no lo des por terminado):\n" +
+                              "\n".join(f"- [{h['perfil']}] {h['titulo']}: "
+                                        f"{h['resumen'][:160]}"
+                                        for h in self.fallidas))
+            en_curso = {k: v for k, v in self.en_curso.items() if k != excluir_id}
+            if en_curso:
                 partes.append("EN CURSO AHORA MISMO por otra IA (NO toques esos archivos):\n" +
                               "\n".join(f"- [{v['perfil']}] {v['titulo']}"
-                                         for v in self.en_curso.values()))
+                                         for v in en_curso.values()))
             return "\n\n".join(partes)
 
     def archivos_reales(self):
@@ -1725,19 +2666,19 @@ Criterios:
 - Respeta que una cuenta con poca cuota restante reciba menos carga."""
 
 # ---------------- AUDITORIA CRUZADA SOBRE ARCHIVOS REALES ----------------
-def _mas_potentes(n=3, tarea="review"):
+def _mas_potentes(n=3, tarea="review", preferir=None):
     """Las cuentas mas capaces con cuota, para que se auditen entre ellas."""
-    return ranking(tarea)[:n]
+    return ranking(tarea, preferir=preferir)[:n]
 
 
 def auditar_proyecto(plan, carpeta, resultados, timeout=600, callback=None,
-                     arreglar=True):
+                     arreglar=True, preferir=None):
     """Cada modelo fuerte revisa lo que escribieron los OTROS y lo corrige.
 
     No es una opinion sobre un texto: leen los archivos del disco, buscan
     defectos concretos y, si 'arreglar', los arreglan ahi mismo.
     """
-    fuertes = _mas_potentes(3)
+    fuertes = _mas_potentes(3, preferir=preferir)
     if len(fuertes) < 2:
         return [], "hacen falta al menos 2 cuentas para auditarse entre si"
 
@@ -1771,10 +2712,42 @@ def auditar_proyecto(plan, carpeta, resultados, timeout=600, callback=None,
 
     if callback:
         callback("auditoria", {"cuentas": [t[0] for t in trabajos]})
-    with ThreadPoolExecutor(max_workers=len(trabajos)) as ex:
-        salidas = list(ex.map(
-            lambda t: (t[0], correr(t[0], t[1], t[2], "review", timeout, carpeta)),
-            trabajos))
+    reservados = {t[0] for t in trabajos}
+
+    def ejecutar(t):
+        pid, perfil, prompt = t
+        opciones_lectura = {"solo_lectura": True} if not arreglar else {}
+        r = correr(pid, perfil, prompt, "review", timeout, carpeta,
+                   **opciones_lectura)
+        if r.get("rc") == 0:
+            return pid, r
+        usados = set(reservados)
+        usados.add(pid)
+        for alterna in ranking("review", preferir=preferir):
+            if alterna["pid"] in usados:
+                continue
+            relevo = (
+                prompt + "\n\nRELEVO CONTROLADO: el auditor anterior ya termino "
+                f"con rc={r.get('rc')}. Revisa el estado actual y completa esta "
+                "auditoria sin repetir ni deshacer correcciones utiles."
+            )
+            r = correr(alterna["pid"], alterna["p"], relevo, "review",
+                       timeout, carpeta, **opciones_lectura)
+            pid = alterna["pid"]
+            usados.add(pid)
+            if r.get("rc") == 0:
+                break
+        return pid, r
+    if arreglar:
+        # Dos revisores escribiendo a la vez pueden corregir el mismo archivo
+        # de formas incompatibles. Las auditorias con cambios son deliberadamente
+        # seriales; las de solo lectura conservan el paralelismo.
+        salidas = [ejecutar(t) for t in trabajos]
+    elif trabajos:
+        with ThreadPoolExecutor(max_workers=len(trabajos)) as ex:
+            salidas = list(ex.map(ejecutar, trabajos))
+    else:
+        salidas = []
     out = []
     for pid, r in salidas:
         out.append({"perfil": pid, "texto": (r["texto"] or "").strip(),
