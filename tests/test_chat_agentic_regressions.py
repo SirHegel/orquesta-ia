@@ -437,9 +437,17 @@ class IntencionYCarpetaTests(unittest.TestCase):
             with open(fuera, "w", encoding="utf-8") as archivo:
                 archivo.write("dato externo\n")
             os.symlink(fuera, os.path.join(memoria, "enlace.md"))
+            nota = os.path.join(memoria, "nota.md")
+            with open(nota, "w", encoding="utf-8") as archivo:
+                archivo.write("dato interno\n")
             with mock.patch.object(orqchat, "DIR_MEM", memoria):
                 self.assertIsNone(orqchat.ruta_memoria("../fuera"))
-                self.assertEqual(orqchat.memoria(), [])
+                self.assertEqual(orqchat.memoria(), [("nota", "dato interno")])
+                self.assertFalse(orqchat.borrar_memoria("../fuera"))
+                self.assertFalse(orqchat.borrar_memoria("enlace"))
+                self.assertTrue(orqchat.borrar_memoria("nota"))
+                self.assertFalse(os.path.exists(nota))
+                self.assertTrue(os.path.exists(fuera))
 
     def test_resuelve_la_carpeta_nombrada_sin_exigir_cd_ni_mayusculas_exactas(self):
         with tempfile.TemporaryDirectory() as tmp:

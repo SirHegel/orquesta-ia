@@ -558,6 +558,32 @@ def ruta_memoria(nombre):
     return L.ruta_contenida(DIR_MEM, os.path.join(DIR_MEM, crudo + ".md"))
 
 
+def borrar_memoria(nombre):
+    """Borra solo una entrada regular que el propio directorio haya enumerado."""
+    original = str(nombre or "")
+    componente = os.path.basename(original)
+    if componente != original:
+        return False
+    if componente.endswith(".md"):
+        componente = componente[:-3]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", componente):
+        return False
+    esperado = componente + ".md"
+    try:
+        with os.scandir(DIR_MEM) as entradas:
+            for entrada in entradas:
+                if entrada.name != esperado or not entrada.is_file(follow_symlinks=False):
+                    continue
+                ruta = ruta_memoria(entrada.name)
+                if not ruta:
+                    return False
+                os.remove(ruta)
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def recordar(hecho):
     os.makedirs(DIR_MEM, exist_ok=True)
     slug = re.sub(r"[^a-z0-9]+", "-", hecho.lower())[:40].strip("-") or "nota"
@@ -1005,12 +1031,10 @@ def principal():
                     f = recordar(arg)
                     print(f" {G}·{N} guardado en memoria/{f}\n"); continue
                 if cmd == "olvida":
-                    nombre_memoria = os.path.basename(arg)
-                    ruta = ruta_memoria(nombre_memoria) if nombre_memoria == arg else None
-                    if not ruta:
+                    if os.path.basename(arg) != arg:
                         print(f" {R}·{N} nombre de memoria invalido\n"); continue
-                    if os.path.isfile(ruta) and not os.path.islink(ruta):
-                        os.remove(ruta); print(f" {G}·{N} olvidado: {arg}\n")
+                    if borrar_memoria(arg):
+                        print(f" {G}·{N} olvidado: {arg}\n")
                     else:
                         print(f" {D}no encuentro '{arg}'. Mira /memoria{N}\n")
                     continue
