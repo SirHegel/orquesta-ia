@@ -1,13 +1,13 @@
 """Resolución compartida de la instalación activa de Orquesta.
 
-``ORQ_HOME`` no es un directorio de datos arbitrario: selecciona una copia
-completa de Orquesta.  Los entrypoints usan este módulo antes de importar el
-resto del proyecto para no mezclar el shell/estado de una instalación con el
-código de otra.
+``ORQ_HOME`` no es un directorio de datos arbitrario. El shell selecciona una
+copia completa de Orquesta y los procesos Python usan la variable solo como
+aserción de que su propio entrypoint pertenece a esa misma copia. Este módulo
+se carga antes que el resto del proyecto para no mezclar código y estado.
 """
 
 import os
-import sys
+import stat
 
 
 _MARCADORES = ("orq", "orqlib.py", "orqroot.py", "shell.sh", "tools/minimax")
@@ -17,15 +17,21 @@ class RaizOrquestaInvalida(ValueError):
     """La raíz solicitada no representa una instalación autocontenida."""
 
 
-def _ruta_interna(raiz, relativa):
-    """Resuelve un marcador sin aceptar enlaces que escapen de ``raiz``."""
-    ruta = os.path.realpath(os.path.join(raiz, relativa))
-    try:
-        if os.path.commonpath((raiz, ruta)) != raiz:
-            return None
-    except ValueError:
+def _marcador_exacto(raiz, relativa):
+    """Devuelve un marcador regular en su ubicación exacta, nunca un enlace.
+
+    ``raiz`` ya es canónica, por lo que exigir que ``realpath`` no cambie la
+    ruta también rechaza directorios intermedios enlazados (por ejemplo,
+    ``tools -> lib/tools``), aunque el archivo final no sea un symlink.
+    """
+    ruta = os.path.abspath(os.path.join(raiz, relativa))
+    if os.path.realpath(ruta) != ruta:
         return None
-    return ruta
+    try:
+        modo = os.stat(ruta, follow_symlinks=False).st_mode
+    except (OSError, ValueError):
+        return None
+    return ruta if stat.S_ISREG(modo) else None
 
 
 def resolver_raiz(valor, programa="orq"):
@@ -40,41 +46,38 @@ def resolver_raiz(valor, programa="orq"):
             f"{programa}: ORQ_HOME no es un directorio: {raiz}"
         )
     for relativa in _MARCADORES:
-        ruta = _ruta_interna(raiz, relativa)
-        if not ruta or not os.path.isfile(ruta):
+        if not _marcador_exacto(raiz, relativa):
             raise RaizOrquestaInvalida(
                 f"{programa}: ORQ_HOME no es una instalación completa "
-                f"(falta {relativa})"
+                f"({relativa} debe ser un archivo regular exacto, no un enlace)"
             )
     return raiz
 
 
 def activar_raiz(raiz_del_entrypoint, entrypoint, programa="orq"):
-    """Activa una sola raíz y entrega la ejecución a su propio entrypoint.
+    """Valida que el entrypoint y ``ORQ_HOME`` nombren la misma instalación.
 
-    Cuando un shell de la copia A encuentra en ``PATH`` un enlace a la copia B,
-    el ``ORQ_HOME`` exportado por el shell gana. El proceso se reemplaza por el
-    entrypoint de A antes de cargar ``orqlib``; así no existe una combinación
-    código-B/estado-A.
+    La raíz solo se deriva del archivo que ya está ejecutándose. ``ORQ_HOME`` es
+    una aserción de consistencia heredada del shell, nunca una ruta que Python
+    abra o ejecute. El shell enlaza sus funciones directamente con la copia
+    seleccionada; una invocación explícita de otra copia falla de forma cerrada.
     """
-    elegida = os.environ.get("ORQ_HOME") or raiz_del_entrypoint
-    raiz = resolver_raiz(elegida, programa)
-    objetivo = _ruta_interna(raiz, entrypoint)
+    raiz = resolver_raiz(raiz_del_entrypoint, programa)
+    objetivo = _marcador_exacto(raiz, entrypoint)
     if not objetivo or not os.access(objetivo, os.X_OK):
         raise RaizOrquestaInvalida(
-            f"{programa}: el entrypoint de ORQ_HOME no es ejecutable: {entrypoint}"
+            f"{programa}: el entrypoint de la instalación no es ejecutable: "
+            f"{entrypoint}"
         )
 
-    # ``sys.argv[0]`` pertenece al runner cuando el CLI se carga en pruebas o
-    # como módulo. La ubicación del entrypoint que importó este helper es la
-    # referencia estable tanto para ejecución directa como para symlinks.
-    actual = os.path.realpath(os.path.join(raiz_del_entrypoint, entrypoint))
-    entorno = dict(os.environ)
-    entorno["ORQ_HOME"] = raiz
-    if actual != objetivo:
-        os.execve(objetivo, [objetivo, *sys.argv[1:]], entorno)
+    heredada = os.environ.get("ORQ_HOME")
+    if heredada and heredada != raiz:
+        raise RaizOrquestaInvalida(
+            f"{programa}: ORQ_HOME no coincide con la instalación del entrypoint; "
+            "carga su shell.sh o ejecuta el binario de la raíz seleccionada"
+        )
 
-    # También normaliza ORQ_HOME al ejecutar directamente, para que todos los
-    # procesos hijos hereden exactamente la misma raíz canónica.
+    # Al ejecutar directamente sin shell, establece la misma aserción canónica
+    # para todos los procesos hijos.
     os.environ["ORQ_HOME"] = raiz
     return raiz

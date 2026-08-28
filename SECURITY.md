@@ -56,14 +56,30 @@ pueden seleccionar cualquier proyecto o ejecutar las mismas acciones que ese usu
 ya puede realizar en su terminal. No son una frontera entre usuarios con permisos
 distintos.
 
-`ORQ_HOME` solo selecciona una instalación completa y reconocible. Se
-canonicaliza, se rechazan marcadores que escapen mediante enlaces y el entrypoint
-de esa misma instalación toma la ejecución antes de cargar el estado. Es una
-elección explícita del entorno local, no se lee de una petición web ni de una
-ruta persistida en `profiles.json`. Una raíz inválida falla de forma cerrada; no
-se usa otra copia como fallback. Al cargar `shell.sh`, la ubicación validada de
-ese archivo reemplaza una variable heredada porque es la elección local más
-reciente del operador.
+`ORQ_HOME` solo selecciona una instalación completa y reconocible. La raíz se
+canonicaliza (por eso ella sí puede llegar mediante un symlink), pero cada
+marcador debe ser un archivo regular en su ubicación exacta: no se admiten
+symlinks finales ni en directorios intermedios, aunque apunten dentro de la
+instalación. El entrypoint de esa misma raíz toma la ejecución antes de cargar el
+estado. El código Python deriva la raíz exclusivamente de su propio `__file__`;
+jamás usa `ORQ_HOME` para abrir ni ejecutar una ruta. Esa variable solo debe
+coincidir literalmente con la raíz canónica como aserción de consistencia. El
+shell enlaza sus funciones `orq` y `minimax` directamente con la copia elegida;
+invocar explícitamente un binario de otra copia falla de forma cerrada.
+El shell conserva aparte la raíz elegida y la reafirma antes de cada operación,
+por lo que cambiar accidentalmente `ORQ_HOME` después no selecciona otra copia;
+para hacerlo se debe cargar el `shell.sh` de esa instalación. Ese cambio restaura
+primero el entorno original y descarta la caché, los indicadores de cuenta, el
+override manual y la política de la raíz anterior antes de cargar el nuevo estado.
+La configuración local más reciente se aplica después de esa limpieza. Además,
+los wrappers que pueden omitir el sandbox vuelven a validar la política en cada
+invocación: pasar de `ORQ_PERMISOS_TOTALES=1` a `0` no deja flags peligrosos vivos.
+
+La selección es local: no se lee de una petición web ni de una ruta persistida
+en `profiles.json`. Al cargar `shell.sh`, la ubicación validada de ese archivo
+reemplaza una variable heredada porque es la elección más reciente del operador,
+y se reafirma después de cargar `shell.local.sh` para que las demás preferencias
+no separen código y estado.
 
 La frontera no confiable principal es la entrada HTTP del panel, aun cuando este
 escuche solo en loopback. CodeQL se mantiene deliberadamente en el modelo más estricto

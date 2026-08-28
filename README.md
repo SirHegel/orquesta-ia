@@ -52,11 +52,22 @@ ln -sf "$PWD/tools/minimax" ~/.local/bin/minimax
 de datos independiente. Al cargar `shell.sh`, su ubicación real es la elección
 más reciente del operador: este valida la copia y reemplaza cualquier
 `ORQ_HOME` heredado. `orq` y `minimax` usan esa misma raíz aunque un enlace
-encontrado en `PATH` apunte accidentalmente a otro clon. Fuera de ese shell, un
-`ORQ_HOME` explícito selecciona la copia y debe contener `orq`, `orqlib.py`,
-`orqroot.py`, `shell.sh` y `tools/minimax`. Si no es válido, los comandos fallan
-en vez de leer o escribir en otra instalación. Para cambiar de copia, carga el
-`shell.sh` de esa copia.
+encontrado en `PATH` apunte accidentalmente a otro clon: el shell define ambos
+comandos contra su propia raíz. Fuera de ese shell, la ubicación real del
+entrypoint selecciona la copia; si `ORQ_HOME` ya existe debe coincidir
+literalmente con esa raíz canónica y actúa solo como una aserción de
+consistencia, nunca como una ruta que Python abra o ejecute.
+
+La instalación debe contener `orq`, `orqlib.py`, `orqroot.py`, `shell.sh` y
+`tools/minimax` como archivos regulares exactamente en esas ubicaciones:
+ninguno ni sus directorios intermedios puede ser un symlink. La propia raíz o
+el enlace externo usado para invocar un entrypoint sí pueden ser symlinks y se
+canonicalizan. Si la copia no es válida, o un binario B se invoca explícitamente
+desde el shell de A, el comando falla en vez de mezclar código y estado. Para
+cambiar de copia, carga el `shell.sh` de esa copia. La configuración
+`shell.local.sh` ni un `ORQ_HOME` exportado después pueden reemplazar esa raíz
+después de validarla. Al cargar otra copia se limpian además las cuentas, el
+override manual, la caché y la política procedentes de la instalación anterior.
 
 Requiere Python 3.9+ y los CLIs que vayas a usar (`claude`, `codex`, `agy`).
 La ruta del clon y el emulador de terminal no importan: Kitty, GNOME Terminal,
@@ -93,8 +104,10 @@ chmod 600 "$HOME/.config/orquesta/shell.local.sh"
 ```
 
 Sin ese archivo, `ORQ_AUTO_CHAT=0` y `ORQ_PERMISOS_TOTALES=0`: un clon no abre
-ninguna IA ni redefine `claude`, `codex`, `agy` o `gemini`. Para omitir una vez un
-autoarranque configurado: `ORQ_SIN_MODO_PROMPT=1 bash`.
+ninguna IA ni agrega flags de omisión a `claude`, `codex`, `agy` o `gemini`.
+Los wrappers que una carga anterior hubiera creado vuelven a comprobar la política
+en cada invocación, por lo que desactivarla surte efecto sin abrir otra terminal.
+Para omitir una vez un autoarranque configurado: `ORQ_SIN_MODO_PROMPT=1 bash`.
 
 El terminal solo presenta el proceso. El acceso al disco, navegador u otras
 herramientas depende del sandbox/flags del CLI proveedor y de los permisos Unix del
