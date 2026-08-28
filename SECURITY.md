@@ -56,17 +56,18 @@ pueden seleccionar cualquier proyecto o ejecutar las mismas acciones que ese usu
 ya puede realizar en su terminal. No son una frontera entre usuarios con permisos
 distintos.
 
-La frontera no confiable es la entrada HTTP del panel, aun cuando este escuche solo en
-loopback. Por eso el análisis predeterminado de CodeQL usa el modelo `remote`: todos
-los datos HTTP se validan antes de alcanzar perfiles, procesos o rutas. Adicionalmente,
-los identificadores locales que sí se convierten en nombres de archivo (sesión,
-`run_id`, notas de memoria y nombre de imagen) se acotan y canonicalizan para impedir
+La frontera no confiable principal es la entrada HTTP del panel, aun cuando este
+escuche solo en loopback. CodeQL se mantiene deliberadamente en el modelo más estricto
+`remote_and_local`: además de revisar todos los datos HTTP, ayuda a detectar cuándo un
+identificador local llega accidentalmente a una ruta o a una invocación de proceso. Los
+identificadores que sí se convierten en nombres de archivo (sesión, `run_id`, notas de
+memoria y nombre de imagen) se acotan, vuelven opacos o canonicalizan para impedir
 traversal, enlaces fuera de su raíz e inyección accidental de opciones.
 
-Cambiar el modelo a `remote_and_local` es útil como auditoría de endurecimiento, pero
-reportará como fuentes hostiles funciones locales deliberadas —por ejemplo abrir una
-carpeta elegida con `--en`—. Esos resultados deben revisarse; no implican por sí solos
-que el panel web pueda controlar esa ruta.
+Los resultados que partan de funciones locales deliberadas —por ejemplo abrir una
+carpeta elegida con `--en`— deben juzgarse contra este modelo antes de modificar la
+funcionalidad. Que una ruta sea elegible por el operador local no implica que el panel
+web pueda controlarla; ambos límites se prueban por separado.
 
 ## Permisos de disco
 

@@ -474,9 +474,10 @@ def cmd_imagen(a):
     print("\n  " + c("d", pie) + "\n")
 
 def cmd_ver(a):
-    if not L.run_id_valido(a.run_id):
+    nombre_run = os.path.basename(a.run_id)
+    if nombre_run != a.run_id or not L.run_id_valido(nombre_run):
         print(c("red", "run_id invalido")); sys.exit(1)
-    f = os.path.join(L.BASE, "state", "salidas", a.run_id + ".txt")
+    f = os.path.join(L.BASE, "state", "salidas", nombre_run + ".txt")
     if not os.path.exists(f):
         print(c("red", "no hay salida guardada para ese run_id")); sys.exit(1)
     with open(f) as archivo:

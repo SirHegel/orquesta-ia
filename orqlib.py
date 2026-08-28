@@ -9,7 +9,10 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 _SUBPROCESS_RUN_ORIGINAL = subprocess.run
 _SYSTEMD_USUARIO_CACHE = {}
 
-BASE = os.environ.get("ORQ_HOME") or os.path.dirname(os.path.abspath(__file__))
+# El módulo vive dentro de la instalación y es una raíz más fiable que una
+# variable heredada. ``shell.sh`` aún usa ORQ_HOME para localizar el ejecutable,
+# pero el proceso Python deriva su estado desde el archivo que realmente cargó.
+BASE = os.path.dirname(os.path.realpath(__file__))
 ACCOUNTS = os.path.join(BASE, "accounts")
 PROFILES = os.path.join(BASE, "profiles.json")
 LEDGER = os.path.join(BASE, "state", "ledger.jsonl")
@@ -60,14 +63,17 @@ def id_sesion_seguro(valor, fallback):
     interpolarlos en ``state/sesiones``.
     """
     crudo = str(valor or "")
-    if SESION_RE.fullmatch(crudo):
-        return crudo
-    if not crudo:
-        alterno = str(fallback or "")
-        if SESION_RE.fullmatch(alterno):
-            return alterno
-        crudo = alterno or "sesion"
-    return "sesion-" + hashlib.sha256(crudo.encode("utf-8")).hexdigest()[:20]
+    if crudo:
+        # El nombre visible de la terminal no necesita formar parte de una ruta.
+        # El hash conserva la relación estable entre reinicios sin propagar datos
+        # heredados hacia el sistema de archivos.
+        return "sesion-" + hashlib.sha256(crudo.encode("utf-8")).hexdigest()[:20]
+    alterno = str(fallback or "")
+    if SESION_RE.fullmatch(alterno):
+        return alterno
+    return "sesion-" + hashlib.sha256(
+        (alterno or "sesion").encode("utf-8")
+    ).hexdigest()[:20]
 
 
 def ruta_contenida(raiz, ruta):

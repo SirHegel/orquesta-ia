@@ -12,11 +12,21 @@ class AccountPathSafetyTests(unittest.TestCase):
         seguro = orqlib.id_sesion_seguro(peligroso, "fallback")
         self.assertRegex(seguro, r"^sesion-[0-9a-f]{20}$")
         self.assertEqual(seguro, orqlib.id_sesion_seguro(peligroso, "otro"))
+        visible = "20260828-010101-1234"
+        self.assertRegex(
+            orqlib.id_sesion_seguro(visible, "fallback"), r"^sesion-[0-9a-f]{20}$"
+        )
+        self.assertNotEqual(orqlib.id_sesion_seguro(visible, "fallback"), visible)
         self.assertRegex(
             orqlib.id_sesion_seguro(None, peligroso), r"^sesion-[0-9a-f]{20}$"
         )
         self.assertFalse(orqlib.run_id_valido("../../salida"))
         self.assertTrue(orqlib.run_id_valido("codex-personal-1234567890123456789"))
+
+    def test_base_python_procede_del_modulo_y_no_de_una_variable(self):
+        self.assertEqual(
+            orqlib.BASE, os.path.dirname(os.path.realpath(orqlib.__file__))
+        )
 
     def test_ruta_contenida_rechaza_escape_y_symlink(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -528,8 +528,9 @@ def memoria():
     trozos = []
     if not os.path.isdir(DIR_MEM):
         return trozos
-    for f in sorted(os.listdir(DIR_MEM)):
-        if not f.endswith(".md") or f == "README.md":
+    for entrada in sorted(os.listdir(DIR_MEM)):
+        f = os.path.basename(entrada)
+        if f != entrada or not f.endswith(".md") or f == "README.md":
             continue
         ruta = ruta_memoria(f)
         if not ruta or os.path.islink(ruta):
@@ -546,7 +547,10 @@ def memoria():
 
 def ruta_memoria(nombre):
     """Resuelve una nota, sin traversal ni enlaces que escapen de memoria/."""
-    crudo = str(nombre or "")
+    original = str(nombre or "")
+    crudo = os.path.basename(original)
+    if crudo != original:
+        return None
     if crudo.endswith(".md"):
         crudo = crudo[:-3]
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", crudo):
@@ -1001,7 +1005,8 @@ def principal():
                     f = recordar(arg)
                     print(f" {G}·{N} guardado en memoria/{f}\n"); continue
                 if cmd == "olvida":
-                    ruta = ruta_memoria(arg)
+                    nombre_memoria = os.path.basename(arg)
+                    ruta = ruta_memoria(nombre_memoria) if nombre_memoria == arg else None
                     if not ruta:
                         print(f" {R}·{N} nombre de memoria invalido\n"); continue
                     if os.path.isfile(ruta) and not os.path.islink(ruta):
