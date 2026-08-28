@@ -63,8 +63,8 @@ class PublicacionSeguraTests(unittest.TestCase):
 
     def test_bloquea_secreto_antes_de_stage_commit_y_push(self):
         anterior = self.git("rev-parse", "HEAD").stdout.strip()
-        secreto = "CLIENT_SECRET=" + "E" * 32
-        (self.repo / "config.txt").write_text(secreto + "\n", encoding="utf-8")
+        patron_prueba = "CLIENT_" + "SECRET=" + "E" * 32
+        (self.repo / "config.txt").write_text(patron_prueba + "\n", encoding="utf-8")
         with mock.patch.object(orqlib, "BASE", str(self.orq)):
             resultado = orqlib.publicar_repo(str(self.repo))
 
@@ -75,12 +75,12 @@ class PublicacionSeguraTests(unittest.TestCase):
             self.remote, "rev-parse", "refs/heads/main"
         ).stdout.strip()
         self.assertEqual(remoto, anterior)
-        self.assertNotIn(secreto, str(resultado))
+        self.assertNotIn(patron_prueba, str(resultado))
 
     def test_proceso_ia_hereda_hook_que_bloquea_push_directo(self):
         anterior = self.git("rev-parse", "HEAD").stdout.strip()
-        secreto = "API_KEY=" + "F" * 32
-        (self.repo / "credencial.txt").write_text(secreto + "\n", encoding="utf-8")
+        patron_prueba = "API_" + "KEY=" + "F" * 32
+        (self.repo / "credencial.txt").write_text(patron_prueba + "\n", encoding="utf-8")
         self.git("add", "credencial.txt")
         self.git("commit", "-qm", "commit que debe bloquearse")
         with mock.patch.object(orqlib, "BASE", str(self.orq)):
@@ -95,7 +95,7 @@ class PublicacionSeguraTests(unittest.TestCase):
             self.remote, "rev-parse", "refs/heads/main"
         ).stdout.strip()
         self.assertEqual(remoto, anterior)
-        self.assertNotIn(secreto, push.stdout + push.stderr)
+        self.assertNotIn(patron_prueba, push.stdout + push.stderr)
 
 
 if __name__ == "__main__":

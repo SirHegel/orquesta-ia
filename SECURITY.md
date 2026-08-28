@@ -47,6 +47,27 @@ Las respuestas de la API van con CSP, `X-Frame-Options: DENY`,
 La interfaz escapa todo el contenido que viene del servidor antes de insertarlo en el DOM,
 para que una respuesta de un modelo no pueda inyectar HTML en el panel.
 
+## Modelo de amenaza de CodeQL
+
+Orquesta es una herramienta **local** controlada por la misma cuenta Unix que la
+ejecuta. Los argumentos del CLI, `ORQ_HOME`, `ORQ_CARPETA`, `profiles.json` y el
+comando escrito explícitamente tras `/shell` son decisiones del operador: por diseño
+pueden seleccionar cualquier proyecto o ejecutar las mismas acciones que ese usuario
+ya puede realizar en su terminal. No son una frontera entre usuarios con permisos
+distintos.
+
+La frontera no confiable es la entrada HTTP del panel, aun cuando este escuche solo en
+loopback. Por eso el análisis predeterminado de CodeQL usa el modelo `remote`: todos
+los datos HTTP se validan antes de alcanzar perfiles, procesos o rutas. Adicionalmente,
+los identificadores locales que sí se convierten en nombres de archivo (sesión,
+`run_id`, notas de memoria y nombre de imagen) se acotan y canonicalizan para impedir
+traversal, enlaces fuera de su raíz e inyección accidental de opciones.
+
+Cambiar el modelo a `remote_and_local` es útil como auditoría de endurecimiento, pero
+reportará como fuentes hostiles funciones locales deliberadas —por ejemplo abrir una
+carpeta elegida con `--en`—. Esos resultados deben revisarse; no implican por sí solos
+que el panel web pueda controlar esa ruta.
+
 ## Permisos de disco
 
 Los directorios de cuenta se crean con modo `700`. Verifícalo:

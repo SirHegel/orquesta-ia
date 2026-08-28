@@ -154,6 +154,10 @@ def cmd_cuenta_key(a):
     h = L.home_de(a.id, pr)
     os.makedirs(h, exist_ok=True); os.chmod(h, 0o700)
     destino = os.path.expanduser(pr.get("api_key_file") or os.path.join(h, "api_key"))
+    destino = L.ruta_contenida(h, destino)
+    if not destino:
+        print(c("red", "api_key_file debe permanecer dentro del directorio privado de la cuenta"))
+        sys.exit(1)
     print(c("d", "pega la API key y dale Enter (no se muestra en pantalla):"))
     import getpass
     try:
@@ -442,6 +446,9 @@ def cmd_imagen(a):
     destino = os.path.abspath(os.path.expanduser(a.en or os.getcwd()))
     print(c("d", f"-> {pid} · generando en {destino}\n"))
     nombre = a.nombre or "imagen"
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", nombre):
+        print(c("red", "nombre de imagen invalido: usa solo letras, numeros, punto, _ o -"))
+        sys.exit(1)
     ruta = os.path.join(destino, f"{nombre}.png")
     prompt = (
         f"{a.prompt}\n\n"
@@ -467,10 +474,13 @@ def cmd_imagen(a):
     print("\n  " + c("d", pie) + "\n")
 
 def cmd_ver(a):
+    if not L.run_id_valido(a.run_id):
+        print(c("red", "run_id invalido")); sys.exit(1)
     f = os.path.join(L.BASE, "state", "salidas", a.run_id + ".txt")
     if not os.path.exists(f):
         print(c("red", "no hay salida guardada para ese run_id")); sys.exit(1)
-    print(open(f).read())
+    with open(f) as archivo:
+        print(archivo.read())
 
 def cmd_permisos(a):
     with L.bloqueo():
@@ -864,6 +874,7 @@ def cmd_global(a):
 
 def cmd_score(a):
     if not 0 <= a.nota <= 10: print("nota de 0 a 10"); sys.exit(1)
+    if not L.run_id_valido(a.run_id): print("run_id invalido"); sys.exit(1)
     pid = a.run_id.rsplit("-",1)[0]
     with L.bloqueo():
         s = L.scores(); s.setdefault(pid,{}).setdefault(a.tarea,{"suma":0,"n":0})

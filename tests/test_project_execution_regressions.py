@@ -661,6 +661,20 @@ class VerificacionProyectoTests(unittest.TestCase):
 
 
 class CliImagenTests(unittest.TestCase):
+    def test_nombre_de_imagen_no_puede_escapar_del_destino(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            ORQ_CLI.L,
+            "ranking",
+            return_value=[{"pid": "visual", "p": {"provider": "antigravity"}}],
+        ), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+            ORQ_CLI.cmd_imagen(types.SimpleNamespace(
+                prompt="crea un logo",
+                perfil=None,
+                en=tmp,
+                nombre="../../fuera",
+                timeout=420,
+            ))
+
     def test_generacion_visual_bloquea_la_carpeta_destino(self):
         perfil = {"provider": "antigravity"}
         resultado = {

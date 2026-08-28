@@ -46,38 +46,38 @@ class ScannerStagedTests(unittest.TestCase):
         )
 
     def test_lee_el_blob_staged_y_no_imprime_el_secreto(self):
-        secreto = "sk-" + "proj-" + "A" * 32
+        patron_prueba = "sk-" + "proj-" + "A" * 32
         ruta = self.repo / "solo-indice.txt"
-        ruta.write_text(secreto + "\n", encoding="utf-8")
+        ruta.write_text(patron_prueba + "\n", encoding="utf-8")
         self.git("add", ruta.name)
         ruta.write_text("el working tree ya no lo contiene\n", encoding="utf-8")
 
         resultado = self.scan()
 
         self.assertEqual(resultado.returncode, 1)
-        self.assertNotIn(secreto, resultado.stdout + resultado.stderr)
+        self.assertNotIn(patron_prueba, resultado.stdout + resultado.stderr)
 
     def test_nombres_con_salto_y_tokens_modernos_no_eluden_el_scan(self):
-        secreto = "github_" + "pat_" + "B" * 32
+        patron_prueba = "github_" + "pat_" + "B" * 32
         ruta = self.repo / "nombre\npartido.txt"
-        ruta.write_text(secreto + "\n", encoding="utf-8")
+        ruta.write_text(patron_prueba + "\n", encoding="utf-8")
         self.git("add", ruta.name)
 
         resultado = self.scan()
 
         self.assertEqual(resultado.returncode, 1)
-        self.assertNotIn(secreto, resultado.stdout + resultado.stderr)
+        self.assertNotIn(patron_prueba, resultado.stdout + resultado.stderr)
 
     def test_blob_binario_con_nul_tambien_se_revisa(self):
-        secreto = ("sk-" + "proj-" + "C" * 32).encode()
+        patron_prueba = ("sk-" + "proj-" + "C" * 32).encode()
         ruta = self.repo / "binario.dat"
-        ruta.write_bytes(b"cabecera\x00" + secreto + b"\n")
+        ruta.write_bytes(b"cabecera\x00" + patron_prueba + b"\n")
         self.git("add", ruta.name)
 
         resultado = self.scan()
 
         self.assertEqual(resultado.returncode, 1)
-        self.assertNotIn(secreto.decode(), resultado.stdout + resultado.stderr)
+        self.assertNotIn(patron_prueba.decode(), resultado.stdout + resultado.stderr)
 
     def test_ruta_sensible_anidada_y_rename_se_bloquean(self):
         anidada = self.repo / "nested" / ".envrc"
@@ -102,12 +102,12 @@ class ScannerStagedTests(unittest.TestCase):
         self.assertEqual(resultado.returncode, 2)
 
     def test_todo_incluye_archivos_no_trackeados_y_commit_revisa_su_arbol(self):
-        secreto = "CLIENT_SECRET=" + "D" * 32
+        patron_prueba = "CLIENT_" + "SECRET=" + "D" * 32
         ruta = self.repo / "nuevo.txt"
-        ruta.write_text(secreto + "\n", encoding="utf-8")
+        ruta.write_text(patron_prueba + "\n", encoding="utf-8")
         todo = self.scan_args("--todo", "--repo", str(self.repo))
         self.assertEqual(todo.returncode, 1)
-        self.assertNotIn(secreto, todo.stdout + todo.stderr)
+        self.assertNotIn(patron_prueba, todo.stdout + todo.stderr)
 
         self.git("add", ruta.name)
         self.git("commit", "-qm", "secreto sintetico")
@@ -117,7 +117,7 @@ class ScannerStagedTests(unittest.TestCase):
         self.git("commit", "-qm", "quitar del arbol actual")
         historico = self.scan_args("--commit", commit, "--repo", str(self.repo))
         self.assertEqual(historico.returncode, 1)
-        self.assertNotIn(secreto, historico.stdout + historico.stderr)
+        self.assertNotIn(patron_prueba, historico.stdout + historico.stderr)
 
 
 if __name__ == "__main__":

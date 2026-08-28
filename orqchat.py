@@ -24,7 +24,7 @@ MAX_CHAT_TIMEOUT = 21600
 
 # Cada ventana de kitty tiene su propia conversacion. Una ventana nueva
 # empieza limpia: no hereda lo que hablaste en otra.
-SESION = os.environ.get("ORQ_SESION") or f"suelta-{os.getpid()}"
+SESION = L.id_sesion_seguro(os.environ.get("ORQ_SESION"), f"suelta-{os.getpid()}")
 CTX = os.path.join(DIR_SES, f"{SESION}.json")
 CTX_CARPETA = CTX + ".cwd"
 CTX_PARCIAL = CTX + ".partial.json"
@@ -281,13 +281,13 @@ def resolver_carpeta_mencionada(pregunta, actual=None, raices=None):
     ))
     # Sin una indicacion espacial, solo un slug escrito literalmente justifica
     # cambiar el cwd. La normalizacion permite cotejarlo sin depender de caso.
+    # Tokenizar primero mantiene el coste lineal incluso con entradas enormes;
+    # el filtro posterior exige un slug literal completo (no una subcadena).
+    candidatos = re.findall(r"[A-Za-z0-9._-]+", pregunta or "")
     slugs = {
         _normalizar(x)
-        for x in re.findall(
-            r"(?<![\w-])[A-Za-z0-9][A-Za-z0-9.]*"
-            r"(?:[-_][A-Za-z0-9.]+)+(?![\w-])",
-            pregunta or "",
-        )
+        for x in candidatos
+        if x[0].isalnum() and x[-1].isalnum() and ("-" in x or "_" in x)
     }
     if not hay_indicacion and not slugs:
         return None
@@ -531,13 +531,27 @@ def memoria():
     for f in sorted(os.listdir(DIR_MEM)):
         if not f.endswith(".md") or f == "README.md":
             continue
+        ruta = ruta_memoria(f)
+        if not ruta or os.path.islink(ruta):
+            continue
         try:
-            txt = open(os.path.join(DIR_MEM, f)).read().strip()
+            with open(ruta) as archivo:
+                txt = archivo.read().strip()
             if txt:
                 trozos.append((f[:-3], txt))
         except OSError:
             pass
     return trozos
+
+
+def ruta_memoria(nombre):
+    """Resuelve una nota, sin traversal ni enlaces que escapen de memoria/."""
+    crudo = str(nombre or "")
+    if crudo.endswith(".md"):
+        crudo = crudo[:-3]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", crudo):
+        return None
+    return L.ruta_contenida(DIR_MEM, os.path.join(DIR_MEM, crudo + ".md"))
 
 
 def recordar(hecho):
@@ -873,13 +887,16 @@ def ejecutar_proyecto_chat(descripcion, ctx, preferir=None):
         print(f" {R}·{N} no pude preparar el contexto: {e}\n")
         return 1
     cmd = [
-        os.path.join(L.BASE, "orq"), "proyecto", descripcion,
+        os.path.join(L.BASE, "orq"), "proyecto",
         "--en", CARPETA, "--si", "--timeout", str(timeout_chat()),
         "--contexto", tmp,
     ]
     preferir = preferir or perfil_preferido_chat()
     if preferir:
         cmd += ["--preferir", preferir]
+    # Termina el análisis de opciones antes del texto libre. Así un encargo que
+    # empiece por ``--`` nunca se convierte en una opción del subcomando.
+    cmd += ["--", descripcion]
     try:
         return subprocess.run(cmd).returncode
     except KeyboardInterrupt:
@@ -892,12 +909,10 @@ def ejecutar_proyecto_chat(descripcion, ctx, preferir=None):
 
 def ejecutar_imagen_chat(descripcion, perfil=None):
     """Delega al flujo visual del CLI, que verifica el archivo generado."""
-    cmd = [
-        os.path.join(L.BASE, "orq"), "imagen", descripcion,
-        "--en", CARPETA,
-    ]
+    cmd = [os.path.join(L.BASE, "orq"), "imagen", "--en", CARPETA]
     if perfil:
         cmd += ["--perfil", perfil]
+    cmd += ["--", descripcion]
     try:
         return subprocess.run(cmd).returncode
     except KeyboardInterrupt:
@@ -986,8 +1001,10 @@ def principal():
                     f = recordar(arg)
                     print(f" {G}·{N} guardado en memoria/{f}\n"); continue
                 if cmd == "olvida":
-                    ruta = os.path.join(DIR_MEM, arg if arg.endswith(".md") else arg + ".md")
-                    if os.path.exists(ruta):
+                    ruta = ruta_memoria(arg)
+                    if not ruta:
+                        print(f" {R}·{N} nombre de memoria invalido\n"); continue
+                    if os.path.isfile(ruta) and not os.path.islink(ruta):
                         os.remove(ruta); print(f" {G}·{N} olvidado: {arg}\n")
                     else:
                         print(f" {D}no encuentro '{arg}'. Mira /memoria{N}\n")

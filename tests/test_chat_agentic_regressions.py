@@ -402,14 +402,44 @@ class IntencionYCarpetaTests(unittest.TestCase):
         ejecutar.assert_called_once_with([
             os.path.join(orqchat.L.BASE, "orq"),
             "imagen",
-            descripcion,
             "--en",
             tmp,
             "--perfil",
             "gemini-antigravity",
+            "--",
+            descripcion,
         ])
         responder.assert_not_called()
         proyecto.assert_not_called()
+
+    def test_subcomandos_separan_texto_libre_de_las_opciones(self):
+        proceso = mock.Mock(returncode=0)
+        with tempfile.TemporaryDirectory() as tmp, (
+            mock.patch.object(orqchat, "CARPETA", tmp)
+        ), mock.patch.object(
+            orqchat, "DIR_SES", tmp
+        ), mock.patch.object(
+            orqchat.subprocess, "run", return_value=proceso
+        ) as ejecutar:
+            orqchat.ejecutar_imagen_chat("--perfil atacante", perfil="visual")
+            imagen = ejecutar.call_args.args[0]
+            self.assertEqual(imagen[-2:], ["--", "--perfil atacante"])
+
+            orqchat.ejecutar_proyecto_chat("--en /tmp/ajeno", [], preferir="codex")
+            proyecto = ejecutar.call_args.args[0]
+            self.assertEqual(proyecto[-2:], ["--", "--en /tmp/ajeno"])
+
+    def test_memoria_rechaza_traversal_y_no_sigue_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            memoria = os.path.join(tmp, "memoria")
+            os.makedirs(memoria)
+            fuera = os.path.join(tmp, "fuera.md")
+            with open(fuera, "w", encoding="utf-8") as archivo:
+                archivo.write("dato externo\n")
+            os.symlink(fuera, os.path.join(memoria, "enlace.md"))
+            with mock.patch.object(orqchat, "DIR_MEM", memoria):
+                self.assertIsNone(orqchat.ruta_memoria("../fuera"))
+                self.assertEqual(orqchat.memoria(), [])
 
     def test_resuelve_la_carpeta_nombrada_sin_exigir_cd_ni_mayusculas_exactas(self):
         with tempfile.TemporaryDirectory() as tmp:

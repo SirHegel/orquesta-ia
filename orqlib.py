@@ -38,11 +38,46 @@ PROVEEDORES_IMAGEN = {"antigravity"}
 # su capacidad visual. Un perfil puede ajustar ``power`` (numero o por tarea).
 POTENCIA_BASE = {"claude": 10.0, "gpt": 10.0, "antigravity": 10.0, "minimax": 8.5}
 ID_PERFIL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}-[0-9]{10,30}$")
+SESION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 MIN_MUESTRA_REPARTO = 10_000
 
 
 def id_perfil_valido(pid):
     return bool(ID_PERFIL_RE.fullmatch(str(pid or "")))
+
+
+def run_id_valido(run_id):
+    """Los ids persistidos siempre son ``perfil-time_ns`` y nunca una ruta."""
+    return bool(RUN_ID_RE.fullmatch(str(run_id or "")))
+
+
+def id_sesion_seguro(valor, fallback):
+    """Convierte el identificador local de terminal en un único nombre de archivo.
+
+    ``ORQ_SESION`` es una comodidad local, no una ruta. Si un lanzador externo
+    entrega caracteres de ruta, conservamos estabilidad con un hash en vez de
+    interpolarlos en ``state/sesiones``.
+    """
+    crudo = str(valor or "")
+    if SESION_RE.fullmatch(crudo):
+        return crudo
+    if not crudo:
+        alterno = str(fallback or "")
+        if SESION_RE.fullmatch(alterno):
+            return alterno
+        crudo = alterno or "sesion"
+    return "sesion-" + hashlib.sha256(crudo.encode("utf-8")).hexdigest()[:20]
+
+
+def ruta_contenida(raiz, ruta):
+    """Devuelve la ruta canónica solo cuando permanece dentro de ``raiz``."""
+    base = os.path.realpath(os.path.abspath(os.path.expanduser(str(raiz))))
+    destino = os.path.realpath(os.path.abspath(os.path.expanduser(str(ruta))))
+    try:
+        return destino if os.path.commonpath((base, destino)) == base else None
+    except ValueError:
+        return None
 
 
 def admite_tarea(p, tarea):
