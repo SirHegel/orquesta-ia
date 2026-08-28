@@ -8,6 +8,7 @@ from unittest import mock
 
 import orqchat
 import orqlib
+import orqrun
 
 
 def candidato(pid, provider="claude"):
@@ -324,7 +325,10 @@ class IntencionYCarpetaTests(unittest.TestCase):
                     "resolver_carpeta_mencionada",
                     return_value=destino,
                 ),
-                mock.patch.object(orqchat.os, "chdir") as chdir,
+                mock.patch.object(
+                    orqchat.L, "cambiar_directorio_trabajo",
+                    side_effect=lambda ruta: ruta,
+                ) as cambiar,
                 mock.patch.object(orqchat, "responder") as responder,
                 mock.patch.object(
                     orqchat, "ejecutar_proyecto_chat"
@@ -333,7 +337,7 @@ class IntencionYCarpetaTests(unittest.TestCase):
             ):
                 orqchat.principal()
 
-        self.assertEqual(chdir.call_args_list[-1], mock.call(destino))
+        self.assertEqual(cambiar.call_args_list[-1], mock.call(destino))
         responder.assert_not_called()
         ejecutar_proyecto.assert_not_called()
 
@@ -440,13 +444,16 @@ class IntencionYCarpetaTests(unittest.TestCase):
             nota = os.path.join(memoria, "nota.md")
             with open(nota, "w", encoding="utf-8") as archivo:
                 archivo.write("dato interno\n")
+            os.chmod(nota, 0o600)
             with mock.patch.object(orqchat, "DIR_MEM", memoria):
                 self.assertIsNone(orqchat.ruta_memoria("../fuera"))
                 self.assertEqual(orqchat.memoria(), [("nota", "dato interno")])
                 self.assertFalse(orqchat.borrar_memoria("../fuera"))
                 self.assertFalse(orqchat.borrar_memoria("enlace"))
                 self.assertTrue(orqchat.borrar_memoria("nota"))
-                self.assertFalse(os.path.exists(nota))
+                self.assertTrue(os.path.exists(nota))
+                with open(nota, encoding="utf-8") as archivo:
+                    self.assertEqual(archivo.read(), "")
                 self.assertTrue(os.path.exists(fuera))
 
     def test_resuelve_la_carpeta_nombrada_sin_exigir_cd_ni_mayusculas_exactas(self):
@@ -519,6 +526,25 @@ class IntencionYCarpetaTests(unittest.TestCase):
 
 
 class SesionesClaudeTests(unittest.TestCase):
+    def test_claude_y_minimax_plan_atraviesan_el_despacho_del_supervisor(self):
+        for provider in ("claude", "minimax"):
+            with self.subTest(provider=provider), mock.patch.object(
+                orqrun, "_binario_fijo", return_value="/usr/bin/true"
+            ):
+                generado = orqlib.comando(
+                    {"provider": provider}, "audita", solo_lectura=True
+                )
+                self.assertEqual(generado[0], "claude")
+                proceso = orqrun._iniciar_objetivo("claude", generado[1:])
+                self.assertIsNotNone(proceso)
+                self.assertEqual(proceso.wait(timeout=2), 0)
+
+                invalido = [
+                    "modo-escritura" if valor == "plan" else valor
+                    for valor in generado[1:]
+                ]
+                self.assertFalse(orqrun._opciones_proveedor("claude", invalido))
+
     def test_modos_solo_lectura_no_heredan_permisos_totales(self):
         with mock.patch.dict(os.environ, {"ORQ_PERMISOS_TOTALES": "1"}):
             claude = orqlib.comando(

@@ -3,7 +3,7 @@
 Estado en disco con bloqueo fcntl: cualquier numero de terminales puede usar
 el sistema a la vez sin corromper el ledger ni los contadores.
 """
-import json, os, re, shlex, shutil, subprocess, sys, threading, time, datetime, fcntl, contextlib, uuid, signal, hashlib, glob
+import json, os, re, shlex, shutil, subprocess, sys, threading, time, datetime, fcntl, contextlib, uuid, signal, hashlib, glob, tempfile, stat, pwd, secrets
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 _SUBPROCESS_RUN_ORIGINAL = subprocess.run
@@ -12,14 +12,23 @@ _SYSTEMD_USUARIO_CACHE = {}
 # El módulo vive dentro de la instalación y es una raíz más fiable que una
 # variable heredada. ``shell.sh`` aún usa ORQ_HOME para localizar el ejecutable,
 # pero el proceso Python deriva su estado desde el archivo que realmente cargó.
-BASE = os.path.dirname(os.path.realpath(__file__))
+CODIGO_ORQUESTA = os.path.dirname(os.path.realpath(__file__))
+BASE = CODIGO_ORQUESTA
+HOME_USUARIO = os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
+TEMP_ROOT = os.path.realpath("/tmp")
 ACCOUNTS = os.path.join(BASE, "accounts")
+ACCOUNTS_USUARIO = os.path.join(HOME_USUARIO, ".local", "share", "orquesta", "accounts")
 PROFILES = os.path.join(BASE, "profiles.json")
 LEDGER = os.path.join(BASE, "state", "ledger.jsonl")
 LIMITS = os.path.join(BASE, "state", "limits.json")
 SCORES = os.path.join(BASE, "state", "scores.json")
 LOCK = os.path.join(BASE, "state", ".lock")
 CLAVE_LIMITE_ANTIGRAVITY = "@antigravity-global"
+MAX_REFS_REMOTAS = 10_000
+
+
+class ErrorConfiguracion(RuntimeError):
+    """La configuracion persistida existe, pero no es segura ni utilizable."""
 
 # MiniMax habla el protocolo de Anthropic: reusamos el binario "claude"
 # apuntandolo a su endpoint. Por eso nunca exportamos estas variables de
@@ -27,6 +36,29 @@ CLAVE_LIMITE_ANTIGRAVITY = "@antigravity-global"
 MINIMAX_BASE_URL = "https://api.minimax.io/anthropic"
 MINIMAX_BASE_URL_CN = "https://api.minimaxi.com/anthropic"
 MINIMAX_MODELO = "MiniMax-M3[1m]"
+MINIMAX_ENDPOINTS = {MINIMAX_BASE_URL, MINIMAX_BASE_URL_CN}
+
+_GIT_INTERNO = [
+    "--no-pager", "--no-replace-objects",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
+    "-c", "core.commitGraph=false", "-c", "fetch.writeCommitGraph=false",
+    "-c", "core.attributesFile=/dev/null", "-c", "credential.helper=",
+    "-c", "core.askPass=", "-c", "core.sshCommand=/usr/bin/ssh",
+    "-c", "ssh.variant=ssh", "-c", "core.gitProxy=",
+    "-c", "protocol.ext.allow=never", "-c", "diff.external=",
+    "-c", "advice.graftFileDeprecated=false",
+    "-c", "commit.gpgSign=false",
+    "-c", "remote.origin.uploadpack=git-upload-pack",
+    "-c", "remote.origin.receivepack=git-receive-pack",
+]
+_GIT_VERIFICACION = [
+    "--no-pager", "--no-replace-objects",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
+    "-c", "core.commitGraph=false",
+    "-c", "advice.graftFileDeprecated=false",
+]
 
 TAREAS = ["code", "agentic", "reasoning", "review", "writing",
           "research", "edicion", "imagen", "bulk"]
@@ -48,6 +80,14 @@ MIN_MUESTRA_REPARTO = 10_000
 
 def id_perfil_valido(pid):
     return bool(ID_PERFIL_RE.fullmatch(str(pid or "")))
+
+
+def base_url_minimax(p):
+    """Acepta solo endpoints HTTPS oficiales para no exfiltrar la API key."""
+    valor = p.get("base_url") or MINIMAX_BASE_URL
+    if not isinstance(valor, str) or valor not in MINIMAX_ENDPOINTS:
+        raise ValueError("endpoint MiniMax no permitido")
+    return valor
 
 
 def run_id_valido(run_id):
@@ -76,14 +116,155 @@ def id_sesion_seguro(valor, fallback):
     ).hexdigest()[:20]
 
 
+def _expandir_usuario(valor):
+    """Expande solo ``~`` del UID real; nunca confía en HOME heredado."""
+    texto = str(valor)
+    if texto == "~":
+        return HOME_USUARIO
+    if texto.startswith("~/"):
+        return os.path.join(HOME_USUARIO, texto[2:])
+    return texto
+
+
 def ruta_contenida(raiz, ruta):
     """Devuelve la ruta canónica solo cuando permanece dentro de ``raiz``."""
-    base = os.path.realpath(os.path.abspath(os.path.expanduser(str(raiz))))
-    destino = os.path.realpath(os.path.abspath(os.path.expanduser(str(ruta))))
-    try:
-        return destino if os.path.commonpath((base, destino)) == base else None
-    except ValueError:
+    base = os.path.realpath(os.path.abspath(_expandir_usuario(raiz)))
+    destino = os.path.realpath(os.path.abspath(_expandir_usuario(ruta)))
+    prefijo = base if base.endswith(os.sep) else base + os.sep
+    comprobable = destino if destino.endswith(os.sep) else destino + os.sep
+    if not comprobable.startswith(prefijo):
         return None
+    return comprobable.rstrip(os.sep) or os.sep
+
+
+def _ruta_en_alguna_raiz(ruta, raices, permitir_raiz=True):
+    """Normaliza ``ruta`` y exige una de las capacidades de directorio dadas."""
+    for raiz in raices:
+        segura = ruta_contenida(raiz, ruta)
+        if segura is not None and (permitir_raiz or segura != os.path.realpath(raiz)):
+            return segura
+    return None
+
+
+def _ruta_sin_enlaces(raiz, ruta):
+    """Exige contención canónica y rechaza enlaces en cualquier componente."""
+    base_lexica = os.path.abspath(_expandir_usuario(raiz))
+    ruta_lexica = os.path.abspath(_expandir_usuario(ruta))
+    prefijo = base_lexica.rstrip(os.sep) + os.sep
+    comprobable = ruta_lexica.rstrip(os.sep) + os.sep
+    # El guard es incondicional, incluida la raíz exacta. Así ninguna rama
+    # llega al walker sin demostrar antes la capacidad léxica.
+    if not comprobable.startswith(prefijo):
+        return None
+    # Todo acceso posterior deriva de la misma expresión normalizada que pasó
+    # el guard de prefijo; no se reutiliza la entrada previa a la comprobación.
+    ruta_lexica = comprobable.rstrip(os.sep) or os.sep
+    segura = ruta_contenida(base_lexica, ruta_lexica)
+    if segura is None:
+        return None
+    # Recorremos la expresión léxica, no ``realpath``: de otro modo un enlace
+    # que apunta de vuelta a la misma raíz desaparecería antes de comprobarlo.
+    cursor = os.path.sep if os.path.isabs(ruta_lexica) else ""
+    for parte in ruta_lexica.split(os.sep):
+        if not parte:
+            continue
+        cursor = os.path.join(cursor, parte)
+        try:
+            if stat.S_ISLNK(os.lstat(cursor).st_mode):
+                return None
+        except FileNotFoundError:
+            # El componente final puede crearse después mediante una operación
+            # descriptor-relativa; los padres ausentes fallarán cerrados allí.
+            continue
+        except OSError:
+            return None
+    return segura
+
+
+def ruta_cuenta(pid, p, campo=None, predeterminado=None):
+    """Resuelve un archivo privado sin permitir que salga del home de la cuenta."""
+    home = home_de(pid, p)
+    valor = p.get(campo) if campo else predeterminado
+    if valor in (None, ""):
+        valor = predeterminado
+    if valor in (None, ""):
+        return None
+    crudo = _expandir_usuario(valor)
+    candidato = crudo if os.path.isabs(crudo) else os.path.join(home, crudo)
+    return _ruta_sin_enlaces(home, candidato)
+
+
+def ruta_trabajo_segura(ruta, raices=None):
+    """Autoriza un cwd canónico dentro de áreas de trabajo controladas.
+
+    Por defecto se permite el directorio personal, la instalación y un
+    directorio temporal privado del usuario. ``raices`` existe para llamadas
+    internas que conceden explícitamente una capacidad más estrecha.
+    """
+    if ruta in (None, ""):
+        return None
+    candidato = os.path.abspath(_expandir_usuario(ruta))
+    autorizadas = tuple(raices) if raices is not None else (
+        HOME_USUARIO, BASE,
+    )
+    segura = None
+    for raiz in autorizadas:
+        segura = _ruta_sin_enlaces(raiz, candidato)
+        if segura is not None:
+            break
+    if segura is None and raices is None:
+        temporal = TEMP_ROOT
+        segura = _ruta_sin_enlaces(temporal, candidato)
+        if segura == os.path.realpath(temporal):
+            segura = None
+        if segura is not None:
+            try:
+                relativa = os.path.relpath(segura, os.path.realpath(temporal))
+                privada = os.path.join(
+                    os.path.realpath(temporal), relativa.split(os.sep, 1)[0]
+                )
+                estado = os.stat(privada, follow_symlinks=False)
+                if (estado.st_uid != os.getuid() or estado.st_mode & 0o077
+                        or os.path.islink(privada)):
+                    segura = None
+            except OSError:
+                segura = None
+    return segura if segura and os.path.isdir(segura) else None
+
+
+def preparar_ruta_trabajo(ruta, crear=False):
+    """Valida un cwd y, si se autoriza, crea descendientes con ``mkdirat``."""
+    segura = ruta_trabajo_segura(ruta)
+    if segura or not crear or ruta in (None, ""):
+        return segura
+    candidato = os.path.abspath(_expandir_usuario(ruta))
+    segura = None
+    for raiz in (HOME_USUARIO, BASE):
+        opcion = _ruta_sin_enlaces(raiz, candidato)
+        if opcion is not None:
+            segura = opcion
+            break
+    if segura is None:
+        temporal = TEMP_ROOT
+        dentro_tmp = _ruta_sin_enlaces(temporal, candidato)
+        if dentro_tmp and dentro_tmp != temporal:
+            relativa = os.path.relpath(dentro_tmp, temporal)
+            privada = os.path.join(temporal, relativa.split(os.sep, 1)[0])
+            try:
+                estado = os.stat(privada, follow_symlinks=False)
+                if (stat.S_ISDIR(estado.st_mode) and estado.st_uid == os.getuid()
+                        and not estado.st_mode & 0o077 and not os.path.islink(privada)):
+                    segura = _ruta_sin_enlaces(privada, candidato)
+            except OSError:
+                segura = None
+    if segura is None:
+        return None
+    try:
+        with _abrir_directorio_seguro(segura, crear=True):
+            pass
+    except OSError:
+        return None
+    return ruta_trabajo_segura(segura)
 
 
 def admite_tarea(p, tarea):
@@ -124,8 +305,7 @@ VENTANA_PLAN = {"max": 5, "pro": 5, "team": 5, "api": 1, "free": 5, "desconocido
 
 @contextlib.contextmanager
 def bloqueo():
-    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
-    f = open(LOCK, "a+")
+    f = _abrir_lock(LOCK)
     try:
         fcntl.flock(f, fcntl.LOCK_EX)
         yield
@@ -134,29 +314,521 @@ def bloqueo():
         f.close()
 
 
+@contextlib.contextmanager
+def _abrir_directorio_seguro(path, crear=False, modo=0o700):
+    """Abre un directorio absoluto componente a componente, sin symlinks.
+
+    El descriptor resultante es una capacidad estable aunque otro proceso
+    renombre rutas mientras dura la operación. Si ``crear`` está activo, cada
+    componente ausente se crea con ``mkdirat`` y se vuelve a abrir sin seguir
+    enlaces; una carrera que coloque otra entrada hace fallar la operación.
+    """
+    absoluto = os.path.abspath(_expandir_usuario(path))
+    if not os.path.isabs(absoluto):
+        raise OSError("el directorio seguro debe ser absoluto")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(os.path.sep, flags)
+    try:
+        for parte in absoluto.split(os.sep):
+            if not parte:
+                continue
+            try:
+                siguiente = os.open(parte, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not crear:
+                    raise
+                try:
+                    os.mkdir(parte, modo, dir_fd=fd)
+                except FileExistsError:
+                    # Otro proceso seguro pudo crear el mismo componente entre
+                    # openat y mkdirat. La reapertura O_NOFOLLOW revalida tipo.
+                    pass
+                siguiente = os.open(parte, flags, dir_fd=fd)
+            if not stat.S_ISDIR(os.fstat(siguiente).st_mode):
+                os.close(siguiente)
+                raise OSError("un componente no es un directorio regular")
+            os.close(fd)
+            fd = siguiente
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _adquirir_capacidad_trabajo(ruta, raices=None):
+    """Mantiene un cwd autorizado como descriptor, no como nombre mutable.
+
+    La validacion de política decide qué ruta puede adquirirse y el walker
+    ``openat``/``O_NOFOLLOW`` abre exactamente ese directorio. Desde ese punto
+    los consumidores heredan el descriptor: renombrar la entrada o sustituirla
+    por un symlink no cambia la capacidad ya adquirida.
+    """
+    if ruta in (None, ""):
+        raise OSError("directorio de trabajo no autorizado")
+    candidato = os.path.abspath(_expandir_usuario(ruta))
+    bases = tuple(raices) if raices is not None else (HOME_USUARIO, BASE)
+    opciones = []
+    for base in bases:
+        lexica = os.path.abspath(_expandir_usuario(base))
+        prefijo = lexica.rstrip(os.sep) + os.sep
+        comprobable = candidato.rstrip(os.sep) + os.sep
+        if comprobable.startswith(prefijo):
+            opciones.append((lexica, False))
+    if raices is None:
+        temporal = os.path.abspath(TEMP_ROOT)
+        prefijo_tmp = temporal.rstrip(os.sep) + os.sep
+        comprobable = candidato.rstrip(os.sep) + os.sep
+        if comprobable.startswith(prefijo_tmp) and candidato != temporal:
+            opciones.append((temporal, True))
+    if not opciones:
+        raise OSError("directorio de trabajo fuera de las raices autorizadas")
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    ultimo_error = None
+    # La raíz más específica gana si la instalación vive dentro del HOME.
+    for base, es_temporal in sorted(opciones, key=lambda x: len(x[0]), reverse=True):
+        try:
+            with _abrir_directorio_seguro(base) as base_fd:
+                base_visible = os.path.realpath(f"/proc/self/fd/{base_fd}")
+                relativa = os.path.relpath(candidato, base)
+                partes = [] if relativa == "." else relativa.split(os.sep)
+                if any(p in ("", ".", "..") for p in partes):
+                    raise OSError("componente cwd invalido")
+                fd = os.dup(base_fd)
+                try:
+                    for indice, parte in enumerate(partes):
+                        siguiente = os.open(parte, flags, dir_fd=fd)
+                        os.close(fd)
+                        fd = siguiente
+                        estado = os.fstat(fd)
+                        if not stat.S_ISDIR(estado.st_mode):
+                            raise OSError("un componente cwd no es directorio")
+                        if es_temporal and indice == 0 and (
+                                estado.st_uid != os.getuid()
+                                or estado.st_mode & 0o077):
+                            raise OSError("raiz temporal no privada")
+                    estado = os.fstat(fd)
+                    if not stat.S_ISDIR(estado.st_mode):
+                        raise OSError("la capacidad cwd no es directorio")
+                    adquirida = os.path.realpath(f"/proc/self/fd/{fd}")
+                    prefijo = base_visible.rstrip(os.sep) + os.sep
+                    comprobable = adquirida.rstrip(os.sep) + os.sep
+                    if (adquirida.endswith(" (deleted)")
+                            or not comprobable.startswith(prefijo)):
+                        raise OSError("el cwd cambio durante la adquisicion")
+                except Exception:
+                    os.close(fd)
+                    raise
+                return adquirida, fd
+        except OSError as exc:
+            ultimo_error = exc
+    raise OSError("no pude adquirir el cwd de forma estable") from ultimo_error
+
+
+@contextlib.contextmanager
+def _capacidad_trabajo(ruta, raices=None):
+    """Contexto que cierra la capacidad sin capturar fallos del consumidor."""
+    adquirida, fd = _adquirir_capacidad_trabajo(ruta, raices=raices)
+    try:
+        yield adquirida, fd
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _capacidad_raiz_git(cwd_fd):
+    """Deriva el top-level Git ascendiendo desde un cwd ya adquirido.
+
+    Git solo aporta cuántos componentes separan el cwd de la raíz. Cada
+    ascenso usa ``openat('..')`` sobre el descriptor anterior, de modo que no
+    se reabre el nombre mutable devuelto por ``--show-toplevel``.
+    """
+    prefijo_r = _git(".", "rev-parse", "--show-prefix", cwd_fd=cwd_fd)
+    if not prefijo_r or prefijo_r.returncode != 0:
+        raise OSError("el cwd adquirido no pertenece a un repositorio Git")
+    crudo = prefijo_r.stdout
+    if (not isinstance(crudo, str) or not crudo.endswith("\n")
+            or "\n" in crudo[:-1] or "\r" in crudo or "\x00" in crudo):
+        raise OSError("prefijo Git invalido")
+    prefijo = crudo[:-1]
+    if prefijo and not prefijo.endswith("/"):
+        raise OSError("prefijo Git incompleto")
+    partes = prefijo[:-1].split("/") if prefijo else []
+    if any(parte in ("", ".", "..") for parte in partes):
+        raise OSError("prefijo Git inseguro")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) \
+        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    raiz_fd = os.dup(cwd_fd)
+    try:
+        for _parte in partes:
+            padre_fd = os.open("..", flags, dir_fd=raiz_fd)
+            os.close(raiz_fd)
+            raiz_fd = padre_fd
+        estado = os.fstat(raiz_fd)
+        if not stat.S_ISDIR(estado.st_mode):
+            raise OSError("raiz Git no es un directorio")
+        # Confirma sobre el descriptor derivado que ya estamos en el top-level.
+        raiz_r = _git(".", "rev-parse", "--show-prefix", cwd_fd=raiz_fd)
+        if not raiz_r or raiz_r.returncode != 0 or raiz_r.stdout != "\n":
+            raise OSError("raiz Git incoherente")
+        visible = os.path.realpath(f"/proc/self/fd/{raiz_fd}")
+        if visible.endswith(" (deleted)"):
+            raise OSError("raiz Git eliminada")
+        yield visible, raiz_fd, prefijo
+    finally:
+        os.close(raiz_fd)
+
+
+def cambiar_directorio_trabajo(ruta, raices=None):
+    """Cambia cwd mediante una capacidad estable y devuelve la ruta validada."""
+    with _capacidad_trabajo(ruta, raices=raices) as (segura, fd):
+        os.fchdir(fd)
+        return segura
+
+
+@contextlib.contextmanager
+def _abrir_regular(path, errors=None, mode="r", privado=False):
+    """Abre un archivo regular mediante su padre estable y sin symlinks."""
+    absoluto = os.path.abspath(_expandir_usuario(path))
+    directorio, nombre = os.path.split(absoluto)
+    if not nombre or nombre in (".", "..") or os.sep in nombre:
+        raise OSError("nombre de archivo invalido")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    with _abrir_directorio_seguro(directorio) as dir_fd:
+        fd = os.open(nombre, flags, dir_fd=dir_fd)
+        try:
+            estado = os.fstat(fd)
+            if not stat.S_ISREG(estado.st_mode):
+                raise OSError("la ruta no es un archivo regular")
+            if privado and (estado.st_uid != os.getuid() or estado.st_nlink != 1
+                            or estado.st_mode & 0o077):
+                raise OSError(
+                    "el archivo privado tiene propietario, modo o enlaces inseguros"
+                )
+            opciones = {} if "b" in mode else {"errors": errors}
+            with os.fdopen(fd, mode, **opciones) as f:
+                fd = None
+                yield f
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+
+def _identidad_estado(estado):
+    return [estado.st_mtime_ns, estado.st_dev, estado.st_ino, estado.st_size]
+
+
+@contextlib.contextmanager
+def _abrir_regular_identidad(path, identidad=None, errors=None, mode="r"):
+    """Reabre un archivo privado y exige la identidad observada por el walker."""
+    with _abrir_regular(path, errors=errors, mode=mode, privado=True) as archivo:
+        if identidad is not None and _identidad_estado(
+                os.fstat(archivo.fileno())) != list(identidad):
+            raise OSError("el archivo cambio despues de enumerarlo")
+        yield archivo
+
+
+def _abrir_lock(path):
+    """Abre un lock privado sin seguir enlaces ni aceptar hardlinks."""
+    absoluto = os.path.abspath(_expandir_usuario(path))
+    directorio, nombre = os.path.split(absoluto)
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    with _abrir_directorio_seguro(directorio, crear=True) as dir_fd:
+        fd = os.open(nombre, flags, 0o600, dir_fd=dir_fd)
+        try:
+            estado = os.fstat(fd)
+            if (not stat.S_ISREG(estado.st_mode) or estado.st_uid != os.getuid()
+                    or estado.st_nlink != 1):
+                raise OSError("lock inseguro")
+            os.fchmod(fd, 0o600)
+            return os.fdopen(fd, "a+")
+        except Exception:
+            os.close(fd)
+            raise
+
+
+def _anexar_texto(path, contenido):
+    """Anexa a un regular privado usando un descriptor de directorio estable."""
+    absoluto = os.path.abspath(_expandir_usuario(path))
+    directorio, nombre = os.path.split(absoluto)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    with _abrir_directorio_seguro(directorio, crear=True) as dir_fd:
+        fd = os.open(nombre, flags, 0o600, dir_fd=dir_fd)
+        try:
+            estado = os.fstat(fd)
+            if (not stat.S_ISREG(estado.st_mode) or estado.st_uid != os.getuid()
+                    or estado.st_nlink != 1):
+                raise OSError("archivo de estado inseguro")
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "a") as archivo:
+                fd = None
+                archivo.write(str(contenido))
+                archivo.flush()
+                os.fsync(archivo.fileno())
+            os.fsync(dir_fd)
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+
+def _vaciar_regular_privado_at(dir_fd, nombre, esperado=None):
+    """Vacía un regular estable sin borrar una entrada que pueda ser sustituida.
+
+    ``unlinkat`` no permite ligar el borrado al descriptor del archivo ya
+    validado. Una sustitución entre ``stat`` y ``unlink`` podría borrar otro
+    inode. Conservamos por ello la entrada vacía y hacemos ``ftruncate`` sobre
+    el descriptor abierto con ``O_NOFOLLOW``, tras comprobar su identidad.
+    """
+    if not isinstance(nombre, str) or not nombre or nombre in (".", ".."):
+        raise OSError("nombre de archivo invalido")
+    if esperado is None:
+        esperado = os.stat(nombre, dir_fd=dir_fd, follow_symlinks=False)
+    flags = os.O_WRONLY | getattr(os, "O_CLOEXEC", 0) \
+        | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(nombre, flags, dir_fd=dir_fd)
+    try:
+        estado = os.fstat(fd)
+        identidad = lambda st: (st.st_dev, st.st_ino, st.st_mode,
+                                 st.st_uid, st.st_nlink)
+        if (identidad(estado) != identidad(esperado)
+                or not stat.S_ISREG(estado.st_mode)
+                or estado.st_uid != os.getuid() or estado.st_nlink != 1):
+            raise OSError("archivo privado inseguro o sustituido")
+        os.ftruncate(fd, 0)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return True
+
+
+def _eliminar_regular_privado(path):
+    """Inutiliza el contenido privado y conserva una entrada vacía estable."""
+    absoluto = os.path.abspath(_expandir_usuario(path))
+    directorio, nombre = os.path.split(absoluto)
+    if not nombre or nombre in (".", ".."):
+        raise OSError("nombre de archivo invalido")
+    with _abrir_directorio_seguro(directorio) as dir_fd:
+        esperado = os.stat(nombre, dir_fd=dir_fd, follow_symlinks=False)
+        _vaciar_regular_privado_at(dir_fd, nombre, esperado)
+        os.fsync(dir_fd)
+
+
+def _leer_texto(path, default=None, limite=8 * 1024 * 1024, privado=True):
+    """Lee solo un archivo regular y rechaza el seguimiento del enlace final."""
+    try:
+        with _abrir_regular(path, privado=privado) as f:
+            contenido = f.read(limite + 1)
+            return contenido if len(contenido) <= limite else default
+    except (OSError, UnicodeError):
+        return default
+
+
+def _lineas_acotadas(archivo, bytes_totales=32 * 1024 * 1024,
+                      bytes_linea=1024 * 1024, filas=100_000):
+    """Itera líneas completas sin materializar una línea o archivo hostil."""
+    restantes = max(0, int(bytes_totales))
+    for _ in range(max(0, int(filas))):
+        if restantes <= 0:
+            return
+        linea = archivo.readline(min(bytes_linea + 1, restantes + 1))
+        if not linea:
+            return
+        restantes -= len(linea)
+        if len(linea) > bytes_linea or not linea.endswith("\n"):
+            while linea and not linea.endswith("\n") and restantes > 0:
+                linea = archivo.readline(min(64 * 1024, restantes))
+                restantes -= len(linea)
+            continue
+        yield linea
+
+
 def _leer(path, default):
-    if not os.path.exists(path):
+    contenido = _leer_texto(path)
+    if contenido is None:
         return default
     try:
-        with open(path) as f:
-            return json.load(f)
-    except Exception:
+        return json.loads(contenido)
+    except (ValueError, TypeError):
         return default
+
+
+def _reemplazar_atomico(path, escritor):
+    """Publica bytes con ``openat``/``renameat`` atómicos y privados."""
+    absoluto = os.path.abspath(_expandir_usuario(path))
+    directorio, nombre = os.path.split(absoluto)
+    if not nombre or nombre in (".", "..") or os.sep in nombre:
+        raise OSError("nombre de archivo invalido")
+    tmp = None
+    with _abrir_directorio_seguro(directorio, crear=True) as dir_fd:
+        try:
+            estado = os.stat(nombre, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            estado = None
+        if estado is not None and not stat.S_ISREG(estado.st_mode):
+            raise OSError("destino de estado no es un archivo regular")
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        for _ in range(32):
+            candidato = f".{nombre}.{uuid.uuid4().hex}.tmp"
+            try:
+                fd = os.open(candidato, flags, 0o600, dir_fd=dir_fd)
+                tmp = candidato
+                break
+            except FileExistsError:
+                continue
+        if tmp is None:
+            raise OSError("no pude reservar un archivo temporal privado")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                escritor(f)
+                f.flush()
+                os.fsync(f.fileno())
+            # Revalidar el tipo justo antes del reemplazo mantiene el fallo
+            # cerrado. ``renameat`` nunca sigue la entrada de destino.
+            try:
+                estado = os.stat(nombre, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                estado = None
+            if estado is not None and not stat.S_ISREG(estado.st_mode):
+                raise OSError("destino de estado cambio a una entrada insegura")
+            os.replace(tmp, nombre, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            tmp = None
+            os.fsync(dir_fd)
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    pass
+
+
+def _escribir_texto(path, contenido):
+    datos = str(contenido).encode("utf-8")
+    _reemplazar_atomico(path, lambda archivo: archivo.write(datos))
+
+
+def _copiar_regular_atomico(origen, destino, identidad=None):
+    """Publica una copia privada atómica y falla si ``destino`` ya existe."""
+    absoluto = os.path.abspath(_expandir_usuario(destino))
+    directorio, nombre = os.path.split(absoluto)
+    if not nombre or nombre in (".", ".."):
+        raise OSError("nombre de destino invalido")
+    temporal = None
+    with _abrir_regular_identidad(origen, identidad, mode="rb") as fuente, \
+            _abrir_directorio_seguro(directorio, crear=True) as dir_fd:
+        if os.fstat(fuente.fileno()).st_size > 128 * 1024 * 1024:
+            raise OSError("imagen demasiado grande")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        for _ in range(32):
+            temporal = f".imagen-{uuid.uuid4().hex}.tmp"
+            try:
+                fd = os.open(temporal, flags, 0o600, dir_fd=dir_fd)
+                break
+            except FileExistsError:
+                temporal = None
+        if temporal is None:
+            raise OSError("no pude reservar una copia temporal")
+        try:
+            with os.fdopen(fd, "wb") as salida:
+                shutil.copyfileobj(fuente, salida, 1024 * 1024)
+                salida.flush()
+                os.fsync(salida.fileno())
+            # linkat publica solo si el nombre sigue libre; nunca reemplaza una
+            # imagen creada por otro proceso entre la selección y la copia.
+            os.link(temporal, nombre, src_dir_fd=dir_fd, dst_dir_fd=dir_fd,
+                    follow_symlinks=False)
+            os.unlink(temporal, dir_fd=dir_fd)
+            temporal = None
+            os.fsync(dir_fd)
+        finally:
+            if temporal is not None:
+                try:
+                    os.unlink(temporal, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    pass
+    return absoluto
+
+
+def _copiar_regular_unico(origen, destino, identidad=None, intentos=100):
+    """Elige un sufijo mediante publicación O_EXCL, sin prueba TOCTOU previa."""
+    tronco, extension = os.path.splitext(destino)
+    for numero in range(intentos):
+        candidato = destino if numero == 0 else f"{tronco}-{numero}{extension}"
+        try:
+            return _copiar_regular_atomico(origen, candidato, identidad)
+        except FileExistsError:
+            continue
+    raise OSError("demasiadas colisiones al publicar la imagen")
 
 
 def _escribir(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+    _escribir_texto(path, json.dumps(data, indent=2, ensure_ascii=False))
 
 
 def cfg():
-    return _leer(PROFILES, {"profiles": {}})
+    """Carga ``profiles.json`` sin convertir errores en una config vacia.
+
+    La ausencia del archivo representa una instalacion aun no configurada. En
+    cambio, si la entrada existe pero no puede abrirse como regular privado, es
+    demasiado grande o contiene JSON invalido, continuar con un diccionario
+    vacio permitiria que una escritura posterior reemplazara configuracion
+    real que nunca se llego a leer. Esos casos fallan de forma visible.
+    """
+    try:
+        with _abrir_regular(PROFILES, privado=True) as archivo:
+            contenido = archivo.read(8 * 1024 * 1024 + 1)
+    except FileNotFoundError:
+        return {"profiles": {}}
+    except (OSError, UnicodeError) as exc:
+        raise ErrorConfiguracion(
+            "profiles.json no es un archivo privado legible; "
+            "usa un regular propio con modo 0600"
+        ) from exc
+    if len(contenido) > 8 * 1024 * 1024:
+        raise ErrorConfiguracion("profiles.json excede el limite de 8 MiB")
+    try:
+        config = json.loads(contenido)
+    except (ValueError, TypeError) as exc:
+        raise ErrorConfiguracion("profiles.json no contiene JSON valido") from exc
+    if (not isinstance(config, dict)
+            or not isinstance(config.get("profiles", {}), dict)):
+        raise ErrorConfiguracion(
+            "profiles.json debe ser un objeto con un mapa 'profiles'"
+        )
+    return config
 
 
 def guardar_cfg(c):
+    if (not isinstance(c, dict)
+            or not isinstance(c.get("profiles", {}), dict)):
+        raise ErrorConfiguracion("no se escribio una configuracion invalida")
     _escribir(PROFILES, c)
 
 
@@ -178,9 +850,22 @@ def hoy():
 
 def ledger_rows(dias=None):
     rows = []
-    if os.path.exists(LEDGER):
-        with open(LEDGER) as f:
-            for line in f:
+    try:
+        with _abrir_regular(LEDGER, privado=True) as f:
+            numero = 0
+            restantes = 32 * 1024 * 1024
+            while numero < 100_000 and restantes > 0:
+                line = f.readline(min(1_000_001, restantes + 1))
+                if not line:
+                    break
+                restantes -= len(line)
+                numero += 1
+                if len(line) > 1_000_000 or not line.endswith("\n"):
+                    # Drena el resto de una línea sobredimensionada en bloques.
+                    while line and not line.endswith("\n") and restantes > 0:
+                        line = f.readline(min(64 * 1024, restantes))
+                        restantes -= len(line)
+                    continue
                 line = line.strip()
                 if not line:
                     continue
@@ -188,6 +873,8 @@ def ledger_rows(dias=None):
                     rows.append(json.loads(line))
                 except json.JSONDecodeError:
                     pass
+    except (OSError, UnicodeError):
+        pass
     if dias:
         corte = (ahora() - datetime.timedelta(days=dias)).date().isoformat()
         rows = [r for r in rows if r.get("fecha", "") >= corte]
@@ -196,9 +883,7 @@ def ledger_rows(dias=None):
 
 def log(entry):
     with bloqueo():
-        os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
-        with open(LEDGER, "a") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        _anexar_texto(LEDGER, json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def gastado_hoy(pid):
@@ -224,29 +909,131 @@ def gastado_ventana(pid, horas):
 
 # ---------------- cuentas ----------------
 def home_de(pid, p):
+    """Devuelve solo un home administrado o el home oficial del proveedor."""
+    if not id_perfil_valido(pid):
+        raise ValueError("id de cuenta invalido")
     h = p.get("home")
     if h:
-        h = os.path.expanduser(h)
-        return os.path.abspath(h if os.path.isabs(h) else os.path.join(BASE, h))
-    return os.path.join(ACCOUNTS, pid)
+        h = _expandir_usuario(h)
+        candidato = h if os.path.isabs(h) else os.path.join(BASE, h)
+    else:
+        candidato = os.path.join(BASE, "accounts", pid)
+    candidato = os.path.abspath(candidato)
+    administrados = (
+        os.path.join(BASE, "accounts", pid),
+        os.path.join(ACCOUNTS_USUARIO, pid),
+    )
+    oficiales = {
+        "claude": os.path.join(HOME_USUARIO, ".claude"),
+        "gpt": os.path.join(HOME_USUARIO, ".codex"),
+        "gemini": os.path.join(HOME_USUARIO, ".gemini"),
+        "antigravity": os.path.join(HOME_USUARIO, ".gemini", "antigravity-cli"),
+    }
+    permitidos = list(administrados)
+    oficial = oficiales.get(p.get("provider"))
+    if oficial:
+        permitidos.append(oficial)
+    for permitido in permitidos:
+        if os.path.abspath(_expandir_usuario(permitido)) != candidato:
+            continue
+        seguro = _ruta_sin_enlaces(os.path.dirname(permitido), candidato)
+        if seguro == os.path.realpath(permitido):
+            return seguro
+    raise ValueError("home de cuenta fuera de los directorios administrados")
+
+
+def ruta_api_key(pid, p):
+    """La clave API ocupa un archivo dedicado; nunca otra credencial del home."""
+    home = home_de(pid, p)
+    valor = p.get("api_key_file") or "api_key"
+    crudo = _expandir_usuario(valor)
+    candidato = crudo if os.path.isabs(crudo) else os.path.join(home, crudo)
+    esperado = os.path.join(home, "api_key")
+    segura = _ruta_sin_enlaces(home, candidato)
+    return segura if segura == esperado else None
 
 
 def home_purgable(pid, p):
-    """Solo permite purgar el directorio privado directo de ese id."""
+    """Devuelve solo el directorio privado directo y canónico de ese id."""
     if not id_perfil_valido(pid):
         return False
-    actual = os.path.realpath(home_de(pid, p))
-    esperado = os.path.realpath(os.path.join(ACCOUNTS, pid))
     try:
-        dentro = os.path.commonpath([actual, os.path.realpath(ACCOUNTS)]) \
-            == os.path.realpath(ACCOUNTS)
+        actual = os.path.realpath(home_de(pid, p))
     except ValueError:
+        return None
+    esperado = os.path.realpath(os.path.join(ACCOUNTS, pid))
+    dentro = ruta_contenida(ACCOUNTS, actual)
+    return actual if dentro is not None and actual == esperado else None
+
+
+def purgar_home_cuenta(pid, p):
+    """Vacía ``accounts/<id>`` usando solo capacidades descriptor-relativas.
+
+    Conserva los directorios y entradas regulares vacíos: POSIX no permite
+    ligar ``unlink``/``rmdir`` al descriptor ya validado y reabrir por nombre
+    introduciría una carrera identidad→borrado. ``--purge`` inutiliza el
+    contenido secreto sin prometer borrar nombres o contenedores.
+    """
+    esperado = home_purgable(pid, p)
+    if not esperado:
         return False
-    return dentro and actual == esperado
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) \
+        | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+
+    def vaciar(dir_fd, dispositivo, presupuesto, profundidad=0):
+        if profundidad > 32:
+            raise OSError("home demasiado profundo para purgar")
+        with os.scandir(dir_fd) as entradas:
+            for entrada in entradas:
+                presupuesto[0] -= 1
+                if presupuesto[0] < 0:
+                    raise OSError("home demasiado grande para purgar")
+                previo = entrada.stat(follow_symlinks=False)
+                if previo.st_uid != os.getuid() or previo.st_dev != dispositivo:
+                    raise OSError("entrada de credenciales no privada")
+                identidad = (previo.st_dev, previo.st_ino, previo.st_mode)
+                if stat.S_ISDIR(previo.st_mode):
+                    hijo_fd = os.open(entrada.name, flags, dir_fd=dir_fd)
+                    try:
+                        abierto = os.fstat(hijo_fd)
+                        if ((abierto.st_dev, abierto.st_ino, abierto.st_mode)
+                                != identidad):
+                            raise OSError("directorio de credenciales cambio")
+                        vaciar(hijo_fd, dispositivo, presupuesto, profundidad + 1)
+                    finally:
+                        os.close(hijo_fd)
+                elif stat.S_ISREG(previo.st_mode):
+                    _vaciar_regular_privado_at(dir_fd, entrada.name, previo)
+                else:
+                    # Symlinks, sockets, fifos y dispositivos se preservan y
+                    # hacen fallar la purga; nunca se borran por nombre.
+                    raise OSError("entrada de credenciales no regular")
+        os.fsync(dir_fd)
+
+    try:
+        with _abrir_directorio_seguro(ACCOUNTS) as accounts_fd:
+            cuenta_fd = os.open(pid, flags, dir_fd=accounts_fd)
+            try:
+                estado = os.fstat(cuenta_fd)
+                if (not stat.S_ISDIR(estado.st_mode)
+                        or estado.st_uid != os.getuid() or estado.st_mode & 0o077):
+                    return False
+                vaciar(cuenta_fd, estado.st_dev, [100_000])
+            finally:
+                os.close(cuenta_fd)
+            os.fsync(accounts_fd)
+        return True
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        return False
 
 
 def entorno(pid, p):
     env = dict(os.environ)
+    env["HOME"] = HOME_USUARIO
+    env["PATH"] = os.pathsep.join([
+        os.path.join(HOME_USUARIO, ".local", "bin"),
+        "/usr/local/bin", "/usr/bin", "/bin",
+    ])
     prov = p.get("provider")
     h = home_de(pid, p)
     # Nunca heredar credenciales/endpoints de la cuenta elegida manualmente en
@@ -259,20 +1046,31 @@ def entorno(pid, p):
         "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL", "OPENAI_API_KEY", "CODEX_API_KEY",
         "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_USE_GCA",
-        "GEMINI_CLI_TRUST_WORKSPACE",
+        "GEMINI_CLI_TRUST_WORKSPACE", "BROWSER", "PAGER", "GIT_PAGER",
+        "EDITOR", "VISUAL", "NODE_OPTIONS", "PYTHONPATH", "PYTHONHOME",
+        "BASH_ENV", "ENV", "SHELLOPTS", "GIT_SSH_COMMAND", "GIT_ASKPASS",
+        "SSH_ASKPASS", "GIT_EXEC_PATH", "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT", "LD_PRELOAD", "LD_LIBRARY_PATH",
     ):
         env.pop(nombre, None)
+    for nombre in tuple(env):
+        if (nombre.startswith("DYLD_") or nombre.startswith("GIT_CONFIG_KEY_")
+                or nombre.startswith("GIT_CONFIG_VALUE_")):
+            env.pop(nombre, None)
     if prov == "claude":
         env["CLAUDE_CONFIG_DIR"] = h
     elif prov == "gpt":
         env["CODEX_HOME"] = h
     elif prov == "minimax":
         env["CLAUDE_CONFIG_DIR"] = h
-        env["ANTHROPIC_BASE_URL"] = p.get("base_url") or MINIMAX_BASE_URL
-        k = p.get("api_key_file")
-        if k and os.path.exists(os.path.expanduser(k)):
-            with open(os.path.expanduser(k)) as archivo:
-                env["ANTHROPIC_AUTH_TOKEN"] = archivo.read().strip()
+        env["ANTHROPIC_BASE_URL"] = base_url_minimax(p)
+        k = ruta_api_key(pid, p)
+        if k and os.path.isfile(k) and not os.path.islink(k):
+            clave = _leer_texto(k, "").strip()
+            if clave:
+                env["ANTHROPIC_AUTH_TOKEN"] = clave
+        if "ANTHROPIC_AUTH_TOKEN" not in env:
+            raise ValueError("la cuenta MiniMax no tiene una API key privada")
         m = p.get("model") or MINIMAX_MODELO
         for v in ("ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
                   "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
@@ -285,26 +1083,41 @@ def entorno(pid, p):
     elif prov == "gemini":
         env["GEMINI_CLI_HOME"] = h
         env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
-        k = p.get("api_key_file")
+        k = ruta_api_key(pid, p)
         if p.get("auth") == "oauth":
             env["GOOGLE_GENAI_USE_GCA"] = "true"
-        elif k and os.path.exists(os.path.expanduser(k)):
-            with open(os.path.expanduser(k)) as archivo:
-                env["GEMINI_API_KEY"] = archivo.read().strip()
-    for k, v in (p.get("env") or {}).items():
-        env[k] = v
+        elif k and os.path.isfile(k) and not os.path.islink(k):
+            clave = _leer_texto(k, "").strip()
+            if clave:
+                env["GEMINI_API_KEY"] = clave
+        if p.get("auth") != "oauth" and "GEMINI_API_KEY" not in env:
+            raise ValueError("la cuenta Gemini no tiene una API key privada")
+    personalizadas = p.get("env") or {}
+    if not isinstance(personalizadas, dict):
+        raise ValueError("env del perfil debe ser un objeto")
+    # Una blocklist no alcanza: NODE_OPTIONS, BROWSER, pagers y variables de
+    # Git/SSH también pueden cargar código. Solo admitimos ajustes escalares que
+    # no seleccionan ejecutables, loaders, rutas, credenciales ni endpoints.
+    permitidas = {"API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "NO_COLOR"}
+    for k, v in personalizadas.items():
+        if not isinstance(k, str) or k not in permitidas:
+            raise ValueError("variable de entorno no permitida en el perfil")
+        if not isinstance(v, (str, int, float, bool)):
+            raise ValueError("valor de entorno no escalar en el perfil")
+        env[k] = str(v)
     # Todo `git push` iniciado por una IA hereda un pre-push que escanea cada
     # commit. La publicacion normal de Orquesta vuelve a escanear por su cuenta;
     # esta capa evita que un modelo se salte accidentalmente el gate.
     hook = os.path.join(BASE, "tools", "git-hooks")
     if os.path.isfile(os.path.join(hook, "pre-push")):
-        try:
-            n_git = int(env.get("GIT_CONFIG_COUNT", "0"))
-        except (TypeError, ValueError):
-            n_git = 0
-        env[f"GIT_CONFIG_KEY_{n_git}"] = "core.hooksPath"
-        env[f"GIT_CONFIG_VALUE_{n_git}"] = hook
-        env["GIT_CONFIG_COUNT"] = str(n_git + 1)
+        for nombre in tuple(env):
+            if (nombre == "GIT_CONFIG_PARAMETERS" or nombre == "GIT_CONFIG_COUNT"
+                    or nombre.startswith("GIT_CONFIG_KEY_")
+                    or nombre.startswith("GIT_CONFIG_VALUE_")):
+                env.pop(nombre, None)
+        env["GIT_CONFIG_KEY_0"] = "core.hooksPath"
+        env["GIT_CONFIG_VALUE_0"] = hook
+        env["GIT_CONFIG_COUNT"] = "1"
         env["ORQ_HOME"] = BASE
     return env
 
@@ -344,11 +1157,13 @@ def chrome_claude_instalado():
     """Detecta la extension oficial sin leer datos ni sesiones del navegador."""
     extension_id = "fcoeoabgfenejglbffodgkkbkcdhcgfn"
     patrones = [
-        os.path.expanduser(
-            f"~/.config/google-chrome/*/Extensions/{extension_id}/*/manifest.json"
+        os.path.join(
+            HOME_USUARIO, ".config", "google-chrome", "*", "Extensions",
+            extension_id, "*", "manifest.json",
         ),
-        os.path.expanduser(
-            f"~/.config/chromium/*/Extensions/{extension_id}/*/manifest.json"
+        os.path.join(
+            HOME_USUARIO, ".config", "chromium", "*", "Extensions",
+            extension_id, "*", "manifest.json",
         ),
     ]
     return any(glob.glob(patron) for patron in patrones)
@@ -383,13 +1198,13 @@ def comando(p, prompt, session_id=None, resume=False, solo_lectura=False):
             base += ["--model", modelo]
         if mx.get("effort"):
             base += ["--effort", mx["effort"]]
-        return base + [prompt]
+        return base + ["--", prompt]
     if prov == "minimax":
         base = ["claude", "-p", "--output-format", "json"] + perm
         if solo_lectura:
             base += ["--permission-mode", "plan"]
         base += ["--model", modelo or MINIMAX_MODELO]
-        return base + [prompt]
+        return base + ["--", prompt]
     if prov == "gpt":
         base = ["codex", "exec", "--skip-git-repo-check"] + perm
         if solo_lectura:
@@ -398,7 +1213,7 @@ def comando(p, prompt, session_id=None, resume=False, solo_lectura=False):
             base += ["-m", modelo]
         if mx.get("reasoning"):
             base += ["-c", f'model_reasoning_effort="{mx["reasoning"]}"']
-        return base + [prompt]
+        return base + ["--", prompt]
     if prov == "antigravity":
         base = ["agy", "--output-format", "json"] + perm
         if modelo:
@@ -417,24 +1232,41 @@ def comando(p, prompt, session_id=None, resume=False, solo_lectura=False):
 def autenticado(pid, p):
     prov = p.get("provider")
     h = home_de(pid, p)
+
+    def privada(ruta, no_vacia=False):
+        if not ruta:
+            return False
+        try:
+            with _abrir_regular(ruta, privado=True) as archivo:
+                return bool(archivo.read(1)) if no_vacia else True
+        except OSError:
+            return False
+
     if prov == "claude":
-        return os.path.exists(os.path.join(h, ".credentials.json"))
+        credencial = ruta_cuenta(pid, p, predeterminado=".credentials.json")
+        return privada(credencial)
     if prov == "gpt":
-        return os.path.exists(os.path.join(h, "auth.json"))
+        credencial = ruta_cuenta(pid, p, predeterminado="auth.json")
+        return privada(credencial)
     if prov == "minimax":
-        k = p.get("api_key_file") or os.path.join(h, "api_key")
-        k = os.path.expanduser(k)
-        return os.path.exists(k) and os.path.getsize(k) > 0
+        k = ruta_api_key(pid, p)
+        return privada(k, no_vacia=True)
     if prov == "antigravity":
         import shutil
         return shutil.which("agy") is not None
     if prov == "gemini":
         if p.get("auth") == "oauth":
-            return os.path.exists(os.path.join(h, ".gemini", "oauth_creds.json"))
-        k = p.get("api_key_file")
-        if k and os.path.exists(os.path.expanduser(k)):
+            credencial = ruta_cuenta(
+                pid, p, predeterminado=os.path.join(".gemini", "oauth_creds.json")
+            )
+            return privada(credencial)
+        k = ruta_api_key(pid, p)
+        if privada(k, no_vacia=True):
             return True
-        return os.path.exists(os.path.join(h, ".gemini", "settings.json"))
+        ajustes = ruta_cuenta(
+            pid, p, predeterminado=os.path.join(".gemini", "settings.json")
+        )
+        return privada(ajustes)
     return False
 
 
@@ -463,6 +1295,25 @@ def cmd_login(pid, p):
         return (f'mkdir -p {hq} && printf %s TU_API_KEY > {k} '
                 f'&& chmod 600 {k}')
     return "proveedor desconocido"
+
+
+def guardar_api_key(pid, p, clave):
+    """Guarda una clave sin devolver ni registrar ningún dato derivado de ella."""
+    if not isinstance(clave, str) or len(clave.strip()) < 20:
+        raise ValueError("clave invalida")
+    home = home_de(pid, p)
+    try:
+        with _abrir_directorio_seguro(home, crear=True) as home_fd:
+            os.fchmod(home_fd, 0o700)
+    except OSError:
+        raise OSError("no pude preparar el home privado") from None
+    destino = ruta_api_key(pid, p)
+    if destino is None or os.path.islink(destino):
+        raise ValueError("api_key_file fuera del home privado")
+    try:
+        _escribir_texto(destino, clave.strip())
+    except OSError:
+        raise OSError("no pude guardar la clave de forma segura") from None
 
 
 # ---------------- limites de uso ----------------
@@ -715,7 +1566,8 @@ def _systemd_usuario_disponible():
     variables del bus y caduca pronto para tolerar que aparezca una sesion.
     """
     if (os.environ.get("ORQ_DISABLE_SYSTEMD_SCOPE")
-            or not shutil.which("systemd-run") or not shutil.which("systemctl")):
+            or not os.access("/usr/bin/systemd-run", os.X_OK)
+            or not os.access("/usr/bin/systemctl", os.X_OK)):
         return False
     clave = (os.getuid(), os.environ.get("XDG_RUNTIME_DIR", ""),
              os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""))
@@ -725,7 +1577,7 @@ def _systemd_usuario_disponible():
         return guardado[1]
     try:
         r = _SUBPROCESS_RUN_ORIGINAL(
-            ["systemctl", "--user", "show-environment"],
+            ["/usr/bin/systemctl", "--user", "show-environment"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=2, check=False,
         )
@@ -741,7 +1593,7 @@ def _scope_systemd(cmd):
     if not _systemd_usuario_disponible():
         return cmd, None
     unidad = f"orq-run-{os.getpid()}-{time.time_ns()}"
-    return (["systemd-run", "--user", "--scope", "--quiet",
+    return (["/usr/bin/systemd-run", "--user", "--scope", "--quiet",
              f"--unit={unidad}", "--", *cmd], unidad + ".scope")
 
 
@@ -750,7 +1602,7 @@ def _terminar_aislado(proceso, scope=None, gracia=0.7):
     if scope:
         def matar(senal):
             _SUBPROCESS_RUN_ORIGINAL(
-                ["systemctl", "--user", "kill", "--kill-whom=all",
+                ["/usr/bin/systemctl", "--user", "kill", "--kill-whom=all",
                  f"--signal={senal}", scope],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=2, check=False,
@@ -783,23 +1635,270 @@ def _salida_tras_interrupcion(proceso, espera=1.0):
         return out, err
 
 
+def _modo_supervisor(cmd):
+    """Reduce el ejecutable a un identificador de una lista cerrada."""
+    if not isinstance(cmd, (list, tuple)) or not cmd or not isinstance(cmd[0], str):
+        return None
+    programa = os.path.basename(cmd[0])
+    if programa == "claude":
+        return "claude"
+    if programa == "codex":
+        return "codex"
+    if programa == "agy":
+        return "agy"
+    if programa == "gemini":
+        return "gemini"
+    if programa == "git":
+        opciones = list(cmd[1:])
+        if opciones[:len(_GIT_INTERNO)] == _GIT_INTERNO:
+            return "git-internal"
+        if opciones[:len(_GIT_VERIFICACION)] == _GIT_VERIFICACION:
+            return "git-verification"
+        return None
+    if programa in ("python", "python3"):
+        fixture = os.path.join(CODIGO_ORQUESTA, "orqrun.py")
+        if (len(cmd) == 4 and os.path.realpath(cmd[1]) == fixture
+                and cmd[2] == "--fixture"
+                and cmd[3] in {"infinite", "cwd-probe", "tree-parent", "setsid-parent",
+                               "leader-exit"}):
+            return "fixture"
+        if len(cmd) >= 3 and cmd[1] == "-m" and cmd[2] in {
+                "unittest", "pytest", "ruff", "mypy"}:
+            return "python-module"
+        return None
+    if programa in ("pytest", "py.test"):
+        return "pytest"
+    if programa == "mypy":
+        return "mypy"
+    if programa == "ruff":
+        return "ruff"
+    if programa == "eslint":
+        return "eslint"
+    if programa == "node":
+        return "node"
+    if programa == "npm":
+        return "npm"
+    if programa == "pnpm":
+        return "pnpm"
+    if programa == "yarn":
+        return "yarn"
+    if programa == "cargo":
+        return "cargo"
+    if programa == "go":
+        return "go"
+    if programa == "make":
+        return "make"
+    if programa == "tsc":
+        return "tsc"
+    if programa == "systemd-analyze":
+        return "systemd-analyze"
+    if programa == "pwd" and len(cmd) == 1:
+        return "pwd"
+    if programa == "ls" and list(cmd[1:]) == ["-la"]:
+        return "ls"
+    if programa == "bash":
+        scanner = os.path.join(CODIGO_ORQUESTA, "tools", "scan-secretos.sh")
+        if len(cmd) > 1 and os.path.realpath(cmd[1]) == os.path.realpath(scanner):
+            return "scanner"
+        if len(cmd) > 1 and cmd[1] == "-n":
+            return "bash-n"
+        return None
+    if programa == "sh" and len(cmd) > 1 and cmd[1] == "-n":
+        return "sh-n"
+    return None
+
+
+def _ejecutar_aislado_acotado(cmd, env, cwd, timeout,
+                              limite_salida=16 * 1024 * 1024,
+                              limite_error=4 * 1024 * 1024,
+                              usar_scope=True, cwd_fd=None):
+    """Drena pipes con presupuestos duros y mata el árbol al excederlos."""
+    proceso = None
+    scope = None
+    lectores = []
+    lectores_iniciados = []
+    excedido = threading.Event()
+    buffers = {"out": bytearray(), "err": bytearray()}
+    modo = _modo_supervisor(cmd)
+    if modo is None:
+        return "", "ejecutable fuera de la capacidad del supervisor", 126
+
+    def drenar(pipe, nombre, limite):
+        try:
+            while True:
+                bloque = pipe.read(64 * 1024)
+                if not bloque:
+                    return
+                restante = limite - len(buffers[nombre])
+                if restante > 0:
+                    buffers[nombre].extend(bloque[:restante])
+                if len(bloque) > restante:
+                    excedido.set()
+                    return
+        except (OSError, ValueError):
+            return
+
+    try:
+        # El supervisor fijo permanece vivo aunque el objetivo salga antes que
+        # un daemon setsid. Como subreaper dedicado conserva esos huérfanos en
+        # un árbol terminable sin alterar al proceso multihilo de Orquesta.
+        supervisado = ["/usr/bin/python3", "-I", "-S",
+                       os.path.join(CODIGO_ORQUESTA, "orqrun.py"),
+                       "--mode", modo, *cmd[1:]]
+        cmd_aislado, scope = (_scope_systemd(supervisado)
+                              if usar_scope else (supervisado, None))
+        with contextlib.ExitStack() as pila:
+            if cwd_fd is None:
+                _, trabajo_fd = pila.enter_context(_capacidad_trabajo(cwd))
+            else:
+                trabajo_fd = os.dup(cwd_fd)
+                pila.callback(os.close, trabajo_fd)
+                if not stat.S_ISDIR(os.fstat(trabajo_fd).st_mode):
+                    raise OSError("capacidad cwd invalida")
+            # ``/proc/self`` se evalúa en el hijo antes de cerrar descriptores;
+            # pass_fds conserva la capacidad durante ese chdir. El objetivo
+            # hereda después el cwd (el inode), no el nombre reabrible.
+            cwd_capacidad = f"/proc/self/fd/{trabajo_fd}"
+            proceso = subprocess.Popen(
+                cmd_aislado, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=env, cwd=cwd_capacidad, stdin=subprocess.DEVNULL,
+                start_new_session=True, pass_fds=(trabajo_fd,),
+            )
+        lectores = [
+            threading.Thread(target=drenar, daemon=True,
+                             args=(proceso.stdout, "out", limite_salida)),
+            threading.Thread(target=drenar, daemon=True,
+                             args=(proceso.stderr, "err", limite_error)),
+        ]
+        for lector in lectores:
+            lector.start()
+            lectores_iniciados.append(lector)
+        fin = time.monotonic() + max(0.01, float(timeout))
+        agotado_tiempo = False
+        while proceso.poll() is None:
+            if excedido.is_set():
+                break
+            if time.monotonic() >= fin:
+                agotado_tiempo = True
+                break
+            time.sleep(0.02)
+        if proceso.poll() is None:
+            _terminar_aislado(proceso, scope)
+        rc = 124 if agotado_tiempo else (125 if excedido.is_set()
+                                         else proceso.returncode)
+        for lector in lectores_iniciados:
+            lector.join(1.0)
+        if any(lector.is_alive() for lector in lectores_iniciados):
+            # Un descendiente desacoplado conservó los pipes. Se cierra el scope
+            # y los descriptores; no se espera ni se acumula salida sin límite.
+            _terminar_aislado(proceso, scope)
+            for pipe in (proceso.stdout, proceso.stderr):
+                try:
+                    pipe.close()
+                except (OSError, ValueError):
+                    pass
+            excedido.set()
+            rc = 125 if rc == 0 else rc
+        for lector in lectores_iniciados:
+            lector.join(0.2)
+    except KeyboardInterrupt:
+        if proceso is not None:
+            _terminar_aislado(proceso, scope)
+            for pipe in (proceso.stdout, proceso.stderr):
+                if pipe:
+                    try:
+                        pipe.close()
+                    except (OSError, ValueError):
+                        pass
+        for lector in lectores_iniciados:
+            lector.join(0.2)
+        raise
+    except FileNotFoundError as exc:
+        buffers["err"].extend(
+            f"binario no encontrado: {exc}".encode("utf-8", "replace")[:limite_error]
+        )
+        rc = 127
+    except Exception as exc:
+        # Desde el primer Popen cualquier fallo auxiliar (incluido el arranque
+        # de un lector) debe terminar y recoger el supervisor antes de volver.
+        # Nunca dejamos un objetivo escribiendo sin que alguien drene sus pipes.
+        if proceso is not None:
+            try:
+                _terminar_aislado(proceso, scope)
+            except (OSError, subprocess.SubprocessError):
+                try:
+                    proceso.kill()
+                    proceso.wait(timeout=1)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            for pipe in (proceso.stdout, proceso.stderr):
+                if pipe:
+                    try:
+                        pipe.close()
+                    except (OSError, ValueError):
+                        pass
+        for lector in lectores_iniciados:
+            lector.join(0.5)
+        buffers["err"].extend(str(exc).encode("utf-8", "replace")[:limite_error])
+        rc = 127
+    # Los lectores ya drenaron hasta EOF. Cerrar explícitamente evita dejar
+    # descriptores y advertencias ResourceWarning en procesos de larga vida.
+    for lector in lectores_iniciados:
+        lector.join(0.2)
+    for pipe in (() if proceso is None else (proceso.stdout, proceso.stderr)):
+        if pipe:
+            try:
+                pipe.close()
+            except (OSError, ValueError):
+                pass
+    out = bytes(buffers["out"]).decode("utf-8", "replace")
+    err = bytes(buffers["err"]).decode("utf-8", "replace")
+    if rc == 124:
+        err = (err.rstrip() + f"\ntimeout tras {timeout}s").strip()
+    if excedido.is_set():
+        err = (err.rstrip() + "\nsalida excedio el limite seguro").strip()
+        if rc == 0:
+            rc = 125
+    return out, err, rc
+
+
+def _fallo_previo(pid, p, prompt, tarea, carpeta, detalle):
+    run_id = f"{pid}-{time.time_ns()}"
+    texto = f"[ERROR capacidad] {detalle}"
+    log({"ts": ahora().isoformat(timespec="seconds"), "fecha": hoy(),
+         "semana": ahora().strftime("%G-S%V"), "mes": ahora().strftime("%Y-%m"),
+         "perfil": pid, "provider": p.get("provider", "?"), "tarea": tarea,
+         "tokens": 0, "seg": 0.0, "rc": 2, "limite": False,
+         "sesion": os.environ.get("ORQ_SESION", "sin-sesion"),
+         "term": os.environ.get("ORQ_SESION_TERM", ""),
+         "carpeta": carpeta or "", "prompt": prompt[:200], "run_id": run_id})
+    return {"perfil": pid, "label": p.get("label", pid), "texto": texto,
+            "tokens": 0, "seg": 0.0, "rc": 2, "run_id": run_id,
+            "limitado": None}
+
+
 def correr(pid, p, prompt, tarea="reasoning", timeout=300, carpeta=None,
-           session_id=None, resume=False, solo_lectura=False):
+           session_id=None, resume=False, solo_lectura=False, cwd_fd=None):
     if not admite_tarea(p, tarea):
-        t0 = time.time()
-        run_id = f"{pid}-{time.time_ns()}"
-        texto = (f"[ERROR capacidad] {pid} ({p.get('provider', '?')}) no admite "
-                 f"la tarea '{tarea}'")
-        log({"ts": ahora().isoformat(timespec="seconds"), "fecha": hoy(),
-             "semana": ahora().strftime("%G-S%V"), "mes": ahora().strftime("%Y-%m"),
-             "perfil": pid, "provider": p.get("provider", "?"), "tarea": tarea,
-             "tokens": 0, "seg": 0.0, "rc": 2, "limite": False,
-             "sesion": os.environ.get("ORQ_SESION", "sin-sesion"),
-             "term": os.environ.get("ORQ_SESION_TERM", ""),
-             "carpeta": carpeta or "", "prompt": prompt[:200], "run_id": run_id})
-        return {"perfil": pid, "label": p.get("label", pid), "texto": texto,
-                "tokens": 0, "seg": 0.0, "rc": 2, "run_id": run_id,
-                "limitado": None}
+        return _fallo_previo(
+            pid, p, prompt, tarea, carpeta,
+            f"{pid} ({p.get('provider', '?')}) no admite la tarea '{tarea}'",
+        )
+    if cwd_fd is not None:
+        try:
+            estado_cwd = os.fstat(cwd_fd)
+            destino = carpeta or "."
+            if not stat.S_ISDIR(estado_cwd.st_mode):
+                destino = None
+        except OSError:
+            destino = None
+    else:
+        destino = BASE if carpeta is None else ruta_trabajo_segura(carpeta)
+    if not destino:
+        return _fallo_previo(
+            pid, p, prompt, tarea, carpeta,
+            "la carpeta solicitada esta fuera de las areas autorizadas",
+        )
 
     prov = p.get("provider")
     if prov == "claude" and not session_id:
@@ -823,21 +1922,21 @@ def correr(pid, p, prompt, tarea="reasoning", timeout=300, carpeta=None,
     try:
         if f_lock:
             fcntl.flock(f_lock, fcntl.LOCK_EX)
-        destino = carpeta if carpeta and os.path.isdir(carpeta) else BASE
         if subprocess.run is not _SUBPROCESS_RUN_ORIGINAL:
             # Punto de inyeccion conservado para consumidores que sustituian
             # el runner (incluida la suite historica) sin arrancar una IA real.
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=timeout, env=env, cwd=destino)
+            with (_capacidad_trabajo(destino) if cwd_fd is None
+                  else contextlib.nullcontext((destino, cwd_fd))) as (_, ejec_fd):
+                r = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=timeout,
+                    env=env, cwd=f"/proc/self/fd/{ejec_fd}",
+                    pass_fds=(ejec_fd,),
+                )
             out, err, rc = r.stdout, r.stderr, r.returncode
         else:
-            cmd_aislado, scope = _scope_systemd(cmd)
-            proceso = subprocess.Popen(cmd_aislado, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, text=True,
-                                       env=env, cwd=destino,
-                                       start_new_session=True)
-            out, err = proceso.communicate(timeout=timeout)
-            rc = proceso.returncode
+            out, err, rc = _ejecutar_aislado_acotado(
+                cmd, env, destino, timeout, cwd_fd=cwd_fd
+            )
     except subprocess.TimeoutExpired as e:
         if proceso is not None:
             _terminar_aislado(proceso, scope)
@@ -1073,12 +2172,13 @@ def ranking(tarea, proposito=None, incluir_bloqueados=False, preferir=None):
 NAVEGADORES = [("firefox", "Firefox"), ("brave", "Brave"),
                ("google-chrome", "Google Chrome"), ("chromium", "Chromium"),
                ("microsoft-edge", "Edge")]
-TERMINALES = [("kitty", ["kitty", "--title", "{titulo}", "-e", "bash", "-lc", "{cmd}"]),
-              ("ptyxis", ["ptyxis", "--title", "{titulo}", "--", "bash", "-lc", "{cmd}"]),
-              ("gnome-terminal", ["gnome-terminal", "--title", "{titulo}", "--",
-                                  "bash", "-lc", "{cmd}"]),
-              ("konsole", ["konsole", "-e", "bash", "-lc", "{cmd}"]),
-              ("xterm", ["xterm", "-T", "{titulo}", "-e", "bash", "-lc", "{cmd}"])]
+TERMINALES = [
+    ("kitty", ["kitty", "--title", "LOGIN · ORQUESTA", "-e"]),
+    ("ptyxis", ["ptyxis", "--title", "LOGIN · ORQUESTA", "--"]),
+    ("gnome-terminal", ["gnome-terminal", "--title", "LOGIN · ORQUESTA", "--"]),
+    ("konsole", ["konsole", "-e"]),
+    ("xterm", ["xterm", "-T", "LOGIN · ORQUESTA", "-e"]),
+]
 
 
 def navegadores():
@@ -1098,40 +2198,57 @@ def navegador_valido(valor):
 
 
 def terminal_disponible():
-    import shutil
+    ruta_sistema = "/usr/local/bin:/usr/bin:/bin"
     for t, plantilla in TERMINALES:
-        if shutil.which(t):
-            return t, plantilla
+        ejecutable = shutil.which(t, path=ruta_sistema)
+        if ejecutable:
+            return t, [ejecutable, *plantilla[1:]]
     return None, None
 
 
 def lanzar_login(pid, p, titulo=None):
-    """Abre una terminal con el entorno listo para autenticar esa cuenta."""
+    """Abre el autenticador con argv fijo, sin construir un programa de shell."""
     if not id_perfil_valido(pid):
         return False, "id de cuenta invalido"
     if p.get("provider") not in ("claude", "gpt", "antigravity", "gemini", "minimax"):
         return False, "proveedor no permitido"
     if not navegador_valido(p.get("navegador")):
         return False, "navegador no permitido"
+    try:
+        home_de(pid, p)
+    except ValueError as e:
+        return False, str(e)
     t, plantilla = terminal_disponible()
     if not t:
         return False, "no encontre ninguna terminal grafica instalada"
-    cmd_auth = cmd_login(pid, p).split("#")[0].strip()
-    titulo = titulo or f"LOGIN · {pid}"
-    guion = (
-        "clear; "
-        f"printf '\\n  \\033[1mCONECTAR {pid}\\033[0m\\n'; "
-        f"printf '  \\033[2m{p.get('provider','')} · navegador: {p.get('navegador') or 'por defecto'}\\033[0m\\n\\n'; "
-        + (("printf '  Escribe \\033[33m/login\\033[0m y autoriza en el navegador.\\n\\n'; "
-            ) if p.get("provider") == "claude" else
-           ("printf '  Sigue las instrucciones en pantalla.\\n\\n'; "))
-        + cmd_auth + "; "
-        "printf '\\n  --- terminado ---\\n'; exec bash"
-    )
-    args = [x.replace("{titulo}", titulo).replace("{cmd}", guion) for x in plantilla]
+    args = list(plantilla) + ["/usr/bin/python3", "-I", "-S",
+                              os.path.join(BASE, "orqlogin.py")]
+    # El helper Python debe arrancar sin loaders, rutas de importación ni PATH
+    # controlados por el proceso que llamó al panel. Solo preservamos los
+    # descriptores imprescindibles de la sesión gráfica.
+    env = {
+        nombre: os.environ[nombre]
+        for nombre in (
+            "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY",
+            "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "LANG", "LC_ALL",
+            "LC_CTYPE", "TERM", "COLORTERM", "DESKTOP_SESSION",
+            "XDG_CURRENT_DESKTOP",
+        )
+        if nombre in os.environ
+    }
+    env["HOME"] = HOME_USUARIO
+    env["PATH"] = os.pathsep.join([
+        os.path.join(HOME_USUARIO, ".local", "bin"),
+        "/usr/local/bin", "/usr/bin", "/bin",
+    ])
+    env["ORQ_LOGIN_PROFILE"] = pid
+    navegador = p.get("navegador")
+    if navegador:
+        env["BROWSER"] = navegador
     try:
         subprocess.Popen(args, start_new_session=True,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         env=env)
         return True, f"terminal abierta ({t})"
     except Exception as e:
         return False, str(e)
@@ -1146,48 +2263,15 @@ def activas():
 
 
 def escribir_entorno():
-    """Genera el archivo que cada terminal carga al abrirse.
+    """Actualiza el marcador que hace recargar el entorno activo.
 
-    Con esto, escribir 'claude' o 'codex' en cualquier terminal usa
-    automaticamente la cuenta activa, sin autenticar nada de nuevo.
+    El marcador nunca contiene ni ejecuta datos de perfiles. ``shell.sh`` llama
+    al helper fijo ``orqenv.py``, recibe pares NUL-delimitados y solo asigna una
+    lista cerrada de variables. Así no hay código de shell generado ni secretos
+    persistidos por duplicado.
     """
-    c = cfg()
-    ps = c.get("profiles", {})
-    act = c.get("_activas", {})
-    lineas = ["# Generado por 'orq usar' — no editar a mano",
-              "# Lo carga shell.sh en cada terminal nueva.", ""]
-    for prov, pid in sorted(act.items()):
-        p = ps.get(pid)
-        if not p or not autenticado(pid, p):
-            continue
-        h = home_de(pid, p)
-        if prov == "minimax":
-            # exportar ANTHROPIC_BASE_URL aqui secuestraria la cuenta Claude
-            # real de todas las terminales. MiniMax se usa con 'minimax' o
-            # con 'orquse <id>' dentro de una sola terminal.
-            continue
-        if prov == "claude":
-            lineas += [f'export CLAUDE_CONFIG_DIR="{h}"']
-        elif prov == "gpt":
-            lineas += [f'export CODEX_HOME="{h}"']
-        elif prov == "gemini":
-            lineas += [f'export GEMINI_CLI_HOME="{h}"',
-                       'export GEMINI_CLI_TRUST_WORKSPACE=true']
-            if p.get("auth") == "oauth":
-                lineas.append('export GOOGLE_GENAI_USE_GCA=true')
-            k = p.get("api_key_file")
-            if k and os.path.exists(os.path.expanduser(k)):
-                lineas.append(f'export GEMINI_API_KEY="$(cat "{k}" 2>/dev/null)"')
-        lineas.append(f'export ORQ_{prov.upper()}_CUENTA="{pid}"')
-    lineas.append("")
-    lineas.append(f'export ORQ_PERMISOS_TOTALES={"1" if c.get("_permisos_totales", False) else "0"}')
-    lineas.append("")
     with bloqueo():
-        os.makedirs(os.path.dirname(ENTORNO_SH), exist_ok=True)
-        tmp = ENTORNO_SH + ".tmp"
-        with open(tmp, "w") as f:
-            f.write("\n".join(lineas))
-        os.replace(tmp, ENTORNO_SH)
+        _escribir_texto(ENTORNO_SH, "orquesta-entorno-v2\n")
     return ENTORNO_SH
 
 
@@ -1265,21 +2349,29 @@ def resumen_uso():
            {"sesiones_mes": len([s for s in sesiones if s and s != "sin-sesion"])}
 
 # ---------------- generacion de imagenes ----------------
-SCRATCH_AGY = os.path.expanduser("~/.gemini/antigravity-cli/scratch")
+SCRATCH_AGY = os.path.join(HOME_USUARIO, ".gemini", "antigravity-cli", "scratch")
 
 
 def _imagenes_en(d):
-    import glob
-    r = []
-    for ext in ("png", "jpg", "jpeg", "webp"):
-        r += glob.glob(os.path.join(d, f"*.{ext}"))
-    return {f: os.path.getmtime(f) for f in r}
+    segura = ruta_trabajo_segura(d)
+    if not segura:
+        return {}
+    return {
+        ruta: mtime for mtime, ruta in _archivos_regulares(
+            segura,
+            lambda nombre: os.path.splitext(nombre)[1].lower()
+            in (".png", ".jpg", ".jpeg", ".webp"),
+            limite=1000,
+            profundidad_maxima=0,
+            con_identidad=True,
+        )
+    }
 
 
-def extension_real(ruta):
+def extension_real(ruta, identidad=None):
     """Devuelve la extension segun el contenido, no segun el nombre."""
     try:
-        with open(ruta, "rb") as f:
+        with _abrir_regular_identidad(ruta, identidad, mode="rb") as f:
             cab = f.read(12)
     except Exception:
         return None
@@ -1292,14 +2384,19 @@ def extension_real(ruta):
     return None
 
 
-def generar_imagen(pid, p, prompt, destino=None, timeout=420):
+def _generar_imagen_bloqueada(pid, p, prompt, destino=None, timeout=420):
     """Genera una imagen y la deja en 'destino' con la extension correcta."""
     if not admite_tarea(p, "imagen"):
         return {"perfil": pid, "texto": f"[ERROR capacidad] {pid} no genera imagenes",
                 "tokens": 0, "seg": 0.0, "rc": 2, "run_id": "", "archivos": [],
                 "origen": [], "limitado": None}
+    destino = preparar_ruta_trabajo(destino or BASE, crear=True)
+    if not destino:
+        return {"perfil": pid, "texto": "[ERROR capacidad] destino no autorizado",
+                "tokens": 0, "seg": 0.0, "rc": 2, "run_id": "", "archivos": [],
+                "origen": [], "limitado": None}
     antes = _imagenes_en(SCRATCH_AGY)
-    antes_dst = _imagenes_en(destino) if destino and os.path.isdir(destino) else {}
+    antes_dst = _imagenes_en(destino)
     env = entorno(pid, p)
     cmd = comando(p, prompt)
     t0 = time.time()
@@ -1307,17 +2404,17 @@ def generar_imagen(pid, p, prompt, destino=None, timeout=420):
     scope = None
     try:
         if subprocess.run is not _SUBPROCESS_RUN_ORIGINAL:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                               env=env, cwd=destino or BASE)
+            with _capacidad_trabajo(destino) as (_, cwd_fd):
+                r = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=timeout,
+                    env=env, cwd=f"/proc/self/fd/{cwd_fd}",
+                    pass_fds=(cwd_fd,),
+                )
             out, err, rc = r.stdout, r.stderr, r.returncode
         else:
-            cmd_aislado, scope = _scope_systemd(cmd)
-            proceso = subprocess.Popen(
-                cmd_aislado, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                env=env, cwd=destino or BASE, start_new_session=True,
+            out, err, rc = _ejecutar_aislado_acotado(
+                cmd, env, destino, timeout
             )
-            out, err = proceso.communicate(timeout=timeout)
-            rc = proceso.returncode
     except subprocess.TimeoutExpired as e:
         if proceso is not None:
             _terminar_aislado(proceso, scope)
@@ -1355,31 +2452,31 @@ def generar_imagen(pid, p, prompt, destino=None, timeout=420):
 
     # 1) lo que el modelo dejo directamente en el destino
     guardadas = []
-    if destino and os.path.isdir(destino):
-        ahora_dst = _imagenes_en(destino)
-        for f, m in sorted(ahora_dst.items(), key=lambda x: -x[1]):
-            if f not in antes_dst or m > antes_dst.get(f, 0):
-                ext = extension_real(f)
-                if ext and not f.lower().endswith("." + ext):
-                    nuevo = os.path.splitext(f)[0] + "." + ext
-                    if not os.path.exists(nuevo):
-                        os.rename(f, nuevo); f = nuevo
-                guardadas.append(f)
+    ahora_dst = _imagenes_en(destino)
+    for f, firma in sorted(ahora_dst.items(), key=lambda x: -x[1][0]):
+        if f not in antes_dst or firma != antes_dst.get(f):
+            ext = extension_real(f, firma)
+            if ext and not f.lower().endswith("." + ext):
+                nuevo = os.path.splitext(f)[0] + "." + ext
+                try:
+                    f = _copiar_regular_unico(f, nuevo, firma)
+                except OSError:
+                    continue
+            guardadas.append(f)
     # 2) si no, lo que quedo en el scratch de agy
     nuevas = _imagenes_en(SCRATCH_AGY)
-    creadas = sorted([f for f, m in nuevas.items()
-                      if f not in antes or m > antes.get(f, 0)],
-                     key=lambda f: nuevas[f], reverse=True)
-    if creadas and destino and not guardadas:
-        os.makedirs(destino, exist_ok=True)
+    creadas = sorted([f for f, firma in nuevas.items()
+                      if f not in antes or firma != antes.get(f)],
+                     key=lambda f: nuevas[f][0], reverse=True)
+    if creadas and not guardadas:
         for i, f in enumerate(creadas[:4]):
-            ext = extension_real(f) or "png"
-            base = os.path.splitext(os.path.basename(f))[0]
+            firma = nuevas[f]
+            ext = extension_real(f, firma) or "png"
+            base = re.sub(
+                r"[^A-Za-z0-9._-]+", "-", os.path.splitext(os.path.basename(f))[0]
+            ).strip(".-_")[:64] or "imagen"
             dst = os.path.join(destino, f"{base}{'' if i == 0 else '-' + str(i)}.{ext}")
-            n = 1
-            while os.path.exists(dst):
-                dst = os.path.join(destino, f"{base}-{n}.{ext}"); n += 1
-            shutil.copy2(f, dst)
+            dst = _copiar_regular_unico(f, dst, firma)
             guardadas.append(dst)
 
     run_id = f"{pid}-{time.time_ns()}"
@@ -1394,20 +2491,34 @@ def generar_imagen(pid, p, prompt, destino=None, timeout=420):
             "run_id": run_id, "archivos": guardadas, "origen": creadas[:4],
             "limitado": lim.isoformat(timespec="seconds") if lim else None}
 
+
+def generar_imagen(pid, p, prompt, destino=None, timeout=420):
+    """Serializa snapshot, proveedor y copia porque AGY comparte un scratch."""
+    lock = _lock_proveedor("antigravity")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _generar_imagen_bloqueada(pid, p, prompt, destino, timeout)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
 # ---------------- sesiones externas y serializacion ----------------
 # Los CLIs de suscripcion no toleran bien varias sesiones a la vez: si tienes
 # un 'codex --yolo' trabajando en otra terminal, una llamada nuestra se encola.
 PATRON_PROC = {"claude": r"(^|/)claude(\s|$)", "gpt": r"(^|/)codex(\s|$)",
                "antigravity": r"(^|/)agy(\s|$)"}
-SERIALIZAR = {"gpt"}          # proveedores que exigen una llamada a la vez
+SERIALIZAR = {"gpt", "antigravity"}  # CLIs/estado global que exigen serialización
 
 
 def sesiones_externas():
     """Procesos de CLI vivos que NO lanzo el orquestador (tus terminales)."""
     out = {}
     try:
-        ps = subprocess.run(["ps", "-eo", "pid,etimes,args"],
-                            capture_output=True, text=True, timeout=8).stdout
+        ps = subprocess.run(
+            ["/usr/bin/ps", "-eo", "pid,etimes,args"],
+            capture_output=True, text=True, timeout=8,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8"},
+        ).stdout
     except Exception:
         return out
     mio = str(os.getpid())
@@ -1430,8 +2541,7 @@ def sesiones_externas():
 def _lock_proveedor(prov):
     """Semaforo por proveedor para no pisar sesiones concurrentes."""
     ruta = os.path.join(BASE, "state", f".lock-{prov}")
-    os.makedirs(os.path.dirname(ruta), exist_ok=True)
-    return open(ruta, "a+")
+    return _abrir_lock(ruta)
 
 
 def ruta_lock_cuenta_claude(pid, p):
@@ -1445,43 +2555,23 @@ def ruta_lock_cuenta_claude(pid, p):
 
 def _lock_cuenta_claude(pid, p):
     ruta = ruta_lock_cuenta_claude(pid, p)
-    directorio = os.path.dirname(ruta)
-    os.makedirs(directorio, mode=0o700, exist_ok=True)
-    try:
-        os.chmod(directorio, 0o700)
-    except OSError:
-        pass
-    flags = os.O_RDWR | os.O_CREAT
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(ruta, flags, 0o600)
-    try:
-        os.fchmod(fd, 0o600)
-        return os.fdopen(fd, "a+")
-    except Exception:
-        os.close(fd)
-        raise
+    return _abrir_lock(ruta)
 
 
 @contextlib.contextmanager
 def bloqueo_proyecto(carpeta):
     """Un solo proyecto escritor por carpeta, incluso desde otras terminales."""
-    real = os.path.realpath(os.path.abspath(carpeta))
-    try:
-        repo = _SUBPROCESS_RUN_ORIGINAL(
-            ["git", "-C", real, "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-        if repo.returncode == 0 and repo.stdout.strip():
-            real = os.path.realpath(repo.stdout.strip())
-    except (OSError, subprocess.SubprocessError):
-        pass
+    real = ruta_trabajo_segura(carpeta)
+    if not real:
+        raise ValueError("carpeta de proyecto no autorizada")
+    repo = _git(real, "rev-parse", "--show-toplevel", timeout=5)
+    if repo and repo.returncode == 0 and repo.stdout.strip():
+        raiz_repo = ruta_trabajo_segura(repo.stdout.strip())
+        if raiz_repo:
+            real = raiz_repo
     clave = hashlib.sha256(real.encode("utf-8", "surrogateescape")).hexdigest()
     directorio = os.path.join(BASE, "state", "project-locks")
-    os.makedirs(directorio, exist_ok=True)
-    archivo = open(os.path.join(directorio, clave + ".lock"), "a+")
+    archivo = _abrir_lock(os.path.join(directorio, clave + ".lock"))
     try:
         try:
             fcntl.flock(archivo, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1780,7 +2870,9 @@ def ejecutar_proyecto(plan, carpeta, timeout=600, callback=None,
                       asignacion=None, contexto_terminal="", preferir=None):
     """Ejecucion progresiva: cada tarea arranca en cuanto sus dependencias
     terminan con exito. Un fallo nunca libera trabajo dependiente."""
-    os.makedirs(carpeta, exist_ok=True)
+    carpeta = preparar_ruta_trabajo(carpeta, crear=True)
+    if not carpeta:
+        raise ValueError("carpeta de proyecto fuera de las areas autorizadas")
     pz = Pizarra(carpeta, plan, contexto_terminal)
     pendientes = {t["id"]: t for t in plan["tareas"]}
     ids_plan = set(pendientes)
@@ -2019,88 +3111,292 @@ def _argv_verificacion(comando):
     base = os.path.basename(argv[0])
     args = argv[1:]
 
-    permitido = False
-    if base == "git":
-        permitido = (
-            args in (["diff", "--check"],
-                     ["diff", "--cached", "--check"],
-                     ["diff", "--check", "--cached"])
-            or (args[:1] == ["status"] and all(
-                x in {"--porcelain", "--short", "--branch", "-sb"}
-                for x in args[1:]))
-            or args == ["rev-parse", "--is-inside-work-tree"]
-            or args[:1] == ["ls-files"]
+    def relativos(valores):
+        for valor in valores:
+            candidatos = [valor]
+            if "=" in valor:
+                candidatos.append(valor.split("=", 1)[1])
+            for candidato in candidatos:
+                partes = candidato.replace("\\", "/").split("/")
+                if (candidato.startswith((os.sep, "\\")) or ".." in partes):
+                    return False
+        return True
+
+    def pytest_seguro(valores):
+        prohibidas = ("--basetemp", "--cache-dir", "--rootdir", "--confcutdir")
+        return relativos(valores) and not any(
+            arg == p or arg.startswith(p + "=") for arg in valores for p in prohibidas
         )
-    elif base in {"python", "python3"}:
-        permitido = len(args) >= 2 and args[0] == "-m" and args[1] in {
-            "unittest", "pytest", "compileall", "py_compile", "ruff", "mypy"
-        }
-    elif base in {"pytest", "py.test", "ruff", "mypy", "eslint"}:
-        permitido = True
+
+    def ruff_seguro(valores):
+        return relativos(valores) and bool(valores) and (
+            (valores[0] == "check" and "--fix" not in valores
+             and "--unsafe-fixes" not in valores)
+            or (valores[0] == "format" and "--check" in valores)
+        )
+
+    if base == "git":
+        prefijo = ["/usr/bin/git", *_GIT_VERIFICACION]
+        if args in (["diff", "--check"], ["diff", "--cached", "--check"],
+                    ["diff", "--check", "--cached"]):
+            cached = "--cached" in args
+            return prefijo + ["-c", "diff.external=", "diff", "--no-ext-diff",
+                              "--no-textconv"] + (["--cached"] if cached else []) + ["--check"]
+        if (args[:1] == ["status"] and all(
+                x in {"--porcelain", "--short", "--branch", "-sb"}
+                for x in args[1:])):
+            return prefijo + args
+        if args == ["rev-parse", "--is-inside-work-tree"]:
+            return prefijo + args
+        if args[:1] == ["ls-files"] and all(
+                x in {"--cached", "--modified", "--deleted", "--others",
+                      "--exclude-standard", "-c", "-m", "-d", "-o"}
+                for x in args[1:]):
+            return prefijo + args
+        return None
+    permitido = False
+    if base in {"python", "python3"}:
+        if len(args) < 2 or args[0] != "-m":
+            return None
+        modulo, modulo_args = args[1], args[2:]
+        if modulo == "unittest":
+            permitido = relativos(modulo_args)
+        elif modulo == "pytest":
+            permitido = pytest_seguro(modulo_args)
+        elif modulo == "ruff":
+            permitido = ruff_seguro(modulo_args)
+        elif modulo == "mypy":
+            permitido = relativos(modulo_args) and not any(
+                x == "--config-file" or x.startswith("--config-file=")
+                or x == "--cache-dir" or x.startswith("--cache-dir=")
+                for x in modulo_args
+            )
+    elif base in {"pytest", "py.test", "mypy"}:
+        permitido = pytest_seguro(args) if base != "mypy" else relativos(args)
+    elif base == "ruff":
+        permitido = ruff_seguro(args)
+    elif base == "eslint":
+        permitido = relativos(args) and "--fix" not in args and not any(
+            x == "--output-file" or x.startswith("--output-file=")
+            or x in {"--rulesdir", "--resolve-plugins-relative-to"}
+            or x.startswith("--rulesdir=")
+            or x.startswith("--resolve-plugins-relative-to=")
+            for x in args
+        )
     elif base == "node":
-        permitido = bool(args) and args[0] == "--check"
+        permitido = bool(args) and args[0] == "--check" and relativos(args[1:])
     elif base in {"bash", "sh"}:
-        permitido = bool(args) and args[0] == "-n"
+        permitido = bool(args) and args[0] == "-n" and relativos(args[1:])
     elif base in {"npm", "pnpm", "yarn"}:
-        permitido = args[:1] == ["test"] or (
+        permitido = relativos(args) and (args == ["test"] or (
             len(args) >= 2 and args[0] == "run"
             and args[1] in {"test", "lint", "check", "build", "typecheck"}
-        )
+            and all(not x.startswith("--script-shell") for x in args[2:])
+        ))
     elif base == "cargo":
-        permitido = bool(args) and args[0] in {"test", "check", "clippy", "fmt"}
+        permitido = relativos(args) and bool(args) and (
+            args[0] in {"test", "check", "clippy"}
+            or (args[0] == "fmt" and "--check" in args)
+        ) and not any(
+            x in {"--config", "--manifest-path", "--target-dir"}
+            or x.startswith(("--config=", "--manifest-path=", "--target-dir="))
+            for x in args
+        )
     elif base == "go":
-        permitido = bool(args) and args[0] in {"test", "vet"}
+        permitido = relativos(args) and bool(args) and args[0] in {"test", "vet"} \
+            and not any(x == "-exec" or x.startswith("-exec=") for x in args)
     elif base == "make":
         permitido = bool(args) and all(
             not x.startswith("-") and x in {"test", "check", "lint", "build"}
             for x in args
         )
     elif base == "tsc":
-        permitido = not args or "--noEmit" in args
+        permitido = "--noEmit" in args and relativos(args)
     elif base == "systemd-analyze":
-        permitido = "verify" in args and "security" not in args
+        permitido = relativos(args) and args[:1] == ["verify"] and len(args) >= 2 \
+            and all(not x.startswith("-") for x in args[1:])
     return argv if permitido else None
 
 
-def ejecutar_comando_verificacion(comando, carpeta, timeout=600):
+def _operandos_verificacion_seguros(argv, carpeta, cwd_fd=None):
+    """Revalida operandos que parecen rutas dentro de la capacidad del repo."""
+    if not argv:
+        return False
+    if cwd_fd is None:
+        try:
+            with _capacidad_trabajo(carpeta) as (_, fd):
+                return _operandos_verificacion_seguros(argv, ".", cwd_fd=fd)
+        except OSError:
+            return False
+    valores = list(argv[1:])
+    # El argv Git ya fue sustituido por una plantilla fija sin rutas de entrada.
+    if os.path.basename(argv[0]) == "git":
+        return True
+    ignorar = {
+        "discover", "test", "check", "clippy", "fmt", "vet", "run",
+        "lint", "build", "typecheck", "format", "verify", "unittest",
+        "pytest", "ruff", "mypy",
+    }
+
+    def existe(candidato):
+        try:
+            os.stat(candidato, dir_fd=cwd_fd, follow_symlinks=False)
+            return True
+        except OSError:
+            return False
+
+    def relativo_seguro(candidato):
+        partes = candidato.replace("\\", "/").split("/")
+        if (os.path.isabs(candidato) or not partes
+                or any(parte in ("", "..") for parte in partes)):
+            return False
+        partes = [parte for parte in partes if parte != "."]
+        fd = os.dup(cwd_fd)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            for indice, parte in enumerate(partes):
+                try:
+                    estado = os.stat(parte, dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return indice == len(partes) - 1
+                if stat.S_ISLNK(estado.st_mode):
+                    return False
+                if indice < len(partes) - 1:
+                    if not stat.S_ISDIR(estado.st_mode):
+                        return False
+                    siguiente = os.open(parte, flags, dir_fd=fd)
+                    os.close(fd)
+                    fd = siguiente
+            return True
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+
+    for valor in valores:
+        candidatos = []
+        if "=" in valor:
+            candidatos.append(valor.split("=", 1)[1])
+        if not valor.startswith("-"):
+            candidatos.append(valor)
+        for candidato in candidatos:
+            candidato = candidato.split("::", 1)[0]
+            if not candidato or candidato in ignorar:
+                continue
+            if candidato == "./...":
+                candidato = "."
+            parece_ruta = (
+                candidato in {".", "tests", "src"}
+                or "/" in candidato or "\\" in candidato
+                or existe(candidato)
+                or bool(re.search(r"\.(?:py|js|jsx|ts|tsx|service|toml|json|yaml|yml)$",
+                                  candidato, re.I))
+            )
+            if not parece_ruta:
+                continue
+            if (os.path.isabs(candidato)
+                    or ".." in candidato.replace("\\", "/").split("/")):
+                return False
+            if not relativo_seguro(candidato):
+                return False
+    return True
+
+
+def ejecutar_comando_verificacion(comando, carpeta, timeout=600, cwd_fd=None):
     """Ejecuta una comprobacion permitida y devuelve evidencia propia."""
     argv = _argv_verificacion(comando)
     if argv is None:
         return {"comando": str(comando)[:160], "rc": 126,
                 "resultado": "comando no permitido por la politica de verificacion"}
-    if not shutil.which(argv[0]):
+    if cwd_fd is not None:
+        try:
+            return _ejecutar_comando_verificacion_adquirido(
+                comando, argv, timeout, cwd_fd
+            )
+        except OSError:
+            return {"comando": str(comando)[:160], "rc": 126,
+                    "resultado": "capacidad de verificacion invalida"}
+    try:
+        with _capacidad_trabajo(carpeta) as (_, cwd_fd):
+            return _ejecutar_comando_verificacion_adquirido(
+                comando, argv, timeout, cwd_fd
+            )
+    except OSError:
+        return {"comando": str(comando)[:160], "rc": 126,
+                "resultado": "carpeta de verificacion no autorizada"}
+
+
+def _ejecutar_comando_verificacion_adquirido(comando, argv, timeout, cwd_fd):
+    """Valida y ejecuta sobre la misma capacidad cwd ya adquirida."""
+    estado_cwd = os.fstat(cwd_fd)
+    identidad_cwd = [int(estado_cwd.st_dev), int(estado_cwd.st_ino)]
+    try:
+        with _capacidad_raiz_git(cwd_fd) as (_, repo_fd, _prefijo):
+            estado_repo = os.fstat(repo_fd)
+            identidad_repo = [int(estado_repo.st_dev), int(estado_repo.st_ino)]
+    except OSError:
+        identidad_repo = None
+    if not _operandos_verificacion_seguros(argv, ".", cwd_fd=cwd_fd):
+        return {"comando": str(comando)[:160], "rc": 126,
+                "resultado": "ruta de verificacion fuera de la carpeta autorizada"}
+    if os.path.basename(argv[0]) == "git":
+        config_ejecutable = _config_git_ejecutable(".", cwd_fd=cwd_fd)
+        if config_ejecutable is not False:
+            return {"comando": str(comando)[:160], "rc": 126,
+                    "resultado": ("configuracion Git ejecutable no permitida"
+                                  if config_ejecutable else
+                                  "no pude auditar la configuracion Git")}
+    env = {
+        "HOME": HOME_USUARIO,
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "LC_ALL": os.environ.get("LC_ALL") or "C.UTF-8",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_SHALLOW_FILE": "/dev/null",
+        "GIT_GRAFT_FILE": "/dev/null",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    ejecutable = (argv[0] if os.path.isabs(argv[0])
+                  else shutil.which(argv[0], path=env["PATH"]))
+    if not ejecutable:
         return {"comando": comando, "rc": 127,
                 "resultado": "binario de verificacion no disponible"}
+    argv[0] = ejecutable
     limite = max(5, min(900, int(timeout or 600)))
-    proceso = None
-    scope = None
-    try:
-        aislado, scope = _scope_systemd(argv)
-        proceso = subprocess.Popen(
-            aislado, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            cwd=carpeta, start_new_session=True,
-        )
-        out, err = proceso.communicate(timeout=limite)
-        rc = proceso.returncode
-    except subprocess.TimeoutExpired as e:
-        if proceso is not None:
-            _terminar_aislado(proceso, scope)
-            recogida = _salida_tras_interrupcion(proceso)
-            out, err = recogida if recogida else (e.stdout or "", e.stderr or "")
-        else:
-            out, err = e.stdout or "", e.stderr or ""
-        rc = 124
-    except (OSError, subprocess.SubprocessError) as e:
-        out, err, rc = "", str(e), 127
+    # La verificación no recibe acceso al bus del user manager. Un scope de
+    # systemd necesitaría DBUS/XDG del proceso padre y ampliaría la capacidad del
+    # código bajo prueba; un grupo POSIX dedicado conserva el aislamiento de
+    # terminación sin contaminar el entorno mínimo del objetivo.
+    out, err, rc = _ejecutar_aislado_acotado(
+        argv, env, ".", limite,
+        limite_salida=64 * 1024, limite_error=64 * 1024,
+        usar_scope=False, cwd_fd=cwd_fd,
+    )
     salida = ((out or "") + ("\n" if out and err else "") + (err or "")).strip()
-    if rc == 124:
-        salida = (salida + f"\ntimeout tras {limite}s").strip()
     return {"comando": " ".join(shlex.quote(x) for x in argv), "rc": int(rc),
-            "resultado": salida[-1600:] or ("sin salida" if rc == 0 else "fallo sin salida")}
+            "resultado": salida[-1600:] or ("sin salida" if rc == 0 else "fallo sin salida"),
+            "cwd_identidad": identidad_cwd,
+            "repo_identidad": identidad_repo}
 
 
-def verificar_proyecto(plan, carpeta, resultados, timeout=600, preferir=None):
+def verificar_proyecto(plan, carpeta, resultados, timeout=600, preferir=None,
+                       mensaje_snapshot=None):
     """Verificacion final independiente, con pruebas reales y salida estructurada."""
+    snapshot = None
+    if mensaje_snapshot is not None:
+        try:
+            snapshot = preparar_snapshot_verificacion(carpeta, mensaje_snapshot)
+        except OSError as exc:
+            return {
+                "perfil": "snapshot", "texto": "[ERROR snapshot] no verificable",
+                "tokens": 0, "seg": 0.0, "rc": 126,
+                "verificacion_ok": False, "comprobaciones": [],
+                "hallazgos": [str(exc)[:240]], "snapshot_verificado": None,
+            }
     candidatos = ranking("review", preferir=preferir)
     if not candidatos:
         return {"perfil": "sin-cuenta", "texto": "[ERROR] sin verificador disponible",
@@ -2128,8 +3424,27 @@ def verificar_proyecto(plan, carpeta, resultados, timeout=600, preferir=None):
         if errores:
             prompt += ("\n\nOtro verificador no entrego evidencia valida: "
                        + " | ".join(errores[-3:]))
-        ultimo = correr(candidato["pid"], candidato["p"], prompt, "review",
-                        timeout, carpeta=carpeta, solo_lectura=True)
+        try:
+            if snapshot is None:
+                ultimo = correr(
+                    candidato["pid"], candidato["p"], prompt, "review",
+                    timeout, carpeta=carpeta, solo_lectura=True,
+                )
+            else:
+                with materializar_snapshot_verificacion(snapshot) as (
+                        snapshot_cwd, snapshot_fd):
+                    ultimo = correr(
+                        candidato["pid"], candidato["p"], prompt, "review",
+                        timeout, carpeta=snapshot_cwd, solo_lectura=True,
+                        cwd_fd=snapshot_fd,
+                    )
+                    if not _checkout_snapshot_limpio(snapshot_fd, snapshot):
+                        ultimo = dict(ultimo)
+                        ultimo["rc"] = 126
+                        ultimo["texto"] = "el revisor altero el checkout inmutable"
+        except OSError as exc:
+            errores.append(f"snapshot: {str(exc)[:160]}")
+            continue
         if ultimo.get("rc") != 0:
             errores.append(f"{candidato['pid']}: rc={ultimo.get('rc')}")
             continue
@@ -2151,19 +3466,81 @@ def verificar_proyecto(plan, carpeta, resultados, timeout=600, preferir=None):
         if any(_argv_verificacion(x["comando"]) is None for x in comprobaciones):
             errores.append(f"{candidato['pid']}: propuso una comprobacion no permitida")
             continue
-        comprobaciones_reales = [
-            ejecutar_comando_verificacion(x["comando"], carpeta, timeout)
-            for x in comprobaciones
-        ]
+        comprobaciones_reales = []
+        for comprobacion in comprobaciones:
+            if snapshot is None:
+                prueba = ejecutar_comando_verificacion(
+                    comprobacion["comando"], carpeta, timeout
+                )
+            else:
+                try:
+                    with materializar_snapshot_verificacion(snapshot) as (
+                            snapshot_cwd, snapshot_fd):
+                        prueba = ejecutar_comando_verificacion(
+                            comprobacion["comando"], snapshot_cwd, timeout,
+                            cwd_fd=snapshot_fd,
+                        )
+                        if not _checkout_snapshot_limpio(snapshot_fd, snapshot):
+                            prueba = dict(prueba)
+                            prueba["rc"] = 126
+                            prueba["resultado"] = (
+                                "la comprobacion altero el checkout inmutable"
+                            )
+                except OSError as exc:
+                    prueba = {
+                        "comando": comprobacion["comando"], "rc": 126,
+                        "resultado": f"snapshot no disponible: {str(exc)[:160]}",
+                    }
+            comprobaciones_reales.append(prueba)
         hallazgos_reales = list(hallazgos)
         for prueba in comprobaciones_reales:
             if prueba["rc"] != 0:
                 hallazgos_reales.append(
                     f"fallo real rc={prueba['rc']}: {prueba['comando']}"
                 )
+        identidades = ({tuple(snapshot["cwd_identidad"])} if snapshot else {
+            tuple(prueba.get("cwd_identidad", ()))
+            for prueba in comprobaciones_reales
+        })
+        identidad_coherente = (
+            len(identidades) == 1
+            and len(next(iter(identidades), ())) == 2
+            and all(isinstance(x, int) for x in next(iter(identidades), ()))
+        )
+        if not identidad_coherente:
+            hallazgos_reales.append(
+                "las comprobaciones no conservaron una identidad cwd unica"
+            )
+        identidades_repo = ({tuple(snapshot["repo_identidad"])} if snapshot else {
+            tuple(prueba.get("repo_identidad") or ())
+            for prueba in comprobaciones_reales
+        })
+        identidad_repo = next(iter(identidades_repo), ())
+        identidad_repo_coherente = (
+            len(identidades_repo) == 1
+            and (not identidad_repo or (
+                len(identidad_repo) == 2
+                and all(isinstance(x, int) for x in identidad_repo)
+            ))
+        )
+        if not identidad_repo_coherente:
+            hallazgos_reales.append(
+                "las comprobaciones no conservaron una raiz Git unica"
+            )
         ultimo["verificacion_ok"] = bool(
             dato["ok"] and all(x["rc"] == 0 for x in comprobaciones_reales)
+            and identidad_coherente and identidad_repo_coherente
             and not hallazgos_reales
+        )
+        ultimo["cwd_identidad"] = (
+            list(next(iter(identidades))) if identidad_coherente else None
+        )
+        ultimo["repo_identidad"] = (
+            list(identidad_repo) if identidad_repo_coherente and identidad_repo
+            else None
+        )
+        ultimo["snapshot_verificado"] = (
+            dict(snapshot) if ultimo["verificacion_ok"] and snapshot else None
         )
         ultimo["comprobaciones"] = comprobaciones_reales
         ultimo["hallazgos"] = hallazgos_reales
@@ -2177,49 +3554,1065 @@ def verificar_proyecto(plan, carpeta, resultados, timeout=600, preferir=None):
     return ultimo
 
 
-def _git(carpeta, *args, timeout=120):
-    """Git sin shell; nunca incorpora stdout de error a mensajes publicos."""
-    try:
-        return _SUBPROCESS_RUN_ORIGINAL(
-            ["git", *args], cwd=carpeta, capture_output=True, text=True,
-            timeout=timeout, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+def _git(carpeta, *args, timeout=120, cwd_fd=None, indice=None,
+         identidad_orquesta=False):
+    """Git con configuración ejecutable neutralizada y salida acotada."""
+    argv = ["/usr/bin/git", *_GIT_INTERNO, *args]
+    env = {
+        "HOME": HOME_USUARIO,
+        "PATH": "/usr/bin:/bin",
+        "LC_ALL": "C.UTF-8",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_SHALLOW_FILE": "/dev/null",
+        "GIT_GRAFT_FILE": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    if indice is not None:
+        indice = os.path.abspath(indice)
+        padre = os.path.dirname(indice)
+        estado_padre = os.stat(padre, follow_symlinks=False)
+        if (not stat.S_ISDIR(estado_padre.st_mode)
+                or estado_padre.st_uid != os.getuid()
+                or estado_padre.st_mode & 0o077):
+            raise OSError("indice Git alterno fuera de un directorio privado")
+        env["GIT_INDEX_FILE"] = indice
+    if identidad_orquesta:
+        env.update({
+            "GIT_AUTHOR_NAME": "Orquesta IA",
+            "GIT_AUTHOR_EMAIL": "orquesta@localhost",
+            "GIT_COMMITTER_NAME": "Orquesta IA",
+            "GIT_COMMITTER_EMAIL": "orquesta@localhost",
+        })
+    out, err, rc = _ejecutar_aislado_acotado(
+        argv, env, carpeta, timeout,
+        limite_salida=8 * 1024 * 1024, limite_error=1024 * 1024,
+        usar_scope=False, cwd_fd=cwd_fd,
+    )
+    return subprocess.CompletedProcess(argv, rc, out, err)
+
+
+_CONFIG_GIT_EJECUTABLE = (
+    r"^(include(if\..*)?\.path|filter\..*\.(clean|smudge|process)|"
+    r"diff\..*\.(command|textconv)|merge\..*\.driver|"
+    r"core\.(sshcommand|gitproxy|alternaterefscommand|worktree)|"
+    r"extensions\.worktreeconfig|credential(\..*)?\.helper|"
+    r"gpg(\..*)?\.program|remote\..*\.(uploadpack|receivepack|vcs)|"
+    r"url\..*\.(insteadof|pushinsteadof))$"
+)
+
+
+def _config_git_ejecutable(carpeta, cwd_fd=None):
+    """Audita extensiones locales que podrían convertir Git en ejecución.
+
+    ``--local`` excluye nuestras opciones ``-c`` y los archivos globales; con
+    ``--includes`` también se ven explícitamente los includes declarados por el
+    repositorio. ``False`` significa limpio, ``True`` hallazgo y ``None`` que la
+    auditoría no pudo completarse.
+    """
+    r = _git(
+        carpeta, "config", "--local", "--includes", "--name-only",
+        "--get-regexp", _CONFIG_GIT_EJECUTABLE, timeout=10, cwd_fd=cwd_fd,
+    )
+    if r is None or r.returncode not in (0, 1):
         return None
+    return r.returncode == 0 and bool(r.stdout.strip())
 
 
-def publicar_repo(carpeta, mensaje="chore: cambios verificados por Orquesta IA"):
+def _oid_git_valido(valor):
+    return isinstance(valor, str) and bool(
+        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", valor)
+    )
+
+
+def _rama_git_valida(valor):
+    return (isinstance(valor, str)
+            and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}", valor))
+            and ".." not in valor and "//" not in valor and "@{" not in valor
+            and not valor.endswith((".", "/", ".lock")))
+
+
+def _rama_remota_auditable(valor):
+    """Equivalente acotado de check-ref-format para inventario remoto."""
+    if (not isinstance(valor, str) or not valor or len(valor) > 4096
+            or valor.startswith(("/", ".")) or valor.endswith((".", "/"))
+            or ".." in valor or "//" in valor or "@{" in valor
+            or any(ord(c) < 32 or ord(c) == 127 or c in " ~^:?*[\\"
+                   for c in valor)):
+        return False
+    return all(parte and not parte.startswith(".")
+               and not parte.endswith(".lock") for parte in valor.split("/"))
+
+
+def _git_directo_bytes(repo_fd, modo, oid=None, entrada=None, indice=None,
+                       limite_salida=64 * 1024 * 1024):
+    """Ejecuta solo primitivas Git sin filtros con argv reconstruido y stdin."""
+    if modo == "hash-object":
+        argv = ["/usr/bin/git", *_GIT_INTERNO,
+                "hash-object", "-w", "--no-filters", "--stdin"]
+    elif modo == "update-index":
+        argv = ["/usr/bin/git", *_GIT_INTERNO,
+                "update-index", "-z", "--index-info"]
+    elif modo == "cat-size" and _oid_git_valido(oid):
+        argv = ["/usr/bin/git", *_GIT_INTERNO, "cat-file", "-s", oid]
+    elif modo == "cat-blob" and _oid_git_valido(oid):
+        argv = ["/usr/bin/git", *_GIT_INTERNO, "cat-file", "blob", oid]
+    else:
+        raise OSError("primitiva Git binaria no permitida")
+    env = {
+        "HOME": HOME_USUARIO, "PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8",
+        "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_SHALLOW_FILE": "/dev/null", "GIT_GRAFT_FILE": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    if indice is not None:
+        env["GIT_INDEX_FILE"] = os.path.abspath(indice)
+    try:
+        resultado = _SUBPROCESS_RUN_ORIGINAL(
+            argv, input=entrada, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=f"/proc/self/fd/{repo_fd}", pass_fds=(repo_fd,), env=env,
+            timeout=180, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise OSError("fallo una primitiva Git sin filtros") from exc
+    if (len(resultado.stdout or b"") > limite_salida
+            or len(resultado.stderr or b"") > 1024 * 1024):
+        raise OSError("salida excesiva de primitiva Git")
+    return resultado
+
+
+def _leer_regular_repo_fd(repo_fd, ruta, limite=32 * 1024 * 1024):
+    """Lee un path Git regular por openat; ``None`` representa un borrado."""
+    if (not isinstance(ruta, str) or not ruta or "\ufffd" in ruta
+            or os.path.isabs(ruta)):
+        raise OSError("ruta Git no representable")
+    partes = ruta.split("/")
+    if any(parte in ("", ".", "..") for parte in partes):
+        raise OSError("ruta Git insegura")
+    flags_dir = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) \
+        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    dir_fd = os.dup(repo_fd)
+    try:
+        for parte in partes[:-1]:
+            siguiente = os.open(parte, flags_dir, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = siguiente
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) \
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            fd = os.open(partes[-1], flags, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise OSError("symlinks y archivos especiales Git no permitidos") from exc
+        try:
+            antes = os.fstat(fd)
+            if (not stat.S_ISREG(antes.st_mode) or antes.st_nlink != 1
+                    or antes.st_size < 0 or antes.st_size > limite):
+                raise OSError("archivo Git no regular, enlazado o excesivo")
+            bloques, restantes = [], antes.st_size
+            while restantes:
+                bloque = os.read(fd, min(64 * 1024, restantes))
+                if not bloque:
+                    raise OSError("archivo Git truncado durante lectura")
+                bloques.append(bloque)
+                restantes -= len(bloque)
+            despues = os.fstat(fd)
+            identidad = lambda st: (
+                st.st_dev, st.st_ino, st.st_mode, st.st_size,
+                st.st_mtime_ns, st.st_ctime_ns,
+            )
+            if identidad(antes) != identidad(despues):
+                raise OSError("archivo Git cambio durante lectura")
+            modo = "100755" if antes.st_mode & 0o111 else "100644"
+            return b"".join(bloques), modo
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _tree_publicable_fd(repo_fd, base_oid):
+    """Hashea bytes crudos publicables sin ejecutar clean/smudge/process."""
+    if base_oid is not None and not _oid_git_valido(base_oid):
+        raise OSError("base Git invalida para el indice alterno")
+    marcas = _git(".", "ls-files", "-v", "-z", cwd_fd=repo_fd)
+    if not marcas or marcas.returncode != 0 or len(marcas.stdout) > 8 * 1024 * 1024:
+        raise OSError("no pude auditar flags del indice")
+    for registro in marcas.stdout.split("\x00"):
+        if not registro:
+            continue
+        if len(registro) < 3 or registro[1] != " ":
+            raise OSError("marca del indice invalida")
+        if registro[0] == "S" or registro[0].islower():
+            raise OSError("skip-worktree y assume-unchanged no son verificables")
+    lista = _git(".", "ls-files", "-co", "--exclude-standard", "-z",
+                 cwd_fd=repo_fd)
+    if not lista or lista.returncode != 0 or len(lista.stdout) > 8 * 1024 * 1024:
+        raise OSError("no pude enumerar el contenido publicable")
+    rutas = lista.stdout.split("\x00")
+    if rutas and rutas[-1] == "":
+        rutas.pop()
+    if len(rutas) > 100_000 or len(set(rutas)) != len(rutas):
+        raise OSError("lista de paths Git invalida o excesiva")
+    entradas = []
+    bytes_totales = 0
+    for ruta in rutas:
+        leido = _leer_regular_repo_fd(repo_fd, ruta)
+        if leido is None:
+            continue
+        contenido, modo = leido
+        bytes_totales += len(contenido)
+        if bytes_totales > 512 * 1024 * 1024:
+            raise OSError("snapshot Git excede el presupuesto total")
+        objeto = _git_directo_bytes(
+            repo_fd, "hash-object", entrada=contenido, limite_salida=256
+        )
+        oid = objeto.stdout.decode("ascii", "strict").strip() \
+            if objeto.returncode == 0 else ""
+        if not _oid_git_valido(oid):
+            raise OSError("blob Git verificable invalido")
+        entradas.append(
+            modo.encode("ascii") + b" " + oid.encode("ascii") + b"\t"
+            + os.fsencode(ruta) + b"\x00"
+        )
+    with tempfile.TemporaryDirectory(prefix="orq-index-", dir=TEMP_ROOT) as privado:
+        os.chmod(privado, 0o700)
+        indice = os.path.join(privado, "index")
+        vacio = _git(".", "read-tree", "--empty", cwd_fd=repo_fd, indice=indice)
+        if not vacio or vacio.returncode != 0:
+            raise OSError("no pude iniciar el indice verificable")
+        if entradas:
+            actualizado = _git_directo_bytes(
+                repo_fd, "update-index", entrada=b"".join(entradas), indice=indice,
+                limite_salida=1024,
+            )
+            if actualizado.returncode != 0:
+                raise OSError("no pude poblar el indice verificable")
+        escrito = _git(".", "write-tree", cwd_fd=repo_fd, indice=indice)
+        tree_oid = escrito.stdout.strip() if escrito and escrito.returncode == 0 else ""
+        if not _oid_git_valido(tree_oid):
+            raise OSError("tree Git verificable invalido")
+        return tree_oid
+
+
+def _materializar_tree_fd(repo_fd, destino_fd, tree_oid):
+    """Escribe blobs regulares de un tree sin pasar por filtros de checkout."""
+    if not _oid_git_valido(tree_oid):
+        raise OSError("tree no materializable")
+    listado = _git(".", "ls-tree", "-r", "-z", tree_oid, cwd_fd=repo_fd)
+    if not listado or listado.returncode != 0 or len(listado.stdout) > 8 * 1024 * 1024:
+        raise OSError("manifest de tree invalido o excesivo")
+    registros = listado.stdout.split("\x00")
+    if registros and registros[-1] == "":
+        registros.pop()
+    if len(registros) > 100_000:
+        raise OSError("tree con demasiadas entradas")
+    presupuesto = 512 * 1024 * 1024
+    flags_dir = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) \
+        | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    for registro in registros:
+        if "\ufffd" in registro or "\t" not in registro:
+            raise OSError("entrada de tree no representable")
+        cabecera, ruta = registro.split("\t", 1)
+        campos = cabecera.split(" ")
+        if (len(campos) != 3 or campos[0] not in {"100644", "100755"}
+                or campos[1] != "blob" or not _oid_git_valido(campos[2])):
+            raise OSError("modo de tree no reproducible")
+        partes = ruta.split("/")
+        if (not ruta or os.path.isabs(ruta) or partes[0] == ".git"
+                or any(parte in ("", ".", "..") for parte in partes)):
+            raise OSError("ruta de tree insegura")
+        tamano_r = _git_directo_bytes(
+            repo_fd, "cat-size", oid=campos[2], limite_salida=128
+        )
+        try:
+            tamano = int(tamano_r.stdout.strip()) if tamano_r.returncode == 0 else -1
+        except ValueError as exc:
+            raise OSError("tamano de blob invalido") from exc
+        if tamano < 0 or tamano > 32 * 1024 * 1024 or tamano > presupuesto:
+            raise OSError("blob de snapshot excesivo")
+        blob_r = _git_directo_bytes(
+            repo_fd, "cat-blob", oid=campos[2], limite_salida=tamano
+        )
+        if blob_r.returncode != 0 or len(blob_r.stdout) != tamano:
+            raise OSError("blob de snapshot corrupto")
+        presupuesto -= tamano
+        dir_fd = os.dup(destino_fd)
+        try:
+            for parte in partes[:-1]:
+                try:
+                    os.mkdir(parte, 0o700, dir_fd=dir_fd)
+                except FileExistsError:
+                    pass
+                siguiente = os.open(parte, flags_dir, dir_fd=dir_fd)
+                os.close(dir_fd)
+                dir_fd = siguiente
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL \
+                | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(partes[-1], flags, 0o600, dir_fd=dir_fd)
+            try:
+                vista = memoryview(blob_r.stdout)
+                while vista:
+                    escritos = os.write(fd, vista)
+                    if escritos <= 0:
+                        raise OSError("escritura incompleta de snapshot")
+                    vista = vista[escritos:]
+                os.fchmod(fd, 0o755 if campos[0] == "100755" else 0o644)
+            finally:
+                os.close(fd)
+        finally:
+            os.close(dir_fd)
+
+
+def _escanear_commit_fd(repo_fd, commit_oid):
+    if not _oid_git_valido(commit_oid):
+        return False
+    scanner = os.path.join(CODIGO_ORQUESTA, "tools", "scan-secretos.sh")
+    if not os.path.isfile(scanner):
+        return False
+    argv = ["/usr/bin/bash", scanner, "--commit", commit_oid, "--repo", "."]
+    _out, _err, rc = _ejecutar_aislado_acotado(
+        argv, {"HOME": HOME_USUARIO, "PATH": "/usr/bin:/bin",
+               "LC_ALL": "C.UTF-8"}, ".", 180,
+        limite_salida=2 * 1024 * 1024, limite_error=2 * 1024 * 1024,
+        usar_scope=False, cwd_fd=repo_fd,
+    )
+    return rc == 0
+
+
+def preparar_snapshot_verificacion(carpeta, mensaje):
+    """Crea un commit inmutable, no referenciado, del contenido a probar."""
+    mensaje = str(mensaje or "chore: snapshot verificado por Orquesta IA")[:200]
+    if not mensaje:
+        raise OSError("mensaje de snapshot vacio")
+    with _capacidad_trabajo(carpeta) as (_, cwd_fd):
+        estado_cwd = os.fstat(cwd_fd)
+        with _capacidad_raiz_git(cwd_fd) as (raiz, repo_fd, prefijo):
+            estado_repo = os.fstat(repo_fd)
+            if _config_git_ejecutable(".", cwd_fd=repo_fd) is not False:
+                raise OSError("configuracion Git ejecutable no permitida")
+            rama_r = _git(".", "symbolic-ref", "--quiet", "--short", "HEAD",
+                          cwd_fd=repo_fd)
+            rama = rama_r.stdout.strip() if rama_r and rama_r.returncode == 0 else ""
+            if not _rama_git_valida(rama):
+                raise OSError("rama Git no publicable")
+            base_r = _git(".", "rev-parse", "HEAD", cwd_fd=repo_fd)
+            base_oid = base_r.stdout.strip() if base_r and base_r.returncode == 0 else ""
+            if not _oid_git_valido(base_oid):
+                ref_local = _git(
+                    ".", "show-ref", "--verify", "--quiet",
+                    f"refs/heads/{rama}", cwd_fd=repo_fd,
+                )
+                if not ref_local or ref_local.returncode != 1:
+                    raise OSError("HEAD base invalido")
+                base_oid = None
+            tree_oid = _tree_publicable_fd(repo_fd, base_oid)
+            listado = _git(".", "ls-tree", "-r", tree_oid, cwd_fd=repo_fd)
+            if not listado or listado.returncode != 0:
+                raise OSError("no pude auditar el tree verificable")
+            modos_no_reproducibles = ("120000 ", "160000 ")
+            if any(linea.startswith(modos_no_reproducibles)
+                   for linea in listado.stdout.splitlines()):
+                raise OSError(
+                    "symlinks y submodulos no permitidos en snapshot verificable"
+                )
+            if base_oid is None:
+                tree_base = None
+            else:
+                tree_base_r = _git(
+                    ".", "rev-parse", f"{base_oid}^{{tree}}", cwd_fd=repo_fd
+                )
+                tree_base = (tree_base_r.stdout.strip()
+                             if tree_base_r and tree_base_r.returncode == 0 else "")
+            creado = base_oid is None or tree_oid != tree_base
+            if creado:
+                commit_args = ["commit-tree", tree_oid]
+                if base_oid is not None:
+                    commit_args.extend(["-p", base_oid])
+                commit_args.extend(["-m", mensaje])
+                commit_r = _git(
+                    ".", *commit_args, cwd_fd=repo_fd, identidad_orquesta=True,
+                )
+                commit_oid = (commit_r.stdout.strip()
+                              if commit_r and commit_r.returncode == 0 else "")
+            else:
+                commit_oid = base_oid
+            if not _oid_git_valido(commit_oid):
+                raise OSError("commit verificable invalido")
+            commit_tree_r = _git(
+                ".", "rev-parse", f"{commit_oid}^{{tree}}", cwd_fd=repo_fd
+            )
+            if (not commit_tree_r or commit_tree_r.returncode != 0
+                    or commit_tree_r.stdout.strip() != tree_oid):
+                raise OSError("el commit verificable no contiene el tree fijado")
+            if _config_git_ejecutable(".", cwd_fd=repo_fd) is not False:
+                raise OSError("la configuracion Git cambio durante el snapshot")
+            # El objeto queda deliberadamente sin ref hasta superar la revisión.
+            testigo_historial = _testigo_historial_git(repo_fd)
+            if not _escanear_commit_fd(repo_fd, commit_oid):
+                raise OSError("el snapshot no supero el escaneo de secretos")
+            if _testigo_historial_git(repo_fd) != testigo_historial:
+                raise OSError("la topologia Git cambio durante el snapshot")
+            return {
+                "version": 1, "base_oid": base_oid, "tree_oid": tree_oid,
+                "commit_oid": commit_oid, "rama": rama,
+                "cwd_rel": prefijo[:-1] if prefijo else "",
+                "cwd_identidad": [estado_cwd.st_dev, estado_cwd.st_ino],
+                "repo_identidad": [estado_repo.st_dev, estado_repo.st_ino],
+                "raiz": raiz, "creado": creado, "mensaje": mensaje,
+            }
+
+
+def _snapshot_valido(snapshot):
+    return (isinstance(snapshot, dict) and snapshot.get("version") == 1
+            and (_oid_git_valido(snapshot.get("base_oid"))
+                 or (snapshot.get("base_oid") is None
+                     and snapshot.get("creado") is True))
+            and all(_oid_git_valido(snapshot.get(k))
+                    for k in ("tree_oid", "commit_oid"))
+            and _rama_git_valida(snapshot.get("rama"))
+            and isinstance(snapshot.get("cwd_rel"), str)
+            and not os.path.isabs(snapshot["cwd_rel"])
+            and ".." not in snapshot["cwd_rel"].split("/")
+            and isinstance(snapshot.get("raiz"), str) and bool(snapshot["raiz"])
+            and type(snapshot.get("creado")) is bool
+            and isinstance(snapshot.get("mensaje"), str)
+            and 0 < len(snapshot["mensaje"]) <= 200
+            and all(isinstance(snapshot.get(k), list)
+                    and len(snapshot[k]) == 2
+                    and all(type(x) is int for x in snapshot[k])
+                    for k in ("cwd_identidad", "repo_identidad")))
+
+
+def _checkout_snapshot_limpio(cwd_fd, snapshot):
+    try:
+        with _capacidad_raiz_git(cwd_fd) as (_, repo_fd, _prefijo):
+            head = _git(".", "rev-parse", "HEAD", cwd_fd=repo_fd)
+            estado = _git(
+                ".", "status", "--porcelain=v2", "-z",
+                "--untracked-files=all", cwd_fd=repo_fd,
+            )
+            return (head and head.returncode == 0
+                    and head.stdout.strip() == snapshot["commit_oid"]
+                    and estado and estado.returncode == 0 and not estado.stdout)
+    except OSError:
+        return False
+
+
+@contextlib.contextmanager
+def materializar_snapshot_verificacion(snapshot):
+    """Entrega un checkout detached privado y lo retira tras matar procesos."""
+    if not _snapshot_valido(snapshot):
+        raise OSError("snapshot de verificacion invalido")
+    padre = tempfile.mkdtemp(prefix="orq-verify-", dir=TEMP_ROOT)
+    try:
+        padre_fd = os.open(
+            padre,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError:
+        # ``mkdtemp`` acaba de crear un directorio privado y vacio. Si ni
+        # siquiera podemos adquirirlo, no dejamos ese nombre abandonado.
+        try:
+            os.rmdir(padre)
+        except OSError:
+            pass
+        raise
+    try:
+        estado_padre = os.fstat(padre_fd)
+        os.fchmod(padre_fd, 0o700)
+    except OSError:
+        os.close(padre_fd)
+        try:
+            os.rmdir(padre)
+        except OSError:
+            pass
+        raise
+    checkout = os.path.join(padre, "checkout")
+    worktree_agregado = False
+    retiro_ok = False
+    try:
+        with _capacidad_trabajo(snapshot["raiz"]) as (_, cwd_raiz_fd):
+            with _capacidad_raiz_git(cwd_raiz_fd) as (_, repo_fd, _prefijo):
+                estado_repo = os.fstat(repo_fd)
+                if [estado_repo.st_dev, estado_repo.st_ino] != snapshot["repo_identidad"]:
+                    raise OSError("la raiz del snapshot cambio")
+                tree_commit_r = _git(
+                    ".", "rev-parse", f"{snapshot['commit_oid']}^{{tree}}",
+                    cwd_fd=repo_fd,
+                )
+                if (not tree_commit_r or tree_commit_r.returncode != 0
+                        or tree_commit_r.stdout.strip() != snapshot["tree_oid"]):
+                    raise OSError("el objeto snapshot no coincide con su tree")
+                agregado = _git(
+                    ".", "worktree", "add", "--no-checkout", "--detach",
+                    checkout, snapshot["commit_oid"], cwd_fd=repo_fd, timeout=180,
+                )
+                if not agregado or agregado.returncode != 0:
+                    raise OSError("no pude crear el checkout verificable")
+                worktree_agregado = True
+                try:
+                    with _capacidad_trabajo(checkout) as (_, checkout_fd):
+                        if _config_git_ejecutable(".", cwd_fd=checkout_fd) is not False:
+                            raise OSError("configuracion ejecutable en worktree")
+                        indexado = _git(
+                            ".", "read-tree", snapshot["tree_oid"],
+                            cwd_fd=checkout_fd,
+                        )
+                        if not indexado or indexado.returncode != 0:
+                            raise OSError("no pude fijar el indice del checkout")
+                        _materializar_tree_fd(
+                            checkout_fd, checkout_fd, snapshot["tree_oid"]
+                        )
+                        if _config_git_ejecutable(".", cwd_fd=checkout_fd) is not False:
+                            raise OSError("la configuracion Git cambio al materializar")
+                    cwd_snapshot = (checkout if not snapshot["cwd_rel"] else
+                                    os.path.join(checkout, *snapshot["cwd_rel"].split("/")))
+                    with _capacidad_trabajo(cwd_snapshot) as (visible, snapshot_cwd_fd):
+                        if not _checkout_snapshot_limpio(snapshot_cwd_fd, snapshot):
+                            raise OSError("checkout verificable no esta limpio")
+                        yield visible, snapshot_cwd_fd
+                finally:
+                    retirado = _git(
+                        ".", "worktree", "remove", "--force", checkout,
+                        cwd_fd=repo_fd, timeout=180,
+                    )
+                    retiro_ok = bool(retirado and retirado.returncode == 0)
+                    if not retiro_ok:
+                        raise OSError(
+                            "no pude retirar el worktree; quedo en cuarentena"
+                        )
+    finally:
+        # Antes de que ``git worktree add`` termine no existe nada que
+        # cuarentenizar. Retiramos un checkout vacio que Git haya alcanzado a
+        # crear y luego el padre, siempre mediante el descriptor adquirido.
+        limpiar_padre = retiro_ok or not worktree_agregado
+        if limpiar_padre and not worktree_agregado:
+            try:
+                os.rmdir("checkout", dir_fd=padre_fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                limpiar_padre = False
+        if limpiar_padre:
+            try:
+                limpiar_padre = not os.listdir(padre_fd)
+            except OSError:
+                limpiar_padre = False
+        os.close(padre_fd)
+        if limpiar_padre:
+            try:
+                estado_visible = os.stat(padre, follow_symlinks=False)
+                if ((estado_visible.st_dev, estado_visible.st_ino)
+                        == (estado_padre.st_dev, estado_padre.st_ino)):
+                    os.rmdir(padre)
+            except OSError:
+                pass
+
+
+def _testigo_historial_git(repo_fd):
+    """Rechaza grafts/shallow y atestigua directorios que los alojan."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        git_fd = os.open(".git", flags, dir_fd=repo_fd)
+    except NotADirectoryError as exc:
+        # En un linked worktree ``.git`` es un archivo que redirige a un
+        # directorio común mutable. Seguirlo ampliaría la capacidad adquirida
+        # y permitiría que grafts/shallow cambiasen fuera del repo_fd. Hasta
+        # modelar ambos gitdirs por descriptor, la publicación falla cerrada.
+        raise OSError(
+            "los linked worktrees no se admiten para publicacion verificable; "
+            "use el checkout principal"
+        ) from exc
+    try:
+        estado_git = os.fstat(git_fd)
+        try:
+            info_fd = os.open("info", flags, dir_fd=git_fd)
+        except FileNotFoundError:
+            info_fd = None
+        try:
+            estado_info = os.fstat(info_fd) if info_fd is not None else None
+            for nombre, fd in (("shallow", git_fd), ("grafts", info_fd)):
+                if fd is None:
+                    continue
+                try:
+                    os.stat(nombre, dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                raise OSError("historial Git shallow/grafts no verificable")
+        finally:
+            if info_fd is not None:
+                os.close(info_fd)
+        def identidad(estado):
+            if estado is None:
+                return None
+            return (estado.st_dev, estado.st_ino, estado.st_mode,
+                    estado.st_mtime_ns, estado.st_ctime_ns)
+
+        return identidad(estado_git), identidad(estado_info)
+    finally:
+        os.close(git_fd)
+
+
+def _refs_remotas_confiables(repo_fd, remoto_fetch):
+    """Obtiene refs de origin en un namespace efimero, no desde refs locales."""
+    if not _remoto_git_permitido(remoto_fetch):
+        raise OSError("URL de fetch no permitida")
+    token = secrets.token_hex(16)
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise OSError("token remoto invalido")
+    namespace = f"refs/orq-audit/{token}/"
+
+    def listar_namespace_crudo():
+        r = _git(
+            ".", "for-each-ref", "--format=%(refname)%09%(objectname)",
+            namespace, cwd_fd=repo_fd,
+        )
+        if not r or r.returncode != 0 or len(r.stdout) > 8 * 1024 * 1024:
+            raise OSError("no pude enumerar el namespace remoto")
+        registros = []
+        for linea in r.stdout.splitlines():
+            if not linea:
+                continue
+            partes = linea.split("\t")
+            if len(partes) != 2 or not partes[0].startswith(namespace):
+                raise OSError("ref temporal remota invalida")
+            if not _oid_git_valido(partes[1]):
+                raise OSError("OID temporal remoto invalido")
+            registros.append((partes[0], partes[1]))
+        return registros
+
+    def validar_namespace(registros):
+        mapa = {}
+        for ref_completa, oid in registros:
+            rama = ref_completa[len(namespace):]
+            if (not _rama_remota_auditable(rama) or rama in mapa):
+                raise OSError("mapa temporal remoto invalido")
+            mapa[rama] = oid
+        if len(mapa) > MAX_REFS_REMOTAS:
+            raise OSError("demasiadas refs remotas")
+        return mapa
+
+    def leer_ls_remote():
+        remoto = _git(
+            ".", "ls-remote", "--heads", "--", remoto_fetch, timeout=180,
+            cwd_fd=repo_fd,
+        )
+        if not remoto or remoto.returncode != 0 or len(remoto.stdout) > 8 * 1024 * 1024:
+            raise OSError("no pude contrastar refs remotas")
+        mapa = {}
+        for linea in remoto.stdout.splitlines():
+            partes = linea.split("\t")
+            prefijo = "refs/heads/"
+            if (len(partes) != 2 or not partes[1].startswith(prefijo)
+                    or not _oid_git_valido(partes[0])):
+                raise OSError("salida ls-remote invalida")
+            rama = partes[1][len(prefijo):]
+            if not _rama_remota_auditable(rama) or rama in mapa:
+                raise OSError("mapa ls-remote invalido")
+            mapa[rama] = partes[0]
+        if len(mapa) > MAX_REFS_REMOTAS:
+            raise OSError("demasiadas refs remotas")
+        return mapa
+
+    if listar_namespace_crudo():
+        raise OSError("namespace remoto no estaba vacio")
+    mapa_fetch = {}
+    error = None
+    try:
+        mapa_antes = leer_ls_remote()
+        refspec = f"+refs/heads/*:{namespace}*"
+        fetch = _git(
+            ".", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+            "--", remoto_fetch, refspec,
+            timeout=180, cwd_fd=repo_fd,
+        )
+        if not fetch or fetch.returncode != 0:
+            raise OSError("no pude obtener refs explicitas de origin")
+        mapa_fetch = validar_namespace(listar_namespace_crudo())
+        mapa_despues = leer_ls_remote()
+        if mapa_antes != mapa_fetch or mapa_despues != mapa_fetch:
+            raise OSError("origin cambio durante la adquisicion de refs")
+    except OSError as exc:
+        error = exc
+    finally:
+        try:
+            actuales = listar_namespace_crudo()
+            for ref_completa, oid in actuales:
+                borrado = _git(
+                    ".", "update-ref", "-d", ref_completa, oid,
+                    cwd_fd=repo_fd,
+                )
+                if not borrado or borrado.returncode != 0:
+                    raise OSError("no pude limpiar una ref remota temporal")
+            if listar_namespace_crudo():
+                raise OSError("namespace remoto temporal no quedo vacio")
+        except OSError as exc:
+            error = error or exc
+    if error is not None:
+        raise error
+    return mapa_fetch
+
+
+def _rev_list_excluyendo_refs(repo_fd, commit_oid, oids_remotos):
+    if not _oid_git_valido(commit_oid):
+        return None
+    unicos = tuple(dict.fromkeys(oids_remotos))
+    if len(unicos) > 10_000 or any(not _oid_git_valido(x) for x in unicos):
+        return None
+    args = ["rev-list", commit_oid]
+    if unicos:
+        args.extend(["--not", *unicos])
+    return _git(".", *args, cwd_fd=repo_fd)
+
+
+def _usuario_remoto_valido(valor):
+    permitidos = frozenset(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+    )
+    return bool(valor) and all(c in permitidos for c in valor)
+
+
+def _host_puerto_remoto_valido(valor):
+    host, separador, puerto = valor.partition(":")
+    if (not host or any(c.isspace() or c in "/@:" for c in host)
+            or (separador and (not puerto or not puerto.isascii()
+                               or not puerto.isdigit()))):
+        return False
+    return True
+
+
+def _remoto_git_permitido(remoto):
+    """Rechaza helpers/protocolos extensibles con un parser lineal cerrado."""
+    if (not isinstance(remoto, str) or not remoto or len(remoto) > 4096
+            or any(c in remoto for c in ("\x00", "\n", "\r"))):
+        return False
+    if os.path.isabs(remoto) or remoto.startswith("file:///"):
+        return True
+
+    minusculas = remoto.lower()
+    if minusculas.startswith("https://"):
+        autoridad, barra, ruta = remoto[8:].partition("/")
+        return bool(
+            barra and ruta and not any(c.isspace() for c in ruta)
+            and _host_puerto_remoto_valido(autoridad)
+        )
+    if minusculas.startswith("ssh://"):
+        autoridad, barra, ruta = remoto[6:].partition("/")
+        if not barra or not ruta or any(c.isspace() for c in ruta):
+            return False
+        usuario, arroba, host_puerto = autoridad.partition("@")
+        if arroba:
+            if not _usuario_remoto_valido(usuario) or "@" in host_puerto:
+                return False
+        else:
+            host_puerto = autoridad
+        return _host_puerto_remoto_valido(host_puerto)
+
+    usuario, arroba, destino = remoto.partition("@")
+    host, dos_puntos, ruta = destino.partition(":")
+    return bool(
+        arroba and dos_puntos and _usuario_remoto_valido(usuario)
+        and host and ruta and not any(c.isspace() or c in "/@:" for c in host)
+        and not any(c.isspace() for c in ruta)
+    )
+
+
+def publicar_repo(carpeta, mensaje="chore: cambios verificados por Orquesta IA",
+                  identidad_esperada=None, identidad_repo_esperada=None,
+                  snapshot_esperado=None):
     """Escanea, confirma y publica un repo sin permitir credenciales.
 
     Se revisan el arbol completo, los blobs staged y cualquier commit local que
     aun no exista en el remoto. Nunca se hace force-push ni merge automatico.
     """
-    carpeta = os.path.realpath(os.path.abspath(os.path.expanduser(carpeta)))
-    raiz_r = _git(carpeta, "rev-parse", "--show-toplevel")
-    if not raiz_r or raiz_r.returncode != 0:
-        return {"ok": False, "fase": "git", "detalle": "la carpeta no es un repositorio Git"}
-    raiz = os.path.realpath(raiz_r.stdout.strip())
-    rama_r = _git(raiz, "symbolic-ref", "--quiet", "--short", "HEAD")
+    def coincide(fd, esperada):
+        if esperada is None:
+            return True
+        if (not isinstance(esperada, (list, tuple)) or len(esperada) != 2
+                or any(type(x) is not int for x in esperada)):
+            return False
+        estado = os.fstat(fd)
+        return tuple(esperada) == (estado.st_dev, estado.st_ino)
+
+    if snapshot_esperado is not None:
+        if not _snapshot_valido(snapshot_esperado):
+            return {"ok": False, "fase": "seguridad",
+                    "detalle": "snapshot verificado invalido"}
+        if (identidad_esperada != snapshot_esperado["cwd_identidad"]
+                or identidad_repo_esperada != snapshot_esperado["repo_identidad"]):
+            return {"ok": False, "fase": "seguridad",
+                    "detalle": "identidades no corresponden al snapshot"}
+    elif identidad_esperada is not None or identidad_repo_esperada is not None:
+        return {"ok": False, "fase": "seguridad",
+                "detalle": "la verificacion no fijo un snapshot inmutable"}
+    try:
+        # Se adquiere primero exactamente el cwd verificado. Desde él se deriva
+        # el top-level ascendiendo por descriptores, sin abrir la ruta textual
+        # que Git pudiera devolver ni confundir un subdirectorio con la raíz.
+        with _capacidad_trabajo(carpeta) as (_, cwd_fd):
+            if not coincide(cwd_fd, identidad_esperada):
+                return {"ok": False, "fase": "seguridad",
+                        "detalle": "la carpeta no es el inode verificado"}
+            with _capacidad_raiz_git(cwd_fd) as (raiz, repo_fd, _prefijo):
+                if not coincide(repo_fd, identidad_repo_esperada):
+                    return {"ok": False, "fase": "seguridad",
+                            "detalle": "el repositorio no es el inode verificado"}
+                return _publicar_repo_adquirido(
+                    raiz, mensaje, repo_fd, snapshot_esperado=snapshot_esperado
+                )
+    except OSError:
+        return {"ok": False, "fase": "seguridad",
+                "detalle": "la carpeta o raiz Git cambio o dejo de ser segura"}
+
+
+def _publicar_repo_adquirido(raiz, mensaje, repo_fd, snapshot_esperado=None):
+    """Completa la transacción usando siempre el mismo descriptor de repo."""
+    def git(*args, timeout=120):
+        return _git(".", *args, timeout=timeout, cwd_fd=repo_fd)
+
+    def push_oid_exacto(oid, oid_remoto_esperado):
+        ref_destino = f"refs/heads/{rama}"
+        refspec = f"{oid}:{ref_destino}"
+        lease = f"--force-with-lease={ref_destino}:{oid_remoto_esperado or ''}"
+        return git("push", lease, "--", remoto_push, refspec, timeout=300)
+
+    def leer_tracking_local(oid):
+        ref = f"refs/remotes/origin/{rama}"
+        actual = git(
+            "for-each-ref", "--format=%(refname)%09%(objectname)", ref
+        )
+        if not actual or actual.returncode != 0:
+            return None
+        lineas = actual.stdout.splitlines()
+        if not lineas:
+            return "0" * len(oid)
+        if len(lineas) != 1:
+            return None
+        partes = lineas[0].split("\t")
+        if (len(partes) != 2 or partes[0] != ref
+                or not _oid_git_valido(partes[1])
+                or len(partes[1]) != len(oid)):
+            return None
+        return partes[1]
+
+    def registrar_tracking(existia_remota, oid, creado, oid_anterior):
+        # El push usa una URL literal, por lo que no actualiza el ref de
+        # seguimiento. Lo movemos con CAS: un fetch concurrente gana y se
+        # informa como fallo posterior al push en vez de pisarlo.
+        seguimiento = git(
+            "update-ref", f"refs/remotes/origin/{rama}", oid, oid_anterior
+        )
+        if not seguimiento or seguimiento.returncode != 0:
+            return {
+                "ok": False, "fase": "tracking", "publicado": True,
+                "detalle": "el commit se publico, pero no pude registrar origin",
+                "commit": oid[:12], "creado": creado, "raiz": raiz,
+            }
+        if existia_remota:
+            return None
+        tracking = git(
+            "branch", f"--set-upstream-to=origin/{rama}", "--", rama
+        )
+        if tracking and tracking.returncode == 0:
+            return None
+        # El push exacto ya terminó: un fallo local de tracking no permite
+        # afirmar que el commit no se publicó ni volver a empujarlo a ciegas.
+        return {
+            "ok": False, "fase": "tracking", "publicado": True,
+            "detalle": "el commit se publico, pero no pude configurar upstream",
+            "commit": oid[:12], "creado": creado, "raiz": raiz,
+        }
+
+    ejecutable = _config_git_ejecutable(".", cwd_fd=repo_fd)
+    if ejecutable is None:
+        return {"ok": False, "fase": "seguridad",
+                "detalle": "no pude auditar la configuracion ejecutable de Git"}
+    if ejecutable:
+        return {"ok": False, "fase": "seguridad",
+                "detalle": "el repositorio declara filtros o drivers ejecutables"}
+    rama_r = git("symbolic-ref", "--quiet", "--short", "HEAD")
     if not rama_r or rama_r.returncode != 0 or not rama_r.stdout.strip():
         return {"ok": False, "fase": "git", "detalle": "HEAD esta separado de una rama"}
     rama = rama_r.stdout.strip()
-    remoto_r = _git(raiz, "remote", "get-url", "origin")
+    remoto_r = git("remote", "get-url", "origin")
     if not remoto_r or remoto_r.returncode != 0:
         return {"ok": False, "fase": "git", "detalle": "falta el remoto origin"}
     remoto = remoto_r.stdout.strip()
-    if re.match(r"^[a-z][a-z0-9+.-]*://[^/@\s]+@", remoto, re.I):
+    if not _remoto_git_permitido(remoto):
         return {"ok": False, "fase": "seguridad",
-                "detalle": "origin contiene credenciales; usa SSH o un credential helper"}
+                "detalle": "origin usa credenciales, helper o protocolo no permitido"}
+    remoto_push_r = git("remote", "get-url", "--push", "origin")
+    remoto_push = remoto_push_r.stdout.strip() if remoto_push_r else ""
+    if (not remoto_push_r or remoto_push_r.returncode != 0
+            or not _remoto_git_permitido(remoto_push)):
+        return {"ok": False, "fase": "seguridad",
+                "detalle": "pushurl de origin no es un remoto permitido"}
 
-    fetch = _git(raiz, "fetch", "--quiet", "origin", timeout=180)
-    if not fetch or fetch.returncode != 0:
-        return {"ok": False, "fase": "fetch", "detalle": "no pude actualizar origin"}
-    ref_remota = f"refs/remotes/origin/{rama}"
-    existe = _git(raiz, "show-ref", "--verify", "--quiet", ref_remota)
+    try:
+        # La comparacion debe describir exactamente el destino de push; un
+        # pushurl puede diferir deliberadamente del URL de fetch de origin.
+        refs_remotas = _refs_remotas_confiables(repo_fd, remoto_push)
+        testigo_historial = _testigo_historial_git(repo_fd)
+    except OSError:
+        return {"ok": False, "fase": "fetch",
+                "detalle": "no pude adquirir refs e historial confiables de origin"}
+    oids_remotos = tuple(dict.fromkeys(refs_remotas.values()))
+
+    if snapshot_esperado is not None:
+        snapshot = snapshot_esperado
+        if rama != snapshot["rama"]:
+            return {"ok": False, "fase": "seguridad",
+                    "detalle": "la rama cambio desde la verificacion"}
+        if snapshot["base_oid"] is None:
+            ref_local = git(
+                "show-ref", "--verify", "--quiet", f"refs/heads/{rama}"
+            )
+            if not ref_local or ref_local.returncode != 1:
+                return {"ok": False, "fase": "seguridad",
+                        "detalle": "la rama unborn cambio desde la verificacion"}
+        else:
+            head_r = git("rev-parse", "HEAD")
+            head_oid = (head_r.stdout.strip()
+                        if head_r and head_r.returncode == 0 else "")
+            if head_oid != snapshot["base_oid"]:
+                return {"ok": False, "fase": "seguridad",
+                        "detalle": "HEAD cambio desde la verificacion"}
+        tree_commit_r = git(
+            "rev-parse", f"{snapshot['commit_oid']}^{{tree}}"
+        )
+        if (not tree_commit_r or tree_commit_r.returncode != 0
+                or tree_commit_r.stdout.strip() != snapshot["tree_oid"]):
+            return {"ok": False, "fase": "seguridad",
+                    "detalle": "el commit probado no coincide con su tree"}
+        try:
+            tree_vivo = _tree_publicable_fd(repo_fd, snapshot["base_oid"])
+        except OSError:
+            return {"ok": False, "fase": "seguridad",
+                    "detalle": "no pude revalidar el contenido probado"}
+        if tree_vivo != snapshot["tree_oid"]:
+            return {"ok": False, "fase": "seguridad",
+                    "detalle": "el contenido cambio despues de las pruebas"}
+
+        # Poblar el índice desde el tree inmutable evita volver a ejecutar
+        # filtros clean/process aunque la configuración cambie en carrera.
+        add = git("read-tree", snapshot["tree_oid"], timeout=180)
+        if not add or add.returncode != 0:
+            return {"ok": False, "fase": "stage",
+                    "detalle": "no pude fijar el indice en el tree probado"}
+        tree_stage_r = git("write-tree")
+        tree_stage = (tree_stage_r.stdout.strip()
+                      if tree_stage_r and tree_stage_r.returncode == 0 else "")
+        if tree_stage != snapshot["tree_oid"]:
+            return {"ok": False, "fase": "seguridad",
+                    "detalle": "el contenido cambio durante la congelacion"}
+        if _config_git_ejecutable(".", cwd_fd=repo_fd) is not False:
+            return {"ok": False, "fase": "seguridad",
+                    "detalle": "la configuracion Git cambio durante la publicacion"}
+
+        oid_rama_remota = refs_remotas.get(rama)
+        existia_remota = oid_rama_remota is not None
+        if snapshot["base_oid"] is None and existia_remota:
+            return {"ok": False, "fase": "sincronizacion",
+                    "detalle": "origin ya contiene la rama unborn verificada"}
+        if existia_remota:
+            cuenta = git(
+                "rev-list", "--left-right", "--count",
+                f"{snapshot['base_oid']}...{oid_rama_remota}",
+            )
+            if not cuenta or cuenta.returncode != 0:
+                return {"ok": False, "fase": "git",
+                        "detalle": "no pude comparar la base verificada con origin"}
+            try:
+                _delante, detras = (int(x) for x in cuenta.stdout.split())
+            except (ValueError, TypeError):
+                return {"ok": False, "fase": "git",
+                        "detalle": "comparacion remota invalida"}
+            if detras:
+                return {"ok": False, "fase": "sincronizacion",
+                        "detalle": "origin tiene cambios nuevos; integra antes de publicar"}
+
+        try:
+            testigo_snapshot = _testigo_historial_git(repo_fd)
+        except OSError:
+            return {"ok": False, "fase": "seguridad",
+                    "detalle": "historial del snapshot no reproducible"}
+        finales_r = _rev_list_excluyendo_refs(
+            repo_fd, snapshot["commit_oid"], oids_remotos
+        )
+        if not finales_r or finales_r.returncode != 0:
+            return {"ok": False, "fase": "git",
+                    "detalle": "no pude enumerar los commits del snapshot"}
+        finales = [x for x in finales_r.stdout.splitlines() if x]
+        if (len(finales) > 10_000
+                or any(not _oid_git_valido(x) for x in finales)):
+            return {"ok": False, "fase": "seguridad",
+                    "detalle": "lista final de commits invalida o excesiva"}
+        por_escanear = list(dict.fromkeys(finales + [snapshot["commit_oid"]]))
+        if any(not _escanear_commit_fd(repo_fd, oid) for oid in por_escanear):
+            return {"ok": False, "fase": "seguridad",
+                    "detalle": "un commit verificable no supero el escaneo"}
+        try:
+            if _testigo_historial_git(repo_fd) != testigo_snapshot:
+                raise OSError("topologia Git inestable")
+        except OSError:
+            return {"ok": False, "fase": "seguridad",
+                    "detalle": "la topologia Git cambio durante el escaneo"}
+
+        oid_anterior = (snapshot["base_oid"] if snapshot["base_oid"] is not None
+                        else "0" * len(snapshot["commit_oid"]))
+        actualizado = git(
+            "update-ref", f"refs/heads/{rama}", snapshot["commit_oid"],
+            oid_anterior,
+        )
+        if not actualizado or actualizado.returncode != 0:
+            return {"ok": False, "fase": "seguridad",
+                    "detalle": "la rama cambio antes de fijar el commit probado"}
+        tracking_anterior = leer_tracking_local(snapshot["commit_oid"])
+        if tracking_anterior is None:
+            return {"ok": False, "fase": "tracking",
+                    "detalle": "no pude atestiguar el tracking local antes del push"}
+        push = push_oid_exacto(snapshot["commit_oid"], oid_rama_remota)
+        if not push or push.returncode != 0:
+            return {"ok": False, "fase": "push",
+                    "detalle": "el commit probado quedo local, pero git push fallo"}
+        fallo_tracking = registrar_tracking(
+            existia_remota, snapshot["commit_oid"], bool(snapshot.get("creado")),
+            tracking_anterior,
+        )
+        if fallo_tracking:
+            return fallo_tracking
+        return {"ok": True, "fase": "listo",
+                "detalle": "publicado exactamente el snapshot probado",
+                "commit": snapshot["commit_oid"][:12],
+                "creado": bool(snapshot.get("creado")), "raiz": raiz}
+
+    oid_rama_remota = refs_remotas.get(rama)
+    existia_remota = oid_rama_remota is not None
+    head_inicial_r = git("rev-parse", "HEAD")
+    head_inicial = (head_inicial_r.stdout.strip()
+                    if head_inicial_r and head_inicial_r.returncode == 0 else "")
+    unborn = not _oid_git_valido(head_inicial)
+    if unborn:
+        ref_local = git(
+            "show-ref", "--verify", "--quiet", f"refs/heads/{rama}"
+        )
+        if not ref_local or ref_local.returncode != 1:
+            return {"ok": False, "fase": "git",
+                    "detalle": "HEAD local invalido"}
+        if existia_remota:
+            return {"ok": False, "fase": "sincronizacion",
+                    "detalle": "origin ya contiene la rama unborn local"}
     commits_locales = []
-    if existe and existe.returncode == 0:
-        cuenta = _git(raiz, "rev-list", "--left-right", "--count",
-                      f"HEAD...origin/{rama}")
+    if existia_remota:
+        cuenta = git("rev-list", "--left-right", "--count",
+                     f"{head_inicial}...{oid_rama_remota}")
         if not cuenta or cuenta.returncode != 0:
             return {"ok": False, "fase": "git", "detalle": "no pude comparar con origin"}
         try:
@@ -2229,25 +4622,38 @@ def publicar_repo(carpeta, mensaje="chore: cambios verificados por Orquesta IA")
         if detras:
             return {"ok": False, "fase": "sincronizacion",
                     "detalle": "origin tiene cambios nuevos; integra antes de publicar"}
-        if delante:
-            lista = _git(raiz, "rev-list", f"origin/{rama}..HEAD")
-            if not lista or lista.returncode != 0:
-                return {"ok": False, "fase": "git", "detalle": "no pude auditar commits locales"}
-            commits_locales = [x for x in lista.stdout.splitlines() if x]
+        lista = git("rev-list", f"{oid_rama_remota}..HEAD") if delante else None
+    elif not unborn:
+        # Una rama sin upstream puede contener secretos en commits anteriores
+        # ya borrados del tip. Se enumeran siempre todos los objetos que ningún
+        # ref remoto conoce antes de permitir el primer push.
+        lista = _rev_list_excluyendo_refs(repo_fd, head_inicial, oids_remotos)
+    else:
+        lista = None
+    if lista is not None:
+        if not lista or lista.returncode != 0:
+            return {"ok": False, "fase": "git", "detalle": "no pude auditar commits locales"}
+        commits_locales = [x for x in lista.stdout.splitlines() if x]
+        if (len(commits_locales) > 10_000
+                or any(not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", x)
+                       for x in commits_locales)):
+            return {"ok": False, "fase": "seguridad",
+                    "detalle": "lista de commits locales invalida o excesiva"}
 
-    scanner = os.path.join(BASE, "tools", "scan-secretos.sh")
+    scanner = os.path.join(CODIGO_ORQUESTA, "tools", "scan-secretos.sh")
     if not os.path.isfile(scanner):
         return {"ok": False, "fase": "seguridad", "detalle": "falta el escaner de secretos"}
 
     def escanear(*opciones):
-        try:
-            return _SUBPROCESS_RUN_ORIGINAL(
-                ["bash", scanner, *opciones, "--repo", raiz],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                timeout=180, check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
+        argv = ["/usr/bin/bash", scanner, *opciones, "--repo", "."]
+        out, err, rc = _ejecutar_aislado_acotado(
+            argv, {"HOME": HOME_USUARIO, "PATH": "/usr/bin:/bin",
+                   "LC_ALL": "C.UTF-8"}, ".", 180,
+            limite_salida=2 * 1024 * 1024,
+            limite_error=2 * 1024 * 1024,
+            usar_scope=False, cwd_fd=repo_fd,
+        )
+        return subprocess.CompletedProcess(argv, rc, out, err)
 
     for commit in commits_locales:
         revisado = escanear("--commit", commit)
@@ -2258,8 +4664,14 @@ def publicar_repo(carpeta, mensaje="chore: cambios verificados por Orquesta IA")
     if not completo or completo.returncode != 0:
         return {"ok": False, "fase": "seguridad",
                 "detalle": "el arbol de trabajo no supero el escaneo de secretos"}
+    try:
+        if _testigo_historial_git(repo_fd) != testigo_historial:
+            raise OSError("topologia Git inestable")
+    except OSError:
+        return {"ok": False, "fase": "seguridad",
+                "detalle": "la topologia Git cambio durante la auditoria inicial"}
 
-    add = _git(raiz, "add", "-A")
+    add = git("add", "-A")
     if not add or add.returncode != 0:
         return {"ok": False, "fase": "stage", "detalle": "git add fallo"}
     staged = escanear("--staged")
@@ -2267,16 +4679,16 @@ def publicar_repo(carpeta, mensaje="chore: cambios verificados por Orquesta IA")
         return {"ok": False, "fase": "seguridad",
                 "detalle": "el indice no supero el escaneo de secretos"}
 
-    hay_stage = _git(raiz, "diff", "--cached", "--quiet")
+    hay_stage = git("diff", "--cached", "--quiet")
     creado = False
     if hay_stage is None:
         return {"ok": False, "fase": "git", "detalle": "no pude leer el indice"}
     if hay_stage.returncode == 1:
-        commit = _git(raiz, "commit", "-m", str(mensaje)[:200], timeout=180)
+        commit = git("commit", "-m", str(mensaje)[:200], timeout=180)
         if not commit or commit.returncode != 0:
             return {"ok": False, "fase": "commit", "detalle": "git commit fallo"}
         creado = True
-        ultimo = _git(raiz, "rev-parse", "HEAD")
+        ultimo = git("rev-parse", "HEAD")
         if not ultimo or ultimo.returncode != 0:
             return {"ok": False, "fase": "git", "detalle": "no pude verificar el commit"}
         revisado = escanear("--commit", ultimo.stdout.strip())
@@ -2286,18 +4698,68 @@ def publicar_repo(carpeta, mensaje="chore: cambios verificados por Orquesta IA")
     elif hay_stage.returncode != 0:
         return {"ok": False, "fase": "git", "detalle": "estado del indice invalido"}
 
-    push_args = ["push"]
-    if not existe or existe.returncode != 0:
-        push_args += ["--set-upstream", "origin", rama]
-    else:
-        push_args += ["origin", rama]
-    push = _git(raiz, *push_args, timeout=300)
+    # Congela el objeto exacto después de cualquier commit propio y vuelve a
+    # enumerar sus ancestros no presentes en remotos. La rama local es mutable;
+    # nunca se usa como fuente del push después de esta auditoría final.
+    final_r = git("rev-parse", "HEAD")
+    final_oid = final_r.stdout.strip() if final_r and final_r.returncode == 0 else ""
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", final_oid):
+        return {"ok": False, "fase": "git", "detalle": "HEAD final invalido"}
+    if existia_remota:
+        # HEAD pudo cambiar después de la comparación inicial. La evidencia
+        # final se ata otra vez al OID remoto inventariado, sin resolver refs
+        # mutables ni consultar commit-graph/replace/grafts locales.
+        ancestro = git(
+            "merge-base", "--is-ancestor", oid_rama_remota, final_oid
+        )
+        if not ancestro or ancestro.returncode != 0:
+            return {"ok": False, "fase": "sincronizacion",
+                    "detalle": "el OID final ya no desciende del tip remoto auditado"}
+    try:
+        testigo_final = _testigo_historial_git(repo_fd)
+    except OSError:
+        return {"ok": False, "fase": "seguridad",
+                "detalle": "historial final no reproducible"}
+    finales_r = _rev_list_excluyendo_refs(repo_fd, final_oid, oids_remotos)
+    if not finales_r or finales_r.returncode != 0:
+        return {"ok": False, "fase": "git",
+                "detalle": "no pude congelar los commits a publicar"}
+    finales = [x for x in finales_r.stdout.splitlines() if x]
+    if (len(finales) > 10_000
+            or any(not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", x)
+                   for x in finales)):
+        return {"ok": False, "fase": "seguridad",
+                "detalle": "cobertura final de commits invalida o excesiva"}
+    # Si una rama nueva nace de un tip ya alcanzable desde otro ref remoto,
+    # ``rev-list`` con OIDs remotos puede ser correctamente vacío. El tip se
+    # escanea de todas formas antes de crear el nuevo ref remoto.
+    for commit_oid in dict.fromkeys(finales + [final_oid]):
+        revisado = escanear("--commit", commit_oid)
+        if not revisado or revisado.returncode != 0:
+            return {"ok": False, "fase": "seguridad",
+                    "detalle": "un commit final no supero el escaneo"}
+    try:
+        if _testigo_historial_git(repo_fd) != testigo_final:
+            raise OSError("topologia Git inestable")
+    except OSError:
+        return {"ok": False, "fase": "seguridad",
+                "detalle": "la topologia Git cambio durante el escaneo final"}
+
+    tracking_anterior = leer_tracking_local(final_oid)
+    if tracking_anterior is None:
+        return {"ok": False, "fase": "tracking",
+                "detalle": "no pude atestiguar el tracking local antes del push"}
+    push = push_oid_exacto(final_oid, oid_rama_remota)
     if not push or push.returncode != 0:
         return {"ok": False, "fase": "push",
                 "detalle": "el commit es local y seguro, pero git push fallo"}
-    head = _git(raiz, "rev-parse", "--short", "HEAD")
+    fallo_tracking = registrar_tracking(
+        existia_remota, final_oid, creado, tracking_anterior
+    )
+    if fallo_tracking:
+        return fallo_tracking
     return {"ok": True, "fase": "listo", "detalle": "publicado sin secretos",
-            "commit": head.stdout.strip() if head and head.returncode == 0 else "",
+            "commit": final_oid[:12],
             "creado": creado, "raiz": raiz}
 
 # ---------------- USO REAL (todas las sesiones, no solo las de Orquesta) ----------------
@@ -2305,19 +4767,119 @@ def publicar_repo(carpeta, mensaje="chore: cambios verificados por Orquesta IA")
 # manuales (claude, codex --yolo, agy) consumen de la MISMA cuota. Aqui se
 # leen los registros que cada CLI deja en disco para ver el consumo real.
 CACHE_REAL = os.path.join(BASE, "state", "uso_real.json")
-USO_CACHE_VERSION = 2
+USO_CACHE_VERSION = 3
 
 
 def _dirs_sesiones(pid, p):
     prov = p.get("provider")
-    h = home_de(pid, p)
     if prov == "claude":
-        return [os.path.join(h, "projects")]
+        ruta = ruta_cuenta(pid, p, predeterminado="projects")
+        return [ruta] if ruta else []
     if prov == "gpt":
-        return [os.path.join(h, "sessions")]
+        ruta = ruta_cuenta(pid, p, predeterminado="sessions")
+        return [ruta] if ruta else []
     if prov == "antigravity":
-        return [os.path.join(h, "conversations")]
+        ruta = ruta_cuenta(pid, p, predeterminado="conversations")
+        return [ruta] if ruta else []
     return []
+
+
+def _archivos_regulares(raiz, acepta, limite=10_000, profundidad_maxima=16,
+                        con_identidad=False):
+    """Enumera con capacidades ``dir_fd`` y límites contra árboles hostiles."""
+    try:
+        limite = max(0, int(limite))
+        profundidad_maxima = max(0, int(profundidad_maxima))
+    except (TypeError, ValueError):
+        return []
+    if not limite:
+        return []
+    base = os.path.abspath(_expandir_usuario(raiz))
+    archivos = []
+    directorios_vistos = set()
+    archivos_vistos = set()
+    presupuesto = [limite]
+
+    flags_dir = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags_dir |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags_dir |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags_dir |= os.O_NOFOLLOW
+    flags_archivo = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags_archivo |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags_archivo |= os.O_NOFOLLOW
+
+    def visitar(dir_fd, ruta_visible, profundidad):
+        if presupuesto[0] <= 0 or len(archivos) >= limite:
+            return
+        try:
+            estado_dir = os.fstat(dir_fd)
+            identidad_dir = (estado_dir.st_dev, estado_dir.st_ino)
+            if not stat.S_ISDIR(estado_dir.st_mode) or identidad_dir in directorios_vistos:
+                return
+            directorios_vistos.add(identidad_dir)
+            with os.scandir(dir_fd) as entradas:
+                for entrada in entradas:
+                    if presupuesto[0] <= 0 or len(archivos) >= limite:
+                        return
+                    presupuesto[0] -= 1
+                    try:
+                        estado = entrada.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISLNK(estado.st_mode):
+                        continue
+                    ruta_hija = os.path.join(ruta_visible, entrada.name)
+                    if stat.S_ISDIR(estado.st_mode):
+                        if profundidad >= profundidad_maxima:
+                            continue
+                        try:
+                            hijo_fd = os.open(entrada.name, flags_dir, dir_fd=dir_fd)
+                        except OSError:
+                            continue
+                        try:
+                            comprobado = os.fstat(hijo_fd)
+                            if ((comprobado.st_dev, comprobado.st_ino)
+                                    != (estado.st_dev, estado.st_ino)):
+                                continue
+                            visitar(hijo_fd, ruta_hija, profundidad + 1)
+                        finally:
+                            os.close(hijo_fd)
+                        continue
+                    if not stat.S_ISREG(estado.st_mode) or not acepta(entrada.name):
+                        continue
+                    try:
+                        archivo_fd = os.open(entrada.name, flags_archivo, dir_fd=dir_fd)
+                    except OSError:
+                        continue
+                    try:
+                        comprobado = os.fstat(archivo_fd)
+                        identidad = (comprobado.st_dev, comprobado.st_ino)
+                        if (not stat.S_ISREG(comprobado.st_mode)
+                                or identidad != (estado.st_dev, estado.st_ino)
+                                or identidad in archivos_vistos
+                                or comprobado.st_uid != os.getuid()
+                                or comprobado.st_nlink != 1):
+                            continue
+                        archivos_vistos.add(identidad)
+                        firma = _identidad_estado(comprobado)
+                        archivos.append((firma if con_identidad else comprobado.st_mtime,
+                                         ruta_hija))
+                    finally:
+                        os.close(archivo_fd)
+        except OSError:
+            return
+
+    try:
+        with _abrir_directorio_seguro(base) as base_fd:
+            visitar(base_fd, base, 0)
+    except OSError:
+        return []
+    return archivos
 
 
 def _claves_tiempo_local(ts):
@@ -2333,12 +4895,13 @@ def _claves_tiempo_local(ts):
         return str(ts)[:10], str(ts)[:13]
 
 
-def _uso_archivo_claude(f):
+def _uso_archivo_claude(f, identidad=None):
     """Suma el uso de una sesion de Claude Code. Devuelve (por_dia, por_hora)."""
     dias, horas = {}, {}
     try:
-        with open(f, errors="ignore") as fh:
-            for linea in fh:
+        with _abrir_regular_identidad(
+                f, identidad, errors="ignore") as fh:
+            for linea in _lineas_acotadas(fh, bytes_totales=64 * 1024 * 1024):
                 if '"usage"' not in linea:
                     continue
                 try:
@@ -2359,19 +4922,20 @@ def _uso_archivo_claude(f):
                     a = dic.setdefault(k, {"entrada": 0, "salida": 0, "cache": 0, "msgs": 0})
                     a["entrada"] += ent; a["salida"] += sal
                     a["cache"] += cache; a["msgs"] += 1
-    except OSError:
+    except (OSError, UnicodeError):
         pass
     return dias, horas
 
 
-def _uso_archivo_codex(f):
+def _uso_archivo_codex(f, identidad=None):
     dias, horas = {}, {}
     ult = 0
     ts_ult = ""
     uso_ult = {}
     try:
-        with open(f, errors="ignore") as fh:
-            for linea in fh:
+        with _abrir_regular_identidad(
+                f, identidad, errors="ignore") as fh:
+            for linea in _lineas_acotadas(fh, bytes_totales=64 * 1024 * 1024):
                 if "token_usage" not in linea and "total_token" not in linea:
                     continue
                 try:
@@ -2389,7 +4953,7 @@ def _uso_archivo_codex(f):
                     ult = tot
                     uso_ult = u
                     ts_ult = d.get("timestamp") or pl.get("timestamp") or ts_ult
-    except OSError:
+    except (OSError, UnicodeError):
         pass
     if ult and ts_ult:
         dia, hora = _claves_tiempo_local(ts_ult)
@@ -2411,16 +4975,9 @@ def uso_real(pid, p, refrescar=False):
     entrada = cache.get(pid, {})
     archivos = {}
     for d in _dirs_sesiones(pid, p):
-        if not os.path.isdir(d):
-            continue
-        for raiz, _, files in os.walk(d):
-            for f in files:
-                if f.endswith(".jsonl"):
-                    ruta = os.path.join(raiz, f)
-                    try:
-                        archivos[ruta] = os.path.getmtime(ruta)
-                    except OSError:
-                        pass
+        for firma, ruta in _archivos_regulares(
+                d, lambda nombre: nombre.endswith(".jsonl"), con_identidad=True):
+            archivos[ruta] = firma
     if (not refrescar and entrada.get("version") == USO_CACHE_VERSION
             and entrada.get("archivos") == archivos):
         return {"dias": entrada.get("dias", {}), "horas": entrada.get("horas", {}),
@@ -2429,9 +4986,9 @@ def uso_real(pid, p, refrescar=False):
     # Si un JSONL crece se relee el conjunto completo. Sumar el archivo nuevo
     # sobre su agregado anterior duplicaba todos los eventos ya contabilizados.
     dias, horas = {}, {}
-    for ruta, m in archivos.items():
-        d1, h1 = (_uso_archivo_claude(ruta) if prov == "claude"
-                  else _uso_archivo_codex(ruta) if prov == "gpt" else ({}, {}))
+    for ruta, firma in archivos.items():
+        d1, h1 = (_uso_archivo_claude(ruta, firma) if prov == "claude"
+                  else _uso_archivo_codex(ruta, firma) if prov == "gpt" else ({}, {}))
         for src, dst in ((d1, dias), (h1, horas)):
             for k, v in src.items():
                 a = dst.setdefault(k, {"entrada": 0, "salida": 0, "cache": 0, "msgs": 0})
@@ -2473,24 +5030,20 @@ TIER_CLAUDE = {"default_claude_max_20x": ("Max 20x", 20),
 
 def cuota_codex(pid, p):
     """Lee el ultimo rate_limits que dejo codex: es cuota REAL del proveedor."""
-    d = os.path.join(home_de(pid, p), "sessions")
-    if not os.path.isdir(d):
+    d = ruta_cuenta(pid, p, predeterminado="sessions")
+    if not d:
         return None
-    archivos = []
-    for raiz, _, fs in os.walk(d):
-        for f in fs:
-            if f.startswith("rollout-") and f.endswith(".jsonl"):
-                ruta = os.path.join(raiz, f)
-                try:
-                    archivos.append((os.path.getmtime(ruta), ruta))
-                except OSError:
-                    pass
+    archivos = _archivos_regulares(
+        d, lambda nombre: nombre.startswith("rollout-") and nombre.endswith(".jsonl"),
+        con_identidad=True,
+    )
     archivos.sort(reverse=True)
-    for _, ruta in archivos[:6]:
+    for firma, ruta in archivos[:6]:
         ult = None
         try:
-            with open(ruta, errors="ignore") as fh:
-                for linea in fh:
+            with _abrir_regular_identidad(
+                    ruta, firma, errors="ignore") as fh:
+                for linea in _lineas_acotadas(fh, bytes_totales=64 * 1024 * 1024):
                     if "rate_limits" not in linea:
                         continue
                     try:
@@ -2500,7 +5053,7 @@ def cuota_codex(pid, p):
                     rl = (d2.get("payload") or {}).get("rate_limits")
                     if rl:
                         ult = (d2.get("timestamp"), rl)
-        except OSError:
+        except (OSError, UnicodeError):
             continue
         if ult:
             ts, rl = ult
@@ -2517,14 +5070,18 @@ def cuota_codex(pid, p):
 
 def plan_claude(pid, p):
     """Nivel real del plan segun el token guardado por el CLI."""
-    for ruta in (os.path.join(home_de(pid, p), ".claude.json"),
-                 os.path.expanduser("~/.claude.json") if home_de(pid, p).endswith(".claude") else None):
-        if not ruta or not os.path.exists(ruta):
+    home = home_de(pid, p)
+    rutas = [ruta_cuenta(pid, p, predeterminado=".claude.json")]
+    home_claude = os.path.realpath(os.path.join(HOME_USUARIO, ".claude"))
+    if home == home_claude:
+        rutas.append(_ruta_sin_enlaces(
+            HOME_USUARIO, os.path.join(HOME_USUARIO, ".claude.json")
+        ))
+    for ruta in rutas:
+        if not ruta or not os.path.isfile(ruta) or os.path.islink(ruta):
             continue
-        try:
-            with open(ruta) as archivo:
-                d = json.load(archivo)
-        except Exception:
+        d = _leer(ruta, None)
+        if not isinstance(d, dict):
             continue
         oa = d.get("oauthAccount") or {}
         t = oa.get("organizationRateLimitTier") or oa.get("userRateLimitTier")
@@ -2533,8 +5090,10 @@ def plan_claude(pid, p):
             return {"tier": t, "nombre": nom, "multiplicador": mult,
                     "correo": oa.get("emailAddress")}
     try:
-        with open(os.path.join(home_de(pid, p), ".credentials.json")) as archivo:
-            cr = json.load(archivo)
+        credencial = ruta_cuenta(pid, p, predeterminado=".credentials.json")
+        if not credencial or not os.path.isfile(credencial) or os.path.islink(credencial):
+            return None
+        cr = _leer(credencial, {})
         t = (cr.get("claudeAiOauth") or {}).get("rateLimitTier")
         if t:
             nom, mult = TIER_CLAUDE.get(t, (t, 1))
@@ -2620,7 +5179,7 @@ def escanear_equipo():
             herr[h] = r
     d["herramientas"] = herr
     # carpetas del usuario
-    home = os.path.expanduser("~")
+    home = HOME_USUARIO
     d["carpetas"] = [x for x in sorted(os.listdir(home))
                      if not x.startswith(".") and os.path.isdir(os.path.join(home, x))]
     proyectos = os.path.join(home, "Documentos")

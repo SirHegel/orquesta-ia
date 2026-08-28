@@ -28,7 +28,9 @@ También lleva la contabilidad de tokens y permite auditorías cruzadas.
   escriben son exclusivas; las investigaciones de solo lectura sí pueden ir en paralelo.
 - **Cierre verificable.** La IA propone tests, pero Orquesta ejecuta por sí misma solo
   comandos permitidos, ignora el `rc` declarado por el modelo y repite
-  verificación/reparación antes de decir `LISTO`.
+  verificación/reparación antes de decir `LISTO`. Con publicación activa, las pruebas
+  corren en checkouts detached frescos del mismo commit inmutable que se publicará;
+  sin publicación sigue siendo una verificación controlada del workspace vivo.
 - **Publicación segura.** `orq publicar` escanea árbol, índice y commits locales,
   bloquea credenciales, hace commit y push sin force. Los procesos IA heredan además
   un pre-push preventivo para no saltarse accidentalmente ese gate.
@@ -42,7 +44,7 @@ También lleva la contabilidad de tokens y permite auditorías cruzadas.
 ```sh
 git clone <este-repo> "$HOME/.local/share/orquesta"
 cd "$HOME/.local/share/orquesta"
-cp profiles.example.json profiles.json      # edítalo con tus cuentas
+install -m 600 profiles.example.json profiles.json  # edítalo con tus cuentas
 mkdir -p "$HOME/.local/bin"
 ln -sf "$PWD/orq" ~/.local/bin/orq
 ln -sf "$PWD/tools/minimax" ~/.local/bin/minimax
@@ -69,7 +71,12 @@ cambiar de copia, carga el `shell.sh` de esa copia. La configuración
 después de validarla. Al cargar otra copia se limpian además las cuentas, el
 override manual, la caché y la política procedentes de la instalación anterior.
 
-Requiere Python 3.9+ y los CLIs que vayas a usar (`claude`, `codex`, `agy`).
+La implementación soportada requiere Linux con procfs montado (`/proc` y
+`/proc/self/fd`), Bash y las utilidades GNU instaladas en las rutas de sistema que usa
+el código (`/usr/bin`, `/bin`), además de Python 3.9+, Git y los CLIs que vayas a usar
+(`claude`, `codex`, `agy`). El supervisor, el scanner y las operaciones por descriptor
+fallan cerrados si falta ese toolchain; no se resuelven sustitutos desde un `PATH`
+heredado.
 La ruta del clon y el emulador de terminal no importan: Kitty, GNOME Terminal,
 Konsole, WezTerm, Alacritty o una consola SSH pueden ejecutar el mismo comando:
 
@@ -88,20 +95,31 @@ printf '\n[ -f %q ] && . %q\n' "$PWD/shell.sh" "$PWD/shell.sh" >> "$HOME/.bashrc
 
 ### Autoarranque y permisos: decisiones locales
 
-El autoarranque es **opt-in** y se configura fuera de Git. Crea
-`~/.config/orquesta/shell.local.sh` solo en la máquina donde lo quieras:
+El autoarranque es **opt-in** y se configura fuera de Git. Crea el archivo bajo
+`XDG_CONFIG_HOME` (o `~/.config` si no está definido) solo en la máquina donde lo
+quieras:
 
 ```sh
-mkdir -p "$HOME/.config/orquesta"
-cat > "$HOME/.config/orquesta/shell.local.sh" <<'EOF'
+orq_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/orquesta"
+mkdir -p "$orq_config_dir"
+cat > "$orq_config_dir/shell.local.sh" <<'EOF'
 # Una lista limita el autoarranque a esos emuladores; 1 significa cualquiera.
 ORQ_AUTO_CHAT=kitty             # ejemplos: kitty,wezterm  o  1
 
 # Opcional y sensible: hace que los CLIs de proveedores omitan sus confirmaciones.
 ORQ_PERMISOS_TOTALES=1
 EOF
-chmod 600 "$HOME/.config/orquesta/shell.local.sh"
+chmod 600 "$orq_config_dir/shell.local.sh"
+unset orq_config_dir
 ```
+
+La ubicación real es
+`${XDG_CONFIG_HOME:-$HOME/.config}/orquesta/shell.local.sh`. Ese archivo es un
+**trust anchor** explícito: al aceptarlo, Bash ejecutará su contenido con los permisos
+del usuario. Por eso Orquesta solo lo carga si toda la ruta está libre de symlinks y el
+archivo es regular, pertenece al UID actual, tiene un único enlace, no permite escritura
+de grupo ni de otros y ocupa como máximo 64 KiB. Symlinks, hardlinks, FIFO y archivos
+demasiado grandes se rechazan sin evaluar su contenido.
 
 Sin ese archivo, `ORQ_AUTO_CHAT=0` y `ORQ_PERMISOS_TOTALES=0`: un clon no abre
 ninguna IA ni agrega flags de omisión a `claude`, `codex`, `agy` o `gemini`.
@@ -162,8 +180,32 @@ orq cuenta add claude-trabajo --provider claude --plan max --proposito trabajo
 ```
 
 El login **nunca** es automático y el proyecto **nunca** pide, guarda ni transmite
-contraseñas. Cada proveedor guarda su propio token en `accounts/<id>/`, que está
-excluido de git.
+contraseñas. Un home de cuenta solo puede ser una de estas rutas exactas, sin symlinks
+en sus componentes:
+
+- un home administrado: `BASE/accounts/<id>` (`BASE` es la raíz canónica de la
+  instalación) o
+  `~/.local/share/orquesta/accounts/<id>`;
+- el home oficial del proveedor correspondiente: `~/.claude` para Claude,
+  `~/.codex` para GPT/Codex, `~/.gemini` para Gemini o
+  `~/.gemini/antigravity-cli` para Antigravity.
+
+MiniMax solo admite uno de los homes administrados. No basta con que una ruta arbitraria
+esté dentro de la instalación o del directorio personal. Cuando una cuenta usa API key,
+la única ubicación admitida es `<home>/api_key`; se crea y se exige con modo privado
+`0600`, y nunca se reutiliza otro archivo de credenciales del proveedor.
+
+`orq cuenta rm <id> --purge` vacía de forma segura el home administrado directo
+`BASE/accounts/<id>`. Para evitar carreras entre validar un inode y borrar otro nombre,
+trunca por descriptor los archivos regulares y conserva sus entradas y directorios ya
+vacíos. Symlinks, FIFO y otros tipos especiales se preservan y hacen fallar cerrado la
+purga. El botón de login del panel abre el CLI mediante `orqlogin.py` y
+argumentos fijos, sin construir un script `bash -lc`.
+
+En el chat, `/shell` es deliberadamente una consola de diagnóstico de solo lectura.
+Admite únicamente `pwd`, `ls`, `git status`, `git diff --stat` y `git log`. El texto
+libre nunca se interpreta como comando; para cualquier otra operación usa una terminal
+separada.
 
 ### Proyectos y GitHub
 
@@ -179,12 +221,37 @@ privado y excluido de Git):
 Un clon nuevo conserva esta política desactivada: no debe escribir en un remoto sin
 que su dueño lo decida. El gate falla cerrado si no puede leer un blob, si `origin`
 contiene una credencial, si la rama remota va por delante o si cualquier escaneo
-detecta una ruta/valor sensible. Nunca hace force-push.
+detecta una ruta/valor sensible. Nunca fuerza una rama sin un lease exacto del OID
+remoto previamente inventariado.
+
+Para `orq proyecto --publicar`, Orquesta construye un tree con bytes crudos
+(`--no-filters`), crea con `commit-tree` el OID candidato sin mover refs ni el índice y
+lo escanea. La revisión IA y cada comando objetivo reciben un checkout detached fresco
+de ese OID. Al publicar vuelve a construir el tree vivo, exige igualdad exacta, fija la
+rama con compare-and-swap y empuja `OID:refs/heads/rama`; no reconstruye el commit desde
+un worktree que pudo cambiar después de las pruebas. Archivos ignorados no forman parte
+del snapshot; symlinks, submódulos y flags `skip-worktree`/`assume-unchanged` se rechazan
+porque pueden depender de bytes no representados. El commit candidato usa la identidad
+técnica `Orquesta IA <orquesta@localhost>` y no lleva firma criptográfica: un ruleset
+que exija commits firmados rechazará el push y conservará el commit solo localmente.
+Las refs del destino se obtienen desde el `pushurl` literal en un namespace efímero,
+se contrastan con `ls-remote` y se retiran antes del push; refs `origin/*` o refspecs
+locales no sirven como evidencia. El push usa lease sobre el OID remoto observado y
+configura upstream tras crear una rama. Repositorios sin primer commit generan un
+commit raíz verificable. Replace refs, grafts y límites shallow no pueden alterar el
+recorrido auditado y los dos últimos se rechazan.
+Como un linked worktree delega su metadata mediante un archivo `.git` fuera de la
+capacidad adquirida, hoy se rechaza explícitamente: ejecute la publicación verificable
+desde el checkout principal. El fetch de inventario no modifica `FETCH_HEAD` y, tras
+un push exitoso, el ref local `origin/rama` se actualiza mediante compare-and-swap.
 
 ### Cuentas por API key (MiniMax)
 
 MiniMax habla el protocolo de Anthropic, así que reusamos el binario `claude`
-apuntándolo a su endpoint. No hay OAuth: se paga con una API key.
+apuntándolo a su endpoint. No hay OAuth: se paga con una API key. Para impedir que la
+key se envíe a un host configurado por datos no confiables, la allowlist acepta
+exclusivamente los endpoints oficiales `https://api.minimax.io/anthropic` y
+`https://api.minimaxi.com/anthropic`.
 
 ```sh
 orq cuenta add minimax --provider minimax --plan api --ventana 1
@@ -213,12 +280,15 @@ Para dejarlo permanente hay un servicio de usuario en
 orq                  CLI
 orqlib.py            núcleo compartido (estado con bloqueo fcntl)
 orqroot.py           contrato y validación compartidos de ORQ_HOME
+orqlogin.py          login gráfico con argv fijo y validación fail-closed
+orqrun.py            supervisor aislado de procesos con modos y argv validados
 orqchat.py           conversación natural (Kitty mejora la presentación gráfica)
 orqweb.py            panel web (API + jobs asíncronos)
 orquesta-app.py      envoltorio GTK4/WebKit del panel
 web/index.html       interfaz
 shell.sh             integración Bash opcional; autoarranque local opt-in
 tests/               regresiones de routing, Kitti, cuotas, uso y seguridad web
+.github/workflows/tests.yml  CI de compilación, sintaxis y suite completa
 tools/scan-secretos.sh   escáner de árbol, índice y commits
 tools/git-hooks/pre-push gate heredado por procesos IA
 profiles.json        tu configuración real        ← NO versionado
@@ -236,10 +306,14 @@ timeout que pudo haber modificado archivos.
 ## Pruebas
 
 ```sh
-python3 -m unittest discover -v
+python3 -m unittest discover -s tests -v
 bash -n shell.sh tools/scan-secretos.sh
 tools/scan-secretos.sh
 ```
+
+El workflow `tests` compila entrypoints, valida Bash, ejecuta
+`tools/scan-secretos.sh --todo` y corre la suite completa en cada `push` a `main` y PR con
+permisos `contents: read`; las acciones externas están fijadas por SHA.
 
 Ver [SECURITY.md](SECURITY.md).
 

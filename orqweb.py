@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """Panel de control local del orquestador multi-cuenta. Solo 127.0.0.1."""
-import json, os, sys, uuid, threading, webbrowser, traceback
+import copy, json, os, sys, uuid, threading, time, webbrowser, traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +13,12 @@ HTML_PATH = os.path.join(L.BASE, "web", "index.html")
 HOSTS_VALIDOS = {f"127.0.0.1:{PUERTO}", f"localhost:{PUERTO}"}
 ORIGENES_VALIDOS = {f"http://127.0.0.1:{PUERTO}", f"http://localhost:{PUERTO}"}
 MAX_BODY = 2 * 1024 * 1024
+MAX_JOBS = 128
+MAX_ACTIVE_JOBS = 4
+MAX_JOB_WORKERS = 4
+MAX_JOB_ACCOUNTS = 32
+JOB_TTL_SECONDS = 3600
+MAX_JOB_RESULT_CHARS = 128 * 1024
 
 
 # ---------------- estado ----------------
@@ -59,9 +65,101 @@ def estado(tarea="code"):
 
 
 # ---------------- trabajos asincronos ----------------
+def _job_valor(valor, profundidad=0, presupuesto=None):
+    """Acota los resultados retenidos por el panel sin alterar métricas."""
+    if presupuesto is None:
+        presupuesto = [MAX_JOB_RESULT_CHARS]
+    if presupuesto[0] <= 0:
+        return "[resultado omitido por limite]"
+    if profundidad >= 5:
+        return "[resultado anidado omitido]"
+    if isinstance(valor, str):
+        limite = min(len(valor), presupuesto[0], 128 * 1024)
+        presupuesto[0] -= limite
+        return valor[:limite]
+    if isinstance(valor, list):
+        return [
+            _job_valor(x, profundidad + 1, presupuesto) for x in valor[:64]
+        ]
+    if isinstance(valor, dict):
+        acotado = {}
+        for k, v in list(valor.items())[:128]:
+            clave = str(k)[:128]
+            presupuesto[0] = max(0, presupuesto[0] - len(clave))
+            acotado[clave] = _job_valor(v, profundidad + 1, presupuesto)
+        return acotado
+    if valor is None or isinstance(valor, (bool, int, float)):
+        return valor
+    texto = str(valor)
+    limite = min(len(texto), presupuesto[0], 4096)
+    presupuesto[0] -= limite
+    return texto[:limite]
+
+
+def _correr_acotado(*args):
+    """Descarta la salida cruda dentro del worker antes de entregarla al pool."""
+    resultado = L.correr(*args)
+    tokens = resultado.get("tokens", 0) if isinstance(resultado, dict) else 0
+    try:
+        tokens = max(0, int(tokens))
+    except (TypeError, ValueError):
+        tokens = 0
+    return _job_valor(resultado), tokens
+
+
+def _purgar_jobs_bloqueado(ahora=None):
+    ahora = time.monotonic() if ahora is None else ahora
+    terminados = {"listo", "error"}
+    for jid, job in list(JOBS.items()):
+        if (job.get("estado") in terminados
+                and ahora - float(job.get("_actualizado", ahora)) > JOB_TTL_SECONDS):
+            JOBS.pop(jid, None)
+    if len(JOBS) < MAX_JOBS:
+        return
+    candidatos = sorted(
+        ((float(job.get("_actualizado", 0)), jid)
+         for jid, job in JOBS.items() if job.get("estado") in terminados),
+    )
+    for _marca, jid in candidatos:
+        if len(JOBS) < MAX_JOBS:
+            break
+        JOBS.pop(jid, None)
+
+
+def _reservar_job(jid, **kw):
+    with JLOCK:
+        ahora = time.monotonic()
+        _purgar_jobs_bloqueado(ahora)
+        activos = sum(
+            job.get("estado") in {"encolado", "corriendo"}
+            for job in JOBS.values()
+        )
+        if activos >= MAX_ACTIVE_JOBS or len(JOBS) >= MAX_JOBS:
+            return False
+        JOBS[jid] = {
+            **{k: _job_valor(v) for k, v in kw.items()},
+            "_creado": ahora, "_actualizado": ahora,
+        }
+        return True
+
+
 def _job_set(jid, **kw):
     with JLOCK:
-        JOBS.setdefault(jid, {}).update(kw)
+        job = JOBS.get(jid)
+        if job is None:
+            return
+        job.update({k: _job_valor(v) for k, v in kw.items()})
+        job["_actualizado"] = time.monotonic()
+
+
+def _iniciar_hilo_job(jid, target, args=()):
+    try:
+        hilo = threading.Thread(target=target, daemon=True, args=args)
+        hilo.start()
+    except Exception:
+        _job_set(jid, estado="error", error="no se pudo iniciar el trabajo")
+        return False
+    return True
 
 
 def ejecutar_job(jid, prompt, tarea, modo, perfil, timeout):
@@ -90,14 +188,22 @@ def ejecutar_job(jid, prompt, tarea, modo, perfil, timeout):
                     return _job_set(
                         jid, estado="error",
                         error="se necesita otra cuenta compatible con review")
+        if len(objetivo) > MAX_JOB_ACCOUNTS:
+            return _job_set(jid, estado="error",
+                            error="demasiadas cuentas para un solo trabajo")
         _job_set(jid, estado="corriendo", fase="respuestas", cuentas=list(objetivo))
-        with ThreadPoolExecutor(max_workers=len(objetivo)) as ex:
-            res = list(ex.map(lambda kv: L.correr(kv[0], kv[1], prompt, tarea, timeout),
-                              objetivo.items()))
+        with ThreadPoolExecutor(max_workers=min(MAX_JOB_WORKERS, len(objetivo))) as ex:
+            pares = list(ex.map(
+                lambda kv: _correr_acotado(
+                    kv[0], kv[1], prompt, tarea, timeout
+                ), objetivo.items()
+            ))
+        res = [valor for valor, _tokens in pares]
+        total_respuestas = sum(tokens for _valor, tokens in pares)
         _job_set(jid, respuestas=res)
         if modo != "audit":
             return _job_set(jid, estado="listo", auditorias=[],
-                            total=sum(r["tokens"] for r in res))
+                            total=total_respuestas)
         _job_set(jid, fase="auditoria")
         trab = []
         for rid, rp in revisores.items():
@@ -109,10 +215,21 @@ def ejecutar_job(jid, prompt, tarea, modo, perfil, timeout):
                   "Para CADA respuesta ajena indica: (1) errores factuales concretos, "
                   "(2) omisiones importantes, (3) nota de 0 a 10. Breve y directo.")
             trab.append((rid, rp, pa))
-        with ThreadPoolExecutor(max_workers=max(1, len(trab))) as ex:
-            auds = list(ex.map(lambda t: L.correr(t[0], t[1], t[2], "review", timeout), trab))
+        if len(trab) > MAX_JOB_ACCOUNTS:
+            return _job_set(jid, estado="error",
+                            error="demasiadas auditorias para un solo trabajo")
+        with ThreadPoolExecutor(max_workers=min(MAX_JOB_WORKERS,
+                                                max(1, len(trab)))) as ex:
+            pares_auditoria = list(ex.map(
+                lambda t: _correr_acotado(
+                    t[0], t[1], t[2], "review", timeout
+                ), trab
+            ))
+        auds = [valor for valor, _tokens in pares_auditoria]
         _job_set(jid, estado="listo", auditorias=auds,
-                 total=sum(r["tokens"] for r in res + auds))
+                 total=total_respuestas + sum(
+                     tokens for _valor, tokens in pares_auditoria
+                 ))
     except Exception as e:
         _job_set(jid, estado="error", error=f"{e}\n{traceback.format_exc()[-500:]}")
 
@@ -151,11 +268,16 @@ class H(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path == "/api/state":
             t = (parse_qs(u.query).get("tarea") or ["code"])[0]
-            return self._j(200, estado(t if t in L.TAREAS else "code"))
+            try:
+                datos = estado(t if t in L.TAREAS else "code")
+            except L.ErrorConfiguracion as exc:
+                return self._j(500, {"error": str(exc)})
+            return self._j(200, datos)
         if u.path.startswith("/api/job/"):
             jid = u.path.rsplit("/", 1)[-1]
             with JLOCK:
-                j = JOBS.get(jid)
+                _purgar_jobs_bloqueado()
+                j = copy.deepcopy(JOBS.get(jid))
             return self._j(200, j) if j else self._j(404, {"error": "job desconocido"})
         if u.path in ("/", "/index.html"):
             try:
@@ -184,6 +306,8 @@ class H(BaseHTTPRequestHandler):
             return self._j(400, {"error": "json invalido"})
         try:
             return self._ruta(d)
+        except L.ErrorConfiguracion as e:
+            return self._j(500, {"error": str(e)})
         except Exception as e:
             return self._j(500, {"error": str(e)})
 
@@ -214,8 +338,9 @@ class H(BaseHTTPRequestHandler):
                 if (prov == "antigravity" and any(
                         x.get("provider") == "antigravity" for x in ps.values())):
                     return self._j(400, {"error": "Antigravity ya tiene un perfil global"})
-                home = os.path.join(L.ACCOUNTS, pid_ruta)
-                os.makedirs(home, exist_ok=True); os.chmod(home, 0o700)
+                home = L.home_de(pid_ruta, {})
+                with L._abrir_directorio_seguro(home, crear=True) as home_fd:
+                    os.fchmod(home_fd, 0o700)
                 ps[pid] = {"label": d.get("label") or f"{prov} · {pid}", "provider": prov,
                            "home": home, "plan": d.get("plan", "pro"),
                            "ventana_horas": float(d.get("ventana") or 5),
@@ -226,7 +351,7 @@ class H(BaseHTTPRequestHandler):
                            "weights": {t: 7 for t in L.TAREAS}}
                 if prov == "minimax":
                     ps[pid]["auth"] = "apikey"
-                    ps[pid]["api_key_file"] = os.path.join(home, "api_key")
+                    ps[pid]["api_key_file"] = "api_key"
                     ps[pid]["base_url"] = L.MINIMAX_BASE_URL
                 if prov == "antigravity":
                     ps[pid]["allowed_tasks"] = ["imagen"]
@@ -265,6 +390,7 @@ class H(BaseHTTPRequestHandler):
                             except (TypeError, ValueError):
                                 pass
                 L.guardar_cfg(cf)
+            L.escribir_entorno()
             return self._j(200, {"ok": True})
 
         if p == "/api/delete":
@@ -273,11 +399,20 @@ class H(BaseHTTPRequestHandler):
                 return self._j(400, {"error": "id invalido"})
             with L.bloqueo():
                 cf = L.cfg()
-                pr = cf.get("profiles", {}).pop(pid, None)
+                pr = cf.get("profiles", {}).get(pid)
                 if not pr:
                     return self._j(404, {"error": "no existe"})
+                try:
+                    home = L.home_de(pid, pr)
+                except ValueError:
+                    return self._j(400, {"error": "perfil con home inseguro"})
+                cf["profiles"].pop(pid)
+                for prov, pid_activo in list(cf.get("_activas", {}).items()):
+                    if pid_activo == pid:
+                        cf["_activas"].pop(prov)
                 L.guardar_cfg(cf)
-            return self._j(200, {"ok": True, "home": L.home_de(pid, pr)})
+            L.escribir_entorno()
+            return self._j(200, {"ok": True, "home": home})
 
         if p == "/api/limite":
             pid = d.get("id")
@@ -337,29 +472,37 @@ class H(BaseHTTPRequestHandler):
             if pid is not None and (not isinstance(pid, str) or not L.id_perfil_valido(pid)):
                 return self._j(400, {"error": "id invalido"})
             ps = L.cfg().get("profiles", {})
-            objetivo = ({pid: ps[pid]} if pid in ps else
+            if pid is not None and pid not in ps:
+                return self._j(404, {"error": "cuenta no existe"})
+            objetivo = ({pid: ps[pid]} if pid is not None else
                         {k: v for k, v in ps.items()
                          if v.get("enabled", True) and L.autenticado(k, v)})
             if not objetivo:
                 return self._j(400, {"error": "nada que verificar"})
+            if len(objetivo) > MAX_JOB_ACCOUNTS:
+                return self._j(400, {"error": "demasiadas cuentas para verificar"})
             jid = uuid.uuid4().hex[:12]
-            _job_set(jid, estado="encolado", modo="verificar")
+            if not _reservar_job(jid, estado="encolado", modo="verificar"):
+                return self._j(429, {"error": "demasiados trabajos activos"})
 
             def _ver():
                 try:
                     _job_set(jid, estado="corriendo", fase="probando",
                              cuentas=list(objetivo))
-                    with ThreadPoolExecutor(max_workers=len(objetivo)) as ex:
-                        res = list(ex.map(
-                            lambda kv: L.correr(
+                    with ThreadPoolExecutor(
+                            max_workers=min(MAX_JOB_WORKERS, len(objetivo))) as ex:
+                        pares = list(ex.map(
+                            lambda kv: _correr_acotado(
                                 kv[0], kv[1], "di solo: ok",
                                 "reasoning" if L.admite_tarea(kv[1], "reasoning") else "imagen",
                                 90), objetivo.items()))
+                    res = [valor for valor, _tokens in pares]
                     _job_set(jid, estado="listo", respuestas=res, auditorias=[],
-                             total=sum(r["tokens"] for r in res))
+                             total=sum(tokens for _valor, tokens in pares))
                 except Exception as e:
                     _job_set(jid, estado="error", error=str(e))
-            threading.Thread(target=_ver, daemon=True).start()
+            if not _iniciar_hilo_job(jid, _ver):
+                return self._j(500, {"error": "no se pudo iniciar el trabajo"})
             return self._j(200, {"job": jid})
 
         if p == "/api/run":
@@ -387,9 +530,14 @@ class H(BaseHTTPRequestHandler):
                 return self._j(400, {"error": "timeout invalido"})
             timeout = max(1, min(600, timeout))
             jid = uuid.uuid4().hex[:12]
-            _job_set(jid, estado="encolado", modo=modo, tarea=tarea, prompt=prompt[:300])
-            threading.Thread(target=ejecutar_job, daemon=True, args=(
-                jid, prompt, tarea, modo, perfil, timeout)).start()
+            if not _reservar_job(
+                    jid, estado="encolado", modo=modo, tarea=tarea,
+                    prompt=prompt[:300]):
+                return self._j(429, {"error": "demasiados trabajos activos"})
+            if not _iniciar_hilo_job(
+                    jid, ejecutar_job,
+                    (jid, prompt, tarea, modo, perfil, timeout)):
+                return self._j(500, {"error": "no se pudo iniciar el trabajo"})
             return self._j(200, {"job": jid})
 
         self._j(404, {"error": "no encontrado"})

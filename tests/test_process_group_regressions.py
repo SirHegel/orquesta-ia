@@ -2,7 +2,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import textwrap
 import time
 import unittest
 from pathlib import Path
@@ -27,29 +26,9 @@ class ProcessGroupRegressionTests(unittest.TestCase):
     def test_timeout_mata_lider_e_hijo_del_proveedor(self):
         with tempfile.TemporaryDirectory() as td:
             pids_path = Path(td) / "pids"
-            child_code = """
-                import signal, time
-                signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                while True:
-                    time.sleep(1)
-            """
-            parent_code = """
-                import os, signal, subprocess, sys, time
-                signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                child = subprocess.Popen([sys.executable, "-c", CHILD])
-                with open(PIDS, "w") as f:
-                    f.write(f"{os.getpid()} {child.pid}")
-                    f.flush()
-                    os.fsync(f.fileno())
-                while True:
-                    time.sleep(1)
-            """
             command = [
-                sys.executable,
-                "-c",
-                "CHILD = %r\nPIDS = %r\n%s"
-                % (textwrap.dedent(child_code), str(pids_path),
-                   textwrap.dedent(parent_code)),
+                sys.executable, str(Path(L.CODIGO_ORQUESTA) / "orqrun.py"),
+                "--fixture", "tree-parent",
             ]
             profile = {"provider": "gpt", "label": "sintetico"}
 
@@ -94,36 +73,9 @@ class ProcessGroupRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             heartbeat = Path(td) / "heartbeat"
             pids_path = Path(td) / "pids"
-            child_code = textwrap.dedent("""
-                import os, signal, time
-                PIDS = os.environ["PIDS"]
-                HEARTBEAT = os.environ["HEARTBEAT"]
-                signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                with open(PIDS, "a") as f:
-                    f.write(f" {os.getpid()}")
-                    f.flush(); os.fsync(f.fileno())
-                n = 0
-                while True:
-                    n += 1
-                    with open(HEARTBEAT, "w") as f:
-                        f.write(str(n)); f.flush(); os.fsync(f.fileno())
-                    time.sleep(0.03)
-            """)
-            parent_code = textwrap.dedent("""
-                import os, signal, subprocess, sys, time
-                signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                with open(PIDS, "w") as f:
-                    f.write(str(os.getpid())); f.flush(); os.fsync(f.fileno())
-                subprocess.Popen(
-                    [sys.executable, "-c", CHILD], start_new_session=True,
-                    env={**os.environ, "PIDS": PIDS, "HEARTBEAT": HEARTBEAT},
-                )
-                while True: time.sleep(1)
-            """)
             command = [
-                sys.executable, "-c",
-                "CHILD=%r\nPIDS=%r\nHEARTBEAT=%r\n%s"
-                % (child_code, str(pids_path), str(heartbeat), parent_code),
+                sys.executable, str(Path(L.CODIGO_ORQUESTA) / "orqrun.py"),
+                "--fixture", "setsid-parent",
             ]
             profile = {"provider": "gpt", "label": "setsid"}
             with mock.patch.object(L, "comando", return_value=command), \
@@ -147,23 +99,11 @@ class ProcessGroupRegressionTests(unittest.TestCase):
     def test_fallback_sin_systemd_tambien_mata_hijo_con_setsid(self):
         with tempfile.TemporaryDirectory() as td:
             heartbeat = Path(td) / "heartbeat"
-            child = textwrap.dedent("""
-                import os, signal, time
-                signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                while True:
-                    with open(os.environ["HEARTBEAT"], "w") as f:
-                        f.write(str(time.time_ns())); f.flush(); os.fsync(f.fileno())
-                    time.sleep(0.03)
-            """)
-            parent = textwrap.dedent("""
-                import os, signal, subprocess, sys, time
-                signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                subprocess.Popen([sys.executable, "-c", CHILD],
-                                 start_new_session=True, env=os.environ)
-                while True: time.sleep(1)
-            """)
-            command = [sys.executable, "-c", f"CHILD={child!r}\n{parent}"]
-            env = {**os.environ, "HEARTBEAT": str(heartbeat)}
+            command = [
+                sys.executable, str(Path(L.CODIGO_ORQUESTA) / "orqrun.py"),
+                "--fixture", "setsid-parent",
+            ]
+            env = dict(os.environ)
             with mock.patch.dict(
                 os.environ, {"ORQ_DISABLE_SYSTEMD_SCOPE": "1"}
             ), mock.patch.object(

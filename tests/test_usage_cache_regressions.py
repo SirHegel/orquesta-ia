@@ -33,17 +33,20 @@ def totales(resultado):
 class CacheUsoRealTests(unittest.TestCase):
     def test_releer_refrescar_y_ampliar_un_jsonl_no_duplica_consumo(self):
         with tempfile.TemporaryDirectory() as tmp:
-            home = os.path.join(tmp, "cuenta")
+            home = os.path.join(tmp, "accounts", "claude-prueba")
             sesiones = os.path.join(home, "projects", "proyecto")
             os.makedirs(sesiones)
             sesion = os.path.join(sesiones, "sesion.jsonl")
             with open(sesion, "w", encoding="utf-8") as archivo:
                 archivo.write(evento_claude("2026-08-18T12:00:00Z", 10, 2, 4) + "\n")
+            os.chmod(sesion, 0o600)
 
             perfil = {"provider": "claude", "home": home}
             cache = os.path.join(tmp, "uso_real.json")
             lock = os.path.join(tmp, ".lock")
-            with mock.patch.object(orqlib, "CACHE_REAL", cache), mock.patch.object(
+            with mock.patch.object(orqlib, "BASE", tmp), mock.patch.object(
+                orqlib, "CACHE_REAL", cache
+            ), mock.patch.object(
                 orqlib, "LOCK", lock
             ):
                 primero = orqlib.uso_real("claude-prueba", perfil)
@@ -75,6 +78,7 @@ class CacheUsoRealTests(unittest.TestCase):
             sesion = os.path.join(tmp, "sesion.jsonl")
             with open(sesion, "w", encoding="utf-8") as archivo:
                 archivo.write(evento_claude("2026-08-18T02:15:00Z", 7, 1) + "\n")
+            os.chmod(sesion, 0o600)
 
             anterior = os.environ.get("TZ")
             try:

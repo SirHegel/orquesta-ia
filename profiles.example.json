@@ -1,5 +1,5 @@
 {
-  "_lee_esto": "Copia este archivo a profiles.json y edítalo. profiles.json NUNCA se sube a git (está en .gitignore). Las credenciales viven en accounts/<id>/ y tampoco se suben.",
+  "_lee_esto": "Instala este archivo como profiles.json con modo 0600 y edítalo. profiles.json NUNCA se sube a git (está en .gitignore). Las credenciales viven en accounts/<id>/ y tampoco se suben.",
   "_permisos_totales": false,
   "_publicar_github": false,
   "profiles": {

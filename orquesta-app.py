@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """Aplicativo de escritorio de Orquesta IA (GTK4 + WebKit6).
 
 Levanta el panel si no está corriendo y lo muestra en una ventana nativa.
@@ -26,7 +26,7 @@ def asegurar_panel():
         return True, "panel ya en marcha"
     # 1) intentar via systemd (modo permanente)
     try:
-        subprocess.run(["systemctl", "--user", "start", "orquesta.service"],
+        subprocess.run(["/usr/bin/systemctl", "--user", "start", "orquesta.service"],
                        capture_output=True, timeout=10)
     except Exception:
         pass
@@ -36,8 +36,9 @@ def asegurar_panel():
         time.sleep(0.25)
     # 2) fallback: lanzarlo suelto
     try:
-        subprocess.Popen([sys.executable, os.path.join(BASE, "orqweb.py"),
-                          str(PUERTO), "--no-abrir"],
+        subprocess.Popen(["/usr/bin/python3", "-I",
+                          os.path.join(BASE, "orqweb.py"), str(PUERTO),
+                          "--no-abrir"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
     except Exception as e:
