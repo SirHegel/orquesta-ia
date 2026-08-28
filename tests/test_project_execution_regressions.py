@@ -536,6 +536,63 @@ class PreferenciaProyectoTests(unittest.TestCase):
 
 
 class VerificacionProyectoTests(unittest.TestCase):
+    def test_publicacion_verifica_comandos_en_checkout_del_commit_inmutable(self):
+        evidencia = resultado_modelo(
+            "auditor",
+            texto=json.dumps({
+                "ok": True,
+                "comprobaciones": [{
+                    "comando": "python3 -m unittest test_ok.py", "rc": 0,
+                    "resultado": "debe reemplazarse por evidencia real",
+                }],
+                "hallazgos": [],
+            }),
+        )
+        carpetas = []
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(
+                ["/usr/bin/git", "init", "-q", "-b", "main", tmp], check=True
+            )
+            subprocess.run(
+                ["/usr/bin/git", "-C", tmp, "config", "user.name", "Pruebas"],
+                check=True,
+            )
+            subprocess.run(
+                ["/usr/bin/git", "-C", tmp, "config", "user.email", "tests@local"],
+                check=True,
+            )
+            with open(os.path.join(tmp, "test_ok.py"), "w", encoding="utf-8") as archivo:
+                archivo.write(
+                    "import unittest\nclass T(unittest.TestCase):\n"
+                    "    def test_ok(self): self.assertTrue(True)\n"
+                )
+            subprocess.run(
+                ["/usr/bin/git", "-C", tmp, "add", "test_ok.py"], check=True
+            )
+            subprocess.run(
+                ["/usr/bin/git", "-C", tmp, "commit", "-qm", "base"], check=True
+            )
+
+            def revisar(*_args, **kwargs):
+                carpetas.append(kwargs.get("carpeta"))
+                self.assertIsNotNone(kwargs.get("cwd_fd"))
+                self.assertNotEqual(os.path.realpath(kwargs["carpeta"]), tmp)
+                return dict(evidencia)
+
+            with mock.patch.object(
+                orqlib, "ranking",
+                return_value=[{"pid": "auditor", "p": {"provider": "gpt"}}],
+            ), mock.patch.object(orqlib, "correr", side_effect=revisar):
+                salida = orqlib.verificar_proyecto(
+                    {"resumen": "probar snapshot"}, tmp, [],
+                    mensaje_snapshot="feat: snapshot probado",
+                )
+
+        self.assertTrue(salida["verificacion_ok"], salida)
+        self.assertTrue(orqlib._snapshot_valido(salida["snapshot_verificado"]))
+        self.assertEqual(len(carpetas), 1)
+        self.assertIn("/tmp/orq-verify-", carpetas[0])
+
     def test_verificador_exige_comandos_reales_rc_cero_y_sin_hallazgos(self):
         perfiles = [{"pid": "auditor", "p": {"provider": "gpt"}}]
         evidencia = resultado_modelo(
@@ -550,7 +607,9 @@ class VerificacionProyectoTests(unittest.TestCase):
             }),
         )
         def ejecutar(comando, _carpeta, _timeout):
-            return {"comando": comando, "rc": 0, "resultado": "OK real"}
+            estado = os.stat(_carpeta)
+            return {"comando": comando, "rc": 0, "resultado": "OK real",
+                    "cwd_identidad": [estado.st_dev, estado.st_ino]}
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
             orqlib, "ranking", return_value=perfiles

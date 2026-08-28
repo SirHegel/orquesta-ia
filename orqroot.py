@@ -10,7 +10,11 @@ import os
 import stat
 
 
-_MARCADORES = ("orq", "orqlib.py", "orqroot.py", "shell.sh", "tools/minimax")
+_MARCADORES = (
+    "orq", "orqlib.py", "orqroot.py", "orqenv.py", "orqlogin.py",
+    "orqrun.py",
+    "shell.sh", "tools/minimax",
+)
 
 
 class RaizOrquestaInvalida(ValueError):

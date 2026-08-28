@@ -10,8 +10,12 @@ esac
 # Cargar este archivo es la decisión más reciente del operador: su ubicación
 # real reemplaza cualquier ORQ_HOME heredado y todos los entrypoints la usan.
 _ORQ_SHELL_FILE="${BASH_SOURCE[0]:-}"
+if [ ! -x /usr/bin/python3 ]; then
+  printf 'orquesta: falta /usr/bin/python3 de confianza\n' >&2
+  return 1 2>/dev/null || exit 1
+fi
 if ! ORQ_HOME="$(
-  python3 - "$_ORQ_SHELL_FILE" <<'PY'
+  /usr/bin/python3 -I - "$_ORQ_SHELL_FILE" <<'PY'
 import os
 import sys
 
@@ -33,7 +37,19 @@ fi
 export ORQ_HOME
 _ORQ_HOME_CANONICO="$ORQ_HOME"
 unset _ORQ_SHELL_FILE
-case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH";; esac
+if ! _ORQ_USER_HOME="$(/usr/bin/python3 -I - <<'PY'
+import os
+import pwd
+print(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
+PY
+)" || [ "${_ORQ_USER_HOME#/}" = "$_ORQ_USER_HOME" ]; then
+  unset ORQ_HOME _ORQ_HOME_CANONICO _ORQ_USER_HOME
+  return 1 2>/dev/null || exit 1
+fi
+case ":$PATH:" in
+  *":$_ORQ_USER_HOME/.local/bin:"*) ;;
+  *) export PATH="$_ORQ_USER_HOME/.local/bin:$PATH";;
+esac
 
 # Detecta el cambio antes de reemplazar la selección anterior. El entorno
 # original se captura antes de cargar cualquier configuración de Orquesta.
@@ -45,6 +61,7 @@ fi
 declare -ga _ORQ_VARIABLES_PROVEEDOR=(
   CLAUDE_CONFIG_DIR CODEX_HOME GEMINI_CLI_HOME GEMINI_API_KEY
   GOOGLE_API_KEY GOOGLE_GENAI_USE_GCA GEMINI_CLI_TRUST_WORKSPACE
+  OPENAI_API_KEY CODEX_API_KEY
   ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN
   ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL
   ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
@@ -80,16 +97,87 @@ _orq_restaurar_original() {
 # en ese archivo también debe surtir efecto al volver a cargar la misma copia.
 if [ "$_ORQ_CAMBIO_RAIZ" = 1 ]; then
   _orq_restaurar_original "${_ORQ_VARIABLES_PROVEEDOR[@]}"
-  unset ORQ_CUENTA _ORQ_ENTORNO_MTIME
+  unset ORQ_CUENTA _ORQ_ENTORNO_FIRMA
 fi
 _orq_restaurar_original "${_ORQ_VARIABLES_POLITICA[@]}"
 
-# Preferencias de ESTA maquina, fuera del repositorio. Es codigo de shell local:
-# debe ser propiedad del usuario y no se copia ni se publica con el proyecto.
-_ORQ_SHELL_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/orquesta/shell.local.sh"
-if [ -r "$_ORQ_SHELL_CONFIG" ]; then
-  . "$_ORQ_SHELL_CONFIG"
+# Preferencias de ESTA maquina, fuera del repositorio. Es un trust anchor
+# explícito del operador: se abre una sola vez, se valida por descriptor y se
+# ejecuta desde ese descriptor estable. Un symlink, hardlink, otro propietario
+# o permisos de escritura de grupo/otros hacen que se ignore sin evaluarlo.
+_orq_cargar_config_local() {
+  local archivo="$1" contenido rc
+  [ -e "$archivo" ] || return 0
+  # El lector abre sin bloquear y acumula todos los bytes antes de emitirlos.
+  # Por tanto Bash nunca evalua una salida parcial si la validacion falla.
+  if ! contenido="$(/usr/bin/python3 -I -S - "$archivo" <<'PY'
+import os
+import stat
+import sys
+
+ruta = sys.argv[1]
+if not os.path.isabs(ruta):
+    raise SystemExit(1)
+partes = ruta.split(os.sep)
+if any(parte in (".", "..") for parte in partes):
+    raise SystemExit(1)
+flags_dir = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+flags_file = (os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+              | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+fd_dir = os.open(os.path.sep, flags_dir)
+try:
+    componentes = [parte for parte in partes if parte]
+    if not componentes:
+        raise SystemExit(1)
+    for parte in componentes[:-1]:
+        siguiente = os.open(parte, flags_dir, dir_fd=fd_dir)
+        os.close(fd_dir)
+        fd_dir = siguiente
+    fd = os.open(componentes[-1], flags_file, dir_fd=fd_dir)
+    try:
+        antes = os.fstat(fd)
+        if (not stat.S_ISREG(antes.st_mode) or antes.st_uid != os.getuid()
+                or antes.st_nlink != 1 or antes.st_mode & 0o022
+                or antes.st_size > 64 * 1024):
+            raise SystemExit(1)
+        bloques = []
+        restante = 64 * 1024 + 1
+        while restante:
+            bloque = os.read(fd, min(16 * 1024, restante))
+            if not bloque:
+                break
+            bloques.append(bloque)
+            restante -= len(bloque)
+        contenido = b"".join(bloques)
+        despues = os.fstat(fd)
+        if (len(contenido) > 64 * 1024 or b"\0" in contenido
+                or (antes.st_dev, antes.st_ino, antes.st_mtime_ns, antes.st_size)
+                != (despues.st_dev, despues.st_ino,
+                    despues.st_mtime_ns, despues.st_size)):
+            raise SystemExit(1)
+        sys.stdout.buffer.write(contenido)
+    finally:
+        os.close(fd)
+finally:
+    os.close(fd_dir)
+PY
+  )"; then
+    return 1
+  fi
+  # ``command substitution`` elimina saltos finales; el here-string agrega
+  # uno. Para asignaciones/configuracion shell la semantica se conserva y los
+  # bytes ya fueron validados por completo antes de este unico ``source``.
+  . /dev/stdin <<<"$contenido"
+  rc=$?
+  unset contenido
+  return "$rc"
+}
+_ORQ_SHELL_CONFIG="${XDG_CONFIG_HOME:-$_ORQ_USER_HOME/.config}/orquesta/shell.local.sh"
+if ! _orq_cargar_config_local "$_ORQ_SHELL_CONFIG"; then
+  printf 'orquesta: shell.local.sh inseguro; no se cargo\n' >&2
 fi
+unset -f _orq_cargar_config_local
 # Las preferencias locales controlan autoarranque y permisos, no pueden volver
 # a separar el shell del estado cambiando la instalación ya seleccionada.
 ORQ_HOME="$_ORQ_HOME_CANONICO"
@@ -119,30 +207,64 @@ minimax() {
 
 # Identidad de ESTA terminal: permite medir uso por sesion.
 if [ -z "$ORQ_SESION" ]; then
-  export ORQ_SESION="$(date +%Y%m%d-%H%M%S)-$$"
+  export ORQ_SESION="$(/usr/bin/date +%Y%m%d-%H%M%S)-$$"
   export ORQ_SESION_TERM="${TERM_PROGRAM:-${KITTY_WINDOW_ID:+kitty}}"
-  [ -z "$ORQ_SESION_TERM" ] && ORQ_SESION_TERM="$(ps -o comm= -p "$PPID" 2>/dev/null)"
+  [ -z "$ORQ_SESION_TERM" ] && ORQ_SESION_TERM="$(/usr/bin/ps -o comm= -p "$PPID" 2>/dev/null)"
   export ORQ_SESION_TERM
 fi
 
 _orq_cargar_entorno() {
   _orq_reafirmar_raiz
   local f="$ORQ_HOME/state/entorno.sh"
-  [ -f "$f" ] || return 0
-  local m; m=$(stat -c %Y "$f" 2>/dev/null) || return 0
+  [ -f "$f" ] && [ ! -L "$f" ] || return 0
+  local m; m=$(/usr/bin/stat -Lc '%d:%i:%s:%Y' "$f" 2>/dev/null) || return 0
   # solo recarga si cambio, y nunca pisa un override manual de esta terminal
-  if [ "$m" != "$_ORQ_ENTORNO_MTIME" ] && [ -z "$ORQ_CUENTA" ]; then
-    # Los perfiles eligen cuentas, no la politica de sandbox de esta maquina.
-    # Conserva el valor del entorno/config local e ignora el legado del state.
-    local permisos_set="${ORQ_PERMISOS_TOTALES+x}"
-    local permisos_val="${ORQ_PERMISOS_TOTALES:-}"
-    . "$f"
-    if [ "$permisos_set" = x ]; then
-      ORQ_PERMISOS_TOTALES="$permisos_val"
-    else
-      unset ORQ_PERMISOS_TOTALES
-    fi
-    _ORQ_ENTORNO_MTIME="$m"
+  if [ "$m" != "$_ORQ_ENTORNO_FIRMA" ] && [ -z "$ORQ_CUENTA" ]; then
+    # El marcador no se ejecuta. Un helper fijo valida profiles.json y entrega
+    # pares NUL-delimitados; Bash solo asigna nombres de esta lista cerrada.
+    local -a datos=()
+    local env_fd env_pid
+    exec {env_fd}< <(/usr/bin/python3 -I "$ORQ_HOME/orqenv.py" active)
+    env_pid=$!
+    mapfile -d '' -t datos <&"$env_fd"
+    exec {env_fd}<&-
+    wait "$env_pid" || return 1
+    [ $((${#datos[@]} % 2)) -eq 0 ] || return 1
+    _orq_restaurar_original "${_ORQ_VARIABLES_PROVEEDOR[@]}"
+    local i nombre valor
+    # Una cuenta activa no puede quedar dominada por credenciales heredadas.
+    # Se limpia solo el proveedor que el helper validó; los demás conservan el
+    # entorno original de la terminal.
+    for ((i=0; i<${#datos[@]}; i+=2)); do
+      nombre="${datos[i]}"
+      case "$nombre" in
+        CLAUDE_CONFIG_DIR)
+          unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN \
+                ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL \
+                ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
+                ANTHROPIC_DEFAULT_HAIKU_MODEL \
+                CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC;;
+        CODEX_HOME)
+          unset OPENAI_API_KEY CODEX_API_KEY;;
+        GEMINI_CLI_HOME)
+          unset GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_GENAI_USE_GCA \
+                GEMINI_CLI_TRUST_WORKSPACE;;
+      esac
+    done
+    for ((i=0; i<${#datos[@]}; i+=2)); do
+      nombre="${datos[i]}"; valor="${datos[i+1]}"
+      case "$nombre" in
+        CLAUDE_CONFIG_DIR|CODEX_HOME|GEMINI_CLI_HOME|GEMINI_API_KEY|\
+        GOOGLE_GENAI_USE_GCA|GEMINI_CLI_TRUST_WORKSPACE|\
+        ORQ_CLAUDE_CUENTA|ORQ_GPT_CUENTA|ORQ_GEMINI_CUENTA|\
+        ORQ_ANTIGRAVITY_CUENTA)
+          printf -v "$nombre" '%s' "$valor"
+          export "$nombre"
+          ;;
+      esac
+    done
+    unset datos i nombre valor
+    _ORQ_ENTORNO_FIRMA="$m"
   fi
 }
 
@@ -160,7 +282,7 @@ alias orqu='orq uso'
 
 _orq_restaurar_proveedores() {
   _orq_restaurar_original "${_ORQ_VARIABLES_PROVEEDOR[@]}"
-  unset ORQ_CUENTA _ORQ_ENTORNO_MTIME
+  unset ORQ_CUENTA _ORQ_ENTORNO_FIRMA
   _orq_cargar_entorno
 }
 
@@ -175,46 +297,58 @@ orquse() {
   local id="$1"
   [ -z "$id" ] && { echo "uso: orquse <id-de-cuenta>"; orq cuentas; return 1; }
   local -a info=()
-  mapfile -t info < <(python3 - "$id" <<'PY'
-import json,sys,os
-b=os.environ.get("ORQ_HOME") or os.path.expanduser("~/Documentos/ia/orquesta")
-p=json.load(open(os.path.join(b,"profiles.json")))["profiles"].get(sys.argv[1])
-if not p: sys.exit(1)
-h=p.get("home") or os.path.join(b,"accounts",sys.argv[1])
-def ruta(v):
-    if not v: return "-"
-    v=os.path.expanduser(v)
-    return os.path.abspath(v if os.path.isabs(v) else os.path.join(b,v))
-if not os.path.isabs(os.path.expanduser(h)):
-    h=os.path.join(b,os.path.expanduser(h))
-for valor in (p["provider"], os.path.abspath(os.path.expanduser(h)),
-              p.get("auth") or "-", ruta(p.get("api_key_file")),
-              p.get("base_url") or "-", p.get("model") or "-"):
-    print(valor)
-PY
-)
+  local perfil_fd perfil_pid
+  exec {perfil_fd}< <(/usr/bin/python3 -I "$_ORQ_RAIZ_ACTIVA/orqenv.py" profile "$id")
+  perfil_pid=$!
+  mapfile -d '' -t info <&"$perfil_fd"
+  exec {perfil_fd}<&-
+  wait "$perfil_pid" || { echo "cuenta invalida: $id"; return 1; }
   [ "${#info[@]}" -eq 6 ] || { echo "cuenta desconocida: $id"; return 1; }
-  _orq_restaurar_proveedores
   local proveedor="${info[0]}" home="${info[1]}" auth="${info[2]}"
-  local key_file="${info[3]}" base_url="${info[4]}" modelo="${info[5]}"
+  local clave="${info[3]}" base_url="${info[4]}" modelo="${info[5]}"
+  case "$proveedor:$auth:$clave" in
+    minimax:*-)
+      echo "la cuenta MiniMax no tiene una API key privada"; return 1;;
+    gemini:oauth:*) ;;
+    gemini:*-)
+      echo "la cuenta Gemini no tiene una API key privada"; return 1;;
+  esac
+  _orq_restaurar_proveedores
+  # El override reemplaza únicamente su proveedor. Las cuentas activas de los
+  # demás (por ejemplo CODEX_HOME al forzar Claude) continúan coherentes.
+  case "$proveedor" in
+    claude|minimax)
+      unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN \
+            CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_MODEL \
+            ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL \
+            ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL \
+            CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC;;
+    gpt)
+      unset CODEX_HOME OPENAI_API_KEY CODEX_API_KEY;;
+    gemini)
+      unset GEMINI_CLI_HOME GEMINI_API_KEY GOOGLE_API_KEY \
+            GOOGLE_GENAI_USE_GCA GEMINI_CLI_TRUST_WORKSPACE;;
+  esac
   case "$proveedor" in
     claude) export CLAUDE_CONFIG_DIR="$home";;
     gpt)    export CODEX_HOME="$home";;
     gemini) export GEMINI_CLI_HOME="$home"; export GEMINI_CLI_TRUST_WORKSPACE=true
             [ "$auth" = "oauth" ] && export GOOGLE_GENAI_USE_GCA=true
-            [ "$key_file" != "-" ] && [ -f "$key_file" ] && export GEMINI_API_KEY="$(cat "$key_file")";;
+            [ "$clave" != "-" ] && export GEMINI_API_KEY="$clave";;
     minimax) # 'claude' en ESTA terminal pasa a hablar con MiniMax
             export CLAUDE_CONFIG_DIR="$home"
-            unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
             export ANTHROPIC_BASE_URL="$([ "$base_url" != "-" ] && echo "$base_url" || echo "https://api.minimax.io/anthropic")"
-            [ "$key_file" != "-" ] && [ -f "$key_file" ] && export ANTHROPIC_AUTH_TOKEN="$(cat "$key_file")"
+            [ "$clave" != "-" ] && export ANTHROPIC_AUTH_TOKEN="$clave"
             local mm; mm="$([ "$modelo" != "-" ] && echo "$modelo" || echo "MiniMax-M3[1m]")"
             export ANTHROPIC_MODEL="$mm" ANTHROPIC_SMALL_FAST_MODEL="$mm" \
                    ANTHROPIC_DEFAULT_OPUS_MODEL="$mm" ANTHROPIC_DEFAULT_SONNET_MODEL="$mm" \
                    ANTHROPIC_DEFAULT_HAIKU_MODEL="$mm"
             export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1;;
+    antigravity) ;;
+    *) echo "proveedor de cuenta invalido"; return 1;;
   esac
   export ORQ_CUENTA="$id"
+  unset info clave
   echo "esta terminal usa ahora: $id ($proveedor)  ·  'orqoff' para volver a Orquesta"
 }
 
@@ -242,10 +376,14 @@ orqyo() {
 if [ "${ORQ_PERMISOS_TOTALES:-0}" = "1" ]; then
   # Respeta tu lanzador claude-vagabond (el del logo de Musashi) si existe,
   # solo le añade los permisos.
-  if [ -x "$HOME/.config/kitty/claude-vagabond" ]; then
+  if [ -x "$_ORQ_USER_HOME/.config/kitty/claude-vagabond" ] \
+     && [ ! -L "$_ORQ_USER_HOME/.config/kitty/claude-vagabond" ] \
+     && [ "$(/usr/bin/stat -Lc '%u:%F' \
+          "$_ORQ_USER_HOME/.config/kitty/claude-vagabond" 2>/dev/null)" \
+          = "$EUID:regular file" ]; then
     claude() {
       if [ "${ORQ_PERMISOS_TOTALES:-0}" != 1 ]; then command claude "$@"; return; fi
-      "$HOME/.config/kitty/claude-vagabond" --dangerously-skip-permissions "$@"
+      "$_ORQ_USER_HOME/.config/kitty/claude-vagabond" --dangerously-skip-permissions "$@"
     }
   else
     claude() {
@@ -290,7 +428,7 @@ ia() {
 # ORQ_AUTO_CHAT=0 (default)    nunca
 _orq_terminal_id() {
   if [ -n "${TERM_PROGRAM:-}" ]; then
-    printf '%s' "$TERM_PROGRAM" | tr '[:upper:]' '[:lower:]'
+    printf '%s' "$TERM_PROGRAM" | /usr/bin/tr '[:upper:]' '[:lower:]'
   elif [ -n "${KITTY_WINDOW_ID:-}" ]; then
     printf '%s' kitty
   elif [ -n "${WEZTERM_PANE:-}" ]; then
@@ -298,7 +436,9 @@ _orq_terminal_id() {
   elif [ -n "${ALACRITTY_WINDOW_ID:-}" ]; then
     printf '%s' alacritty
   else
-    ps -o comm= -p "$PPID" 2>/dev/null | sed 's|.*/||; s/[[:space:]]//g' | tr '[:upper:]' '[:lower:]'
+    /usr/bin/ps -o comm= -p "$PPID" 2>/dev/null \
+      | /usr/bin/sed 's|.*/||; s/[[:space:]]//g' \
+      | /usr/bin/tr '[:upper:]' '[:lower:]'
   fi
 }
 
@@ -310,7 +450,7 @@ _orq_auto_chat_habilitado() {
     0|false|FALSE|no|NO|off|"") return 1 ;;
   esac
   actual="$(_orq_terminal_id)"
-  lista=",$(printf '%s' "$politica" | tr '[:upper:] ' '[:lower:],'),"
+  lista=",$(printf '%s' "$politica" | /usr/bin/tr '[:upper:] ' '[:lower:],'),"
   case "$lista" in *",$actual,"*) return 0 ;; *) return 1 ;; esac
 }
 

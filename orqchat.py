@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """Orquesta IA — interfaz de lenguaje natural para kitty.
 
 No es un shell con IA encima: es una conversacion. Mantiene contexto entre
 turnos aunque cada respuesta la conteste una cuenta distinta.
 """
-import os, sys, json, re, time, threading, subprocess, shutil, textwrap, unicodedata
+import os, sys, json, re, time, threading, subprocess, shutil, textwrap, unicodedata, hashlib, stat, tempfile
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import orqlib as L
 
@@ -30,11 +30,17 @@ CTX_CARPETA = CTX + ".cwd"
 CTX_PARCIAL = CTX + ".partial.json"
 
 # Carpeta de trabajo de ESTA ventana. Se conserva si el chat se reinicia.
-CARPETA = os.path.abspath(os.environ.get("ORQ_CARPETA") or os.getcwd())
 try:
-    guardada = open(CTX_CARPETA).read().strip()
-    if os.path.isdir(guardada):
-        CARPETA = os.path.abspath(guardada)
+    _CWD_INICIAL = os.getcwd()
+except OSError:
+    _CWD_INICIAL = L.BASE
+CARPETA = L.ruta_trabajo_segura(os.environ.get("ORQ_CARPETA") or _CWD_INICIAL)
+CARPETA = CARPETA or L.ruta_trabajo_segura(_CWD_INICIAL) or L.BASE
+try:
+    guardada = L._leer_texto(CTX_CARPETA, "").strip()
+    guardada = L.ruta_trabajo_segura(guardada)
+    if guardada:
+        CARPETA = guardada
 except OSError:
     pass
 
@@ -233,9 +239,7 @@ def pregunta_operativa(pregunta, ctx):
 
 def guardar_carpeta():
     try:
-        os.makedirs(DIR_SES, exist_ok=True)
-        with open(CTX_CARPETA, "w") as f:
-            f.write(CARPETA + "\n")
+        L._escribir_texto(CTX_CARPETA, CARPETA + "\n")
     except OSError:
         pass
 
@@ -248,16 +252,20 @@ def resolver_carpeta_mencionada(pregunta, actual=None, raices=None):
     ubicacion o escribe un slug distintivo (por ejemplo ``mi-repo``). Si el
     nombre elegido existe mas de una vez, conservamos la carpeta actual.
     """
-    actual = os.path.abspath(actual or CARPETA)
+    raices_explicitas = tuple(raices) if raices is not None else None
+    actual = L.ruta_trabajo_segura(actual or CARPETA, raices_explicitas)
+    actual = actual or CARPETA
     # Una ruta explicita siempre gana.
     explicitas = re.findall(r"(?<!\w)(~?/[^\s,;]+)", pregunta or "")
     for cruda in reversed(explicitas):
-        ruta = os.path.abspath(os.path.expanduser(cruda.rstrip(".:'\"!?)]}")))
-        if os.path.isdir(ruta):
+        ruta = L.ruta_trabajo_segura(
+            cruda.rstrip(".:'\"!?)]}"), raices_explicitas
+        )
+        if ruta:
             return ruta
 
     if raices is None:
-        home = os.path.expanduser("~")
+        home = L.HOME_USUARIO
         raices = [
             os.path.join(home, "Documentos", "Repos"),
             os.path.join(home, "Documentos"),
@@ -299,8 +307,8 @@ def resolver_carpeta_mencionada(pregunta, actual=None, raices=None):
     por_nombre = {}
     vistas = set()
     for prioridad, raiz in enumerate(raices):
-        raiz = os.path.abspath(os.path.expanduser(str(raiz)))
-        if not os.path.isdir(raiz) or raiz in vistas:
+        raiz = L.ruta_trabajo_segura(raiz, raices_explicitas)
+        if not raiz or raiz in vistas:
             continue
         for base, dirs, _files in os.walk(raiz, followlinks=False):
             rel = os.path.relpath(base, raiz)
@@ -388,30 +396,31 @@ def candidatos_para(tarea, forzado=None):
 def _estado_repo(carpeta):
     """Foto barata de archivos para poder reconocer trabajo parcial."""
     try:
-        raiz = subprocess.run(
-            ["git", "-C", carpeta, "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=3,
-        )
+        raiz = L._git(carpeta, "rev-parse", "--show-toplevel", timeout=3)
         if raiz.returncode:
             return None, {}
-        raiz = raiz.stdout.strip()
-        lista = subprocess.run(
-            ["git", "-C", raiz, "ls-files", "-co", "--exclude-standard", "-z"],
-            capture_output=True, timeout=8,
-        )
-        if lista.returncode:
-            return raiz, {}
-        estado = {}
-        for dato in lista.stdout.split(b"\0")[:20000]:
-            if not dato:
-                continue
-            rel = os.fsdecode(dato)
-            ruta = os.path.join(raiz, rel)
-            try:
-                st = os.stat(ruta)
-                estado[rel] = (st.st_mtime_ns, st.st_size)
-            except OSError:
-                pass
+        raiz = L.ruta_trabajo_segura(raiz.stdout.strip())
+        if not raiz:
+            return None, {}
+        with L._capacidad_trabajo(raiz) as (_, repo_fd):
+            lista = L._git(
+                ".", "ls-files", "-co", "--exclude-standard", "-z",
+                timeout=8, cwd_fd=repo_fd,
+            )
+            if lista.returncode:
+                return raiz, {}
+            datos = lista.stdout
+            if len(datos.encode("utf-8", "replace")) > 4 * 1024 * 1024:
+                return raiz, {}
+            estado = {}
+            for rel in datos.split("\0")[:20000]:
+                if not rel or os.path.isabs(rel) or ".." in rel.split(os.sep):
+                    continue
+                try:
+                    st = os.stat(rel, dir_fd=repo_fd, follow_symlinks=False)
+                    estado[rel] = (st.st_mtime_ns, st.st_size)
+                except OSError:
+                    pass
         return raiz, estado
     except (OSError, subprocess.SubprocessError):
         return None, {}
@@ -429,11 +438,11 @@ def _cambios_desde(antes, despues):
 
 def logo():
     """Musashi en la esquina, como en tu claude-vagabond."""
-    img = os.path.expanduser("~/.config/kitty/musashi.png")
+    img = os.path.join(L.HOME_USUARIO, ".config", "kitty", "musashi.png")
     if not en_kitty() or not os.path.exists(img):
         return
     try:
-        subprocess.run(["kitten", "@", "set-window-logo", "--self",
+        subprocess.run(["/usr/bin/kitten", "@", "set-window-logo", "--self",
                         "--position", "top-right", "--alpha",
                         os.environ.get("ORQ_LOGO_ALPHA", "0.30"), img],
                        capture_output=True, timeout=5)
@@ -445,7 +454,7 @@ def quitar_logo():
     if not en_kitty():
         return
     try:
-        subprocess.run(["kitten", "@", "set-window-logo", "--self", "none"],
+        subprocess.run(["/usr/bin/kitten", "@", "set-window-logo", "--self", "none"],
                        capture_output=True, timeout=5)
     except Exception:
         pass
@@ -472,7 +481,7 @@ def cabecera():
     print(f" {D}│{N} " + f"  {D}·{N}  ".join(piezas))
     mem = memoria()
     extra = f"  {D}·{N}  {D}memoria:{N} {len(mem)} nota{'s' if len(mem)!=1 else ''}" if mem else ""
-    corta = CARPETA.replace(os.path.expanduser("~"), "~")
+    corta = CARPETA.replace(L.HOME_USUARIO, "~")
     print(f" {D}│{N} {D}carpeta:{N} {corta}")
     print(f" {D}│{N} {D}ventana nueva, conversacion limpia{N}{extra}")
     print(f" {D}│{N} {D}escribe lo que necesites.  /ayuda para los comandos{N}")
@@ -497,28 +506,129 @@ AYUDA = f"""
    {C}/recuerda <txt>{N} asignarle un hecho permanente
    {C}/olvida <arch>{N}  quitarlo de la memoria
    {C}/nuevo{N}          empezar una conversacion limpia
-   {C}/shell <cmd>{N}    ejecutar un comando del sistema
+   {C}/shell <cmd>{N}    diagnostico local de solo lectura (mira /shell ayuda)
    {C}/salir{N}
 """
+
+COMANDOS_SHELL_SEGUROS = {
+    "pwd": ["/usr/bin/pwd"],
+    "ls": ["/usr/bin/ls", "-la"],
+    "git status": [
+        "/usr/bin/git", "--no-pager", "--no-replace-objects",
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
+        "-c", "core.commitGraph=false",
+        "-c", "advice.graftFileDeprecated=false",
+        "status", "--short", "--branch",
+    ],
+    "git diff --stat": [
+        "/usr/bin/git", "--no-pager", "--no-replace-objects",
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
+        "-c", "core.commitGraph=false",
+        "-c", "advice.graftFileDeprecated=false",
+        "-c", "diff.external=",
+        "diff", "--no-ext-diff", "--no-textconv", "--stat",
+    ],
+    "git log": [
+        "/usr/bin/git", "--no-pager", "--no-replace-objects",
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
+        "-c", "core.commitGraph=false",
+        "-c", "advice.graftFileDeprecated=false",
+        "-c", "log.showSignature=false",
+        "log", "-5", "--oneline", "--decorate",
+    ],
+}
+
+
+def ejecutar_shell_seguro(solicitud):
+    """Ejecuta solo diagnósticos exactos; el texto nunca se vuelve programa."""
+    comando = COMANDOS_SHELL_SEGUROS.get(str(solicitud or "").strip())
+    if comando is None:
+        permitidos = ", ".join(COMANDOS_SHELL_SEGUROS)
+        print(f" {D}comandos permitidos: {permitidos}{N}")
+        return 2
+    carpeta = L.ruta_trabajo_segura(CARPETA)
+    if not carpeta:
+        print(f" {R}·{N} carpeta de trabajo no autorizada")
+        return 2
+    env = {
+        "HOME": L.HOME_USUARIO,
+        "PATH": "/usr/bin:/bin",
+        "LC_ALL": os.environ.get("LC_ALL") or "C.UTF-8",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_SHALLOW_FILE": "/dev/null",
+        "GIT_GRAFT_FILE": "/dev/null",
+    }
+    try:
+        with L._capacidad_trabajo(carpeta) as (_, cwd_fd):
+            if str(solicitud or "").strip().startswith("git "):
+                config_ejecutable = L._config_git_ejecutable(".", cwd_fd=cwd_fd)
+                if config_ejecutable is not False:
+                    detalle = ("configuracion Git ejecutable no permitida"
+                               if config_ejecutable else
+                               "no pude auditar la configuracion Git")
+                    print(f" {R}·{N} {detalle}")
+                    return 2
+            out, err, rc = L._ejecutar_aislado_acotado(
+                comando, env, ".", 15, limite_salida=1024 * 1024,
+                limite_error=1024 * 1024, usar_scope=False, cwd_fd=cwd_fd,
+            )
+        if out:
+            print(out, end="" if out.endswith("\n") else "\n")
+        if err:
+            print(err, file=sys.stderr, end="" if err.endswith("\n") else "\n")
+        return rc
+    except OSError as e:
+        print(f" {R}·{N} no pude ejecutar el diagnostico: {e}")
+        return 1
 
 
 def cargar_ctx():
     """Solo recupera el contexto de ESTA ventana (por si se reinicio el chat)."""
-    try:
-        with open(CTX) as f:
-            return json.load(f)
-    except Exception:
-        return []
+    dato = L._leer(CTX, [])
+    return dato if isinstance(dato, list) else []
+
+
+def cargar_historial():
+    """Carga líneas desde un regular seguro, sin delegar aperturas a readline."""
+    if not readline:
+        return
+    contenido = L._leer_texto(HIST, "")
+    for entrada in contenido.splitlines()[-2000:]:
+        if entrada:
+            readline.add_history(entrada)
+
+
+def guardar_historial():
+    """Persiste el historial mediante el reemplazo atómico de ``orqlib``."""
+    if not readline:
+        return
+    inicio = max(1, readline.get_current_history_length() - 1999)
+    entradas = [
+        readline.get_history_item(i) or ""
+        for i in range(inicio, readline.get_current_history_length() + 1)
+    ]
+    L._escribir_texto(HIST, "\n".join(entradas) + "\n")
 
 
 def limpiar_sesiones_viejas(dias=2):
-    """Borra conversaciones de ventanas que ya no existen."""
+    """Inutiliza conversaciones viejas sin borrar nombres sustituibles."""
     try:
         corte = time.time() - dias * 86400
-        for f in os.listdir(DIR_SES):
-            ruta = os.path.join(DIR_SES, f)
-            if os.path.getmtime(ruta) < corte:
-                os.remove(ruta)
+        with L._abrir_directorio_seguro(DIR_SES) as dir_fd:
+            with os.scandir(dir_fd) as entradas:
+                for entrada in entradas:
+                    estado = entrada.stat(follow_symlinks=False)
+                    if (stat.S_ISREG(estado.st_mode) and estado.st_mtime < corte):
+                        L._vaciar_regular_privado_at(
+                            dir_fd, entrada.name, estado
+                        )
     except OSError:
         pass
 
@@ -536,7 +646,7 @@ def memoria():
         if not ruta or os.path.islink(ruta):
             continue
         try:
-            with open(ruta) as archivo:
+            with L._abrir_regular(ruta, privado=True) as archivo:
                 txt = archivo.read().strip()
             if txt:
                 trozos.append((f[:-3], txt))
@@ -559,7 +669,7 @@ def ruta_memoria(nombre):
 
 
 def borrar_memoria(nombre):
-    """Borra solo una entrada regular que el propio directorio haya enumerado."""
+    """Vacía una nota enumerada sin borrar un inode sustituto por carrera."""
     original = str(nombre or "")
     componente = os.path.basename(original)
     if componente != original:
@@ -568,39 +678,58 @@ def borrar_memoria(nombre):
         componente = componente[:-3]
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", componente):
         return False
-    esperado = componente + ".md"
+    candidato = os.path.abspath(os.path.join(DIR_MEM, componente + ".md"))
+    prefijo = os.path.abspath(DIR_MEM).rstrip(os.sep) + os.sep
+    if not candidato.startswith(prefijo):
+        return False
+    solicitado = os.path.basename(candidato)
     try:
-        with os.scandir(DIR_MEM) as entradas:
-            for entrada in entradas:
-                if entrada.name != esperado or not entrada.is_file(follow_symlinks=False):
-                    continue
-                ruta = ruta_memoria(entrada.name)
-                if not ruta:
-                    return False
-                os.remove(ruta)
-                return True
+        with L._abrir_directorio_seguro(DIR_MEM) as dir_fd:
+            esperado = None
+            with os.scandir(dir_fd) as entradas:
+                for entrada in entradas:
+                    if entrada.name == solicitado:
+                        esperado = entrada.name
+                        estado = entrada.stat(follow_symlinks=False)
+                        break
+            if esperado is None:
+                return False
+            if not stat.S_ISREG(estado.st_mode):
+                return False
+            L._vaciar_regular_privado_at(dir_fd, esperado, estado)
+            return True
     except OSError:
         return False
-    return False
 
 
 def recordar(hecho):
-    os.makedirs(DIR_MEM, exist_ok=True)
-    slug = re.sub(r"[^a-z0-9]+", "-", hecho.lower())[:40].strip("-") or "nota"
-    ruta = os.path.join(DIR_MEM, f"{slug}.md")
-    n = 1
-    while os.path.exists(ruta):
-        ruta = os.path.join(DIR_MEM, f"{slug}-{n}.md"); n += 1
-    with open(ruta, "w") as f:
-        f.write(hecho.strip() + "\n")
-    return os.path.basename(ruta)
+    huella = hashlib.sha256(hecho.encode("utf-8")).hexdigest()[:20]
+    with L._abrir_directorio_seguro(DIR_MEM, crear=True) as dir_fd:
+        os.fchmod(dir_fd, 0o700)
+        for n in range(1000):
+            sufijo = "" if n == 0 else f"-{n}"
+            nombre = f"nota-{huella}{sufijo}.md"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                fd = os.open(nombre, flags, 0o600, dir_fd=dir_fd)
+            except FileExistsError:
+                continue
+            with os.fdopen(fd, "w") as f:
+                f.write(hecho.strip() + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.fsync(dir_fd)
+            return nombre
+    raise OSError("demasiadas colisiones al guardar memoria")
 
 
 def guardar_ctx(c):
     try:
-        os.makedirs(DIR_SES, exist_ok=True)
-        with open(CTX, "w") as f:
-            json.dump(c[-MAX_CTX:], f, ensure_ascii=False)
+        L._escribir(CTX, c[-MAX_CTX:])
     except OSError:
         pass
 
@@ -618,25 +747,19 @@ def guardar_parcial(pregunta, tarea, resultado):
         "ts": time.time(),
     }
     try:
-        os.makedirs(DIR_SES, exist_ok=True)
-        with open(CTX_PARCIAL, "w") as f:
-            json.dump(dato, f, ensure_ascii=False, indent=2)
+        L._escribir(CTX_PARCIAL, dato)
     except OSError:
         pass
 
 
 def cargar_parcial():
-    try:
-        with open(CTX_PARCIAL) as f:
-            dato = json.load(f)
-        return dato if isinstance(dato, dict) else None
-    except (OSError, ValueError):
-        return None
+    dato = L._leer(CTX_PARCIAL, None)
+    return dato if isinstance(dato, dict) else None
 
 
 def limpiar_parcial():
     try:
-        os.remove(CTX_PARCIAL)
+        L._eliminar_regular_privado(CTX_PARCIAL)
     except FileNotFoundError:
         pass
     except OSError:
@@ -905,14 +1028,12 @@ def _responder_sin_lock(pregunta, ctx, tarea, forzado, reanudar=None):
 
 def ejecutar_proyecto_chat(descripcion, ctx, preferir=None):
     """Delega un encargo amplio al flujo multi-IA con progreso visible."""
-    os.makedirs(DIR_SES, exist_ok=True)
     tmp = os.path.join(DIR_SES, f"{SESION}.ctx.txt")
     try:
-        with open(tmp, "w") as f:
-            f.write("\n".join(
-                f"{'Usuario' if t.get('rol') == 'u' else 'IA'}: {t.get('txt', '')[:700]}"
-                for t in ctx[-10:]
-            ))
+        L._escribir_texto(tmp, "\n".join(
+            f"{'Usuario' if t.get('rol') == 'u' else 'IA'}: {t.get('txt', '')[:700]}"
+            for t in ctx[-10:]
+        ))
     except OSError as e:
         print(f" {R}·{N} no pude preparar el contexto: {e}\n")
         return 1
@@ -955,20 +1076,27 @@ def ejecutar_imagen_chat(descripcion, perfil=None):
 
 def principal():
     global CARPETA
+    cwd_original = None
+    try:
+        cwd_original = os.open(
+            ".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+    except OSError:
+        pass
     if readline:
-        try:
-            readline.read_history_file(HIST)
-        except OSError:
-            pass
+        cargar_historial()
         readline.set_history_length(2000)
     limpiar_sesiones_viejas()
     logo()
     cabecera()
     ctx = cargar_ctx()
     try:
-        os.chdir(CARPETA)
+        inicial = L.cambiar_directorio_trabajo(CARPETA)
     except OSError:
-        pass
+        inicial = None
+    if inicial:
+        CARPETA = inicial
     tarea, forzado = None, os.environ.get("ORQ_CHAT_PERFIL") or None
     try:
         while True:
@@ -982,7 +1110,7 @@ def principal():
                 continue
             if readline:
                 try:
-                    readline.write_history_file(HIST)
+                    guardar_historial()
                 except OSError:
                     pass
 
@@ -996,10 +1124,14 @@ def principal():
                     print(AYUDA); continue
                 if cmd == "carpeta":
                     if arg:
-                        nueva = os.path.abspath(os.path.expanduser(arg))
-                        if os.path.isdir(nueva):
+                        nueva = L.ruta_trabajo_segura(arg)
+                        if nueva:
+                            try:
+                                nueva = L.cambiar_directorio_trabajo(nueva)
+                            except OSError:
+                                nueva = None
+                        if nueva:
                             CARPETA = nueva
-                            os.chdir(CARPETA)
                             guardar_carpeta()
                             ctx = []; guardar_ctx(ctx)
                             limpiar_parcial()
@@ -1009,7 +1141,8 @@ def principal():
                             print(f" {R}·{N} no existe: {nueva}\n")
                     else:
                         try:
-                            n = len(os.listdir(CARPETA))
+                            segura = L.ruta_trabajo_segura(CARPETA)
+                            n = len(os.listdir(segura)) if segura else "?"
                         except OSError:
                             n = "?"
                         print(f" {D}carpeta:{N} {CARPETA}  {D}({n} elementos){N}\n")
@@ -1055,8 +1188,7 @@ def principal():
                                           else "vuelve a elegir el router") + "\n")
                     continue
                 if cmd == "shell":
-                    if arg:
-                        subprocess.run(arg, shell=True)
+                    ejecutar_shell_seguro(arg)
                     print(); continue
                 if cmd == "proyecto":
                     if not arg:
@@ -1069,8 +1201,14 @@ def principal():
                     if not encargo:
                         print(f" {D}no hay un encargo anterior para continuar{N}\n"); continue
                     destino = parcial.get("carpeta")
-                    if destino and os.path.isdir(destino):
-                        CARPETA = os.path.abspath(destino); os.chdir(CARPETA); guardar_carpeta()
+                    destino = L.ruta_trabajo_segura(destino)
+                    if destino:
+                        try:
+                            destino = L.cambiar_directorio_trabajo(destino)
+                        except OSError:
+                            destino = None
+                    if destino:
+                        CARPETA = destino; guardar_carpeta()
                     instruccion = (encargo +
                                    "\n\nContinua exactamente desde donde quedaste. Primero "
                                    "audita y conserva los cambios parciales existentes; termina "
@@ -1116,9 +1254,14 @@ def principal():
             parcial_reintento = cargar_parcial() if _es_reintento(linea) else None
             if parcial_reintento and parcial_reintento.get("pregunta"):
                 destino = parcial_reintento.get("carpeta")
-                if destino and os.path.isdir(destino):
-                    CARPETA = os.path.abspath(destino)
-                    os.chdir(CARPETA)
+                destino = L.ruta_trabajo_segura(destino)
+                if destino:
+                    try:
+                        destino = L.cambiar_directorio_trabajo(destino)
+                    except OSError:
+                        destino = None
+                if destino:
+                    CARPETA = destino
                     guardar_carpeta()
                 operativa = (parcial_reintento["pregunta"] +
                               "\n\nContinua exactamente desde la sesion y los cambios "
@@ -1126,13 +1269,18 @@ def principal():
             else:
                 operativa = pregunta_operativa(linea, ctx)
             detectada = resolver_carpeta_mencionada(operativa, CARPETA)
-            if detectada and os.path.abspath(detectada) != CARPETA:
-                CARPETA = os.path.abspath(detectada)
-                os.chdir(CARPETA)
+            detectada = L.ruta_trabajo_segura(detectada)
+            if detectada and detectada != CARPETA:
+                try:
+                    detectada = L.cambiar_directorio_trabajo(detectada)
+                except OSError:
+                    detectada = None
+            if detectada and detectada != CARPETA:
+                CARPETA = detectada
                 guardar_carpeta()
                 print(f" {G}·{N} carpeta detectada: {CARPETA}\n")
             if detectada and es_navegacion_pura(operativa):
-                corta = CARPETA.replace(os.path.expanduser("~"), "~")
+                corta = CARPETA.replace(L.HOME_USUARIO, "~")
                 respuesta_local = f"Carpeta activa: {corta}"
                 print(f" {G}·{N} {respuesta_local}\n")
                 ctx.append({"rol": "u", "txt": linea})
@@ -1178,8 +1326,16 @@ def principal():
     finally:
         guardar_ctx(ctx)
         quitar_logo()
+        if cwd_original is not None:
+            try:
+                os.fchdir(cwd_original)
+            finally:
+                os.close(cwd_original)
         print(f" {D}hasta luego{N}\n")
 
 
 if __name__ == "__main__":
-    principal()
+    try:
+        principal()
+    except L.ErrorConfiguracion as exc:
+        raise SystemExit(f"configuracion rechazada: {exc}")

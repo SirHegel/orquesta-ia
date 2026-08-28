@@ -10,7 +10,9 @@ import unittest
 SHELL = pathlib.Path(__file__).resolve().parents[1] / "shell.sh"
 PROYECTO = SHELL.parent
 ARCHIVOS_INSTALACION = (
-    "orq", "orqlib.py", "orqroot.py", "shell.sh", "tools/minimax",
+    "orq", "orqchat.py", "orqlib.py", "orqroot.py", "orqenv.py", "orqlogin.py",
+    "orqrun.py",
+    "shell.sh", "tools/minimax",
 )
 
 
@@ -25,11 +27,22 @@ class ShellPortabilityTests(unittest.TestCase):
         (raiz / "profiles.json").write_text(
             json.dumps(perfiles), encoding="utf-8"
         )
+        (raiz / "profiles.json").chmod(0o600)
 
     def ejecutar(self, perfiles, script):
         with tempfile.TemporaryDirectory() as tmp:
             raiz = pathlib.Path(tmp) / "Orquesta Con Espacio"
             self.copiar_instalacion(raiz, {"profiles": perfiles})
+            # Los perfiles MiniMax de estas pruebas representan cuentas ya
+            # conectadas. La política productiva solo acepta el archivo
+            # dedicado ``<home>/api_key``.
+            for pid, perfil in perfiles.items():
+                if perfil.get("provider") != "minimax":
+                    continue
+                clave = raiz / "accounts" / pid / "api_key"
+                clave.parent.mkdir(parents=True, exist_ok=True)
+                clave.write_text("minimax-test-key", encoding="utf-8")
+                clave.chmod(0o600)
             config = pathlib.Path(tmp) / "config-vacio"
             config.mkdir()
             env = dict(os.environ)
@@ -51,21 +64,22 @@ class ShellPortabilityTests(unittest.TestCase):
             self.assertEqual(proceso.returncode, 0, proceso.stderr)
             return proceso.stdout, raiz
 
-    def test_home_relativo_y_ruta_del_clon_admiten_espacios(self):
+    def test_home_administrado_y_ruta_del_clon_admiten_espacios(self):
         salida, raiz = self.ejecutar(
             {"claude-prueba": {
-                "provider": "claude", "home": "accounts/Claude con espacio"
+                "provider": "claude", "home": "accounts/claude-prueba"
             }},
             'orquse claude-prueba >/dev/null; printf "RESULT=%s\\n" "$CLAUDE_CONFIG_DIR"',
         )
-        self.assertIn(f"RESULT={raiz / 'accounts' / 'Claude con espacio'}", salida)
+        self.assertIn(f"RESULT={raiz / 'accounts' / 'claude-prueba'}", salida)
 
     def test_cambiar_minimax_a_claude_limpia_endpoint_y_modelo(self):
         salida, _ = self.ejecutar(
             {
                 "minimax": {
                     "provider": "minimax", "home": "accounts/minimax",
-                    "base_url": "https://minimax.invalid", "model": "mm-test",
+                    "base_url": "https://api.minimax.io/anthropic",
+                    "model": "mm-test",
                 },
                 "claude-prueba": {
                     "provider": "claude", "home": "accounts/claude-prueba",
@@ -158,27 +172,43 @@ class ShellPortabilityTests(unittest.TestCase):
             base = pathlib.Path(tmp)
             raiz_a = base / "Instalacion A"
             raiz_b = base / "Instalacion B"
-            self.copiar_instalacion(raiz_a, {"profiles": {}})
-            self.copiar_instalacion(raiz_b, {"profiles": {}})
+            perfiles_a = {
+                "profiles": {
+                    "gpt-a": {
+                        "provider": "gpt", "home": "accounts/gpt-a",
+                    },
+                    "claude-a": {
+                        "provider": "claude", "home": "accounts/claude-a",
+                    },
+                },
+                "_activas": {"gpt": "gpt-a", "claude": "claude-a"},
+            }
+            perfiles_b = {
+                "profiles": {
+                    "claude-b": {
+                        "provider": "claude", "home": "accounts/claude-b",
+                    },
+                },
+                "_activas": {"claude": "claude-b"},
+            }
+            self.copiar_instalacion(raiz_a, perfiles_a)
+            self.copiar_instalacion(raiz_b, perfiles_b)
+            credenciales = (
+                raiz_a / "accounts" / "gpt-a" / "auth.json",
+                raiz_a / "accounts" / "claude-a" / ".credentials.json",
+                raiz_b / "accounts" / "claude-b" / ".credentials.json",
+            )
+            for credencial in credenciales:
+                credencial.parent.mkdir(parents=True, exist_ok=True)
+                credencial.write_text("{}", encoding="utf-8")
+                credencial.chmod(0o600)
             estado_a = raiz_a / "state" / "entorno.sh"
             estado_b = raiz_b / "state" / "entorno.sh"
             estado_a.parent.mkdir()
             estado_b.parent.mkdir()
-            estado_a.write_text(
-                f'export CODEX_HOME="{raiz_a / "accounts/gpt-a"}"\n'
-                f'export CLAUDE_CONFIG_DIR="{raiz_a / "accounts/claude-a"}"\n'
-                'export ORQ_GPT_CUENTA=cuenta-gpt-a\n'
-                'export ORQ_CLAUDE_CUENTA=cuenta-claude-a\n'
-                'export ORQ_PERMISOS_TOTALES=1\n',
-                encoding="utf-8",
-            )
+            estado_a.write_text("orquesta-entorno-v2\n", encoding="utf-8")
             # B omite GPT deliberadamente: sus variables de A deben desaparecer.
-            estado_b.write_text(
-                f'export CLAUDE_CONFIG_DIR="{raiz_b / "accounts/claude-b"}"\n'
-                'export ORQ_CLAUDE_CUENTA=cuenta-claude-b\n'
-                'export ORQ_PERMISOS_TOTALES=0\n',
-                encoding="utf-8",
-            )
+            estado_b.write_text("orquesta-entorno-v2\n", encoding="utf-8")
             mismo_mtime = 1_700_000_000
             os.utime(estado_a, (mismo_mtime, mismo_mtime))
             os.utime(estado_b, (mismo_mtime, mismo_mtime))
@@ -211,7 +241,7 @@ class ShellPortabilityTests(unittest.TestCase):
             self.assertEqual(proceso.returncode, 0, proceso.stderr)
             self.assertIn(
                 f"RESULT={raiz_b}|unset|unset|"
-                f"{raiz_b / 'accounts/claude-b'}|cuenta-claude-b|unset|unset",
+                f"{raiz_b / 'accounts/claude-b'}|claude-b|unset|unset",
                 proceso.stdout,
             )
 
@@ -234,6 +264,8 @@ class ShellPortabilityTests(unittest.TestCase):
                 "ORQ_AUTO_CHAT=0\nORQ_PERMISOS_TOTALES=0\n",
                 encoding="utf-8",
             )
+            (config_a / "shell.local.sh").chmod(0o600)
+            (config_b / "shell.local.sh").chmod(0o600)
             home = base / "home"
             home.mkdir()
             binarios = base / "bin-falso"
@@ -283,19 +315,19 @@ class ShellPortabilityTests(unittest.TestCase):
             base = pathlib.Path(tmp)
             raiz_a = base / "Minimax A con espacios"
             raiz_b = base / "Minimax B con espacios"
-            key_a = raiz_a / "accounts" / "mm-a" / "key"
-            key_b = raiz_b / "accounts" / "mm-b" / "key"
+            key_a = raiz_a / "accounts" / "mm-a" / "api_key"
+            key_b = raiz_b / "accounts" / "mm-b" / "api_key"
             perfiles_a = {
                 "profiles": {"mm-a": {
                     "provider": "minimax", "home": "accounts/mm-a",
-                    "api_key_file": str(key_a),
+                    "api_key_file": "api_key",
                 }},
                 "_activas": {"minimax": "mm-a"},
             }
             perfiles_b = {
                 "profiles": {"mm-b": {
                     "provider": "minimax", "home": "accounts/mm-b",
-                    "api_key_file": str(key_b),
+                    "api_key_file": "api_key",
                 }},
                 "_activas": {"minimax": "mm-b"},
             }
@@ -304,6 +336,7 @@ class ShellPortabilityTests(unittest.TestCase):
             for ruta in (key_a, key_b):
                 ruta.parent.mkdir(parents=True)
                 ruta.write_text("valor-prueba", encoding="utf-8")
+                ruta.chmod(0o600)
 
             bin_dir = base / "bin falso con espacios"
             bin_dir.mkdir()
@@ -327,18 +360,15 @@ class ShellPortabilityTests(unittest.TestCase):
             })
             proceso = subprocess.run(
                 ["bash", "--noprofile", "--norc", "-ic",
-                 f'. "{raiz_a / "shell.sh"}"; minimax -p prueba'],
+                 f'. "{raiz_a / "shell.sh"}"; minimax --cuenta mm-b -p prueba'],
                 env=env, capture_output=True, text=True, timeout=15,
             )
 
-            self.assertEqual(proceso.returncode, 0, proceso.stderr)
-            self.assertIn(
-                f"RESULT={raiz_a}|{raiz_a / 'accounts' / 'mm-a'}",
-                proceso.stdout,
-            )
-            self.assertNotIn(
-                str(raiz_b / "accounts" / "mm-b"), proceso.stdout
-            )
+            # A no conoce mm-b; llegar a este error demuestra que la función
+            # fijada por shell.sh ejecutó el wrapper de A y no el symlink de B.
+            self.assertNotEqual(proceso.returncode, 0)
+            self.assertIn("cuenta MiniMax desconocida: mm-b", proceso.stderr)
+            self.assertNotIn("RESULT=", proceso.stdout)
 
     def test_orq_home_invalido_falla_sin_usar_la_copia_del_binario(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -390,6 +420,7 @@ class ShellPortabilityTests(unittest.TestCase):
                 'ORQ_AUTO_CHAT=0\n',
                 encoding="utf-8",
             )
+            (config / "shell.local.sh").chmod(0o600)
             env = dict(os.environ)
             env.update({
                 "ORQ_HOME": str(raiz_b),
@@ -483,6 +514,174 @@ class ShellPortabilityTests(unittest.TestCase):
 
             self.assertNotEqual(proceso.returncode, 0)
             self.assertIn("orq debe ser un archivo regular exacto", proceso.stderr)
+
+    def test_shell_local_es_trust_anchor_pero_rechaza_modo_escribible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            raiz = base / "Instalacion"
+            self.copiar_instalacion(raiz, {"profiles": {}})
+            config = base / "config" / "orquesta"
+            config.mkdir(parents=True)
+            local = config / "shell.local.sh"
+            local.write_text("ORQ_INYECTADA=si\nORQ_AUTO_CHAT=1\n", encoding="utf-8")
+            local.chmod(0o664)
+            env = dict(os.environ)
+            env.update({
+                "ORQ_AUTO_CHAT": "0", "XDG_CONFIG_HOME": str(config.parent),
+                "TERM": "xterm-256color",
+            })
+            proceso = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-ic",
+                 f'. "{raiz / "shell.sh"}"; '
+                 'printf "RESULT=%s\\n" "${ORQ_INYECTADA-unset}"'],
+                env=env, capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(proceso.returncode, 0, proceso.stderr)
+            self.assertIn("RESULT=unset", proceso.stdout)
+            self.assertIn("shell.local.sh inseguro", proceso.stderr)
+
+    def test_shell_local_fifo_falla_rapido_y_no_evalua_salida(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            raiz = base / "Instalacion"
+            self.copiar_instalacion(raiz, {"profiles": {}})
+            config = base / "config" / "orquesta"
+            config.mkdir(parents=True)
+            local = config / "shell.local.sh"
+            os.mkfifo(local, 0o600)
+            marca = base / "config-ejecutada"
+            env = dict(os.environ)
+            env.update({
+                "ORQ_AUTO_CHAT": "0", "XDG_CONFIG_HOME": str(config.parent),
+                "TERM": "xterm-256color",
+            })
+
+            inicio = __import__("time").monotonic()
+            proceso = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-ic",
+                 f'. "{raiz / "shell.sh"}"; '
+                 f'test ! -e "{marca}"; printf "RESULT=ok\\n"'],
+                env=env, capture_output=True, text=True, timeout=5,
+            )
+
+            self.assertLess(__import__("time").monotonic() - inicio, 4)
+            self.assertEqual(proceso.returncode, 0, proceso.stderr)
+            self.assertIn("RESULT=ok", proceso.stdout)
+            self.assertFalse(marca.exists())
+            self.assertIn("shell.local.sh inseguro", proceso.stderr)
+
+    def test_path_heredado_no_suplanta_utilidades_del_arranque(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            raiz = base / "Instalacion"
+            self.copiar_instalacion(raiz, {"profiles": {}})
+            estado = raiz / "state" / "entorno.sh"
+            estado.parent.mkdir()
+            estado.write_text("orquesta-entorno-v2\n", encoding="utf-8")
+            falsos = base / "bin-falso"
+            falsos.mkdir()
+            marca = base / "utilidad-ejecutada"
+            for nombre in ("python3", "date", "ps", "stat", "sed", "tr"):
+                ruta = falsos / nombre
+                ruta.write_text(
+                    f"#!/bin/sh\ntouch '{marca}'\nexit 99\n", encoding="utf-8"
+                )
+                ruta.chmod(0o755)
+            config = base / "config"
+            config.mkdir()
+            env = dict(os.environ)
+            env.pop("ORQ_SESION", None)
+            env.update({
+                "ORQ_AUTO_CHAT": "0", "XDG_CONFIG_HOME": str(config),
+                "TERM": "xterm-256color", "PATH": f"{falsos}:/usr/bin:/bin",
+            })
+            proceso = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-ic",
+                 f'. "{raiz / "shell.sh"}"; printf "RESULT=ok\\n"'],
+                env=env, capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(proceso.returncode, 0, proceso.stderr)
+            self.assertIn("RESULT=ok", proceso.stdout)
+            self.assertFalse(marca.exists())
+
+    def test_entrypoints_reales_no_usan_python_del_path_heredado(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            raiz = base / "Instalacion"
+            self.copiar_instalacion(raiz, {"profiles": {}})
+            falsos = base / "bin-falso"
+            falsos.mkdir()
+            marca = base / "python-falso-ejecutado"
+            python_falso = falsos / "python3"
+            python_falso.write_text(
+                f"#!/bin/sh\ntouch '{marca}'\nexit 97\n", encoding="utf-8"
+            )
+            python_falso.chmod(0o755)
+            config = base / "config-vacio"
+            config.mkdir()
+            env = dict(os.environ)
+            env.update({
+                "ORQ_HOME": str(raiz), "ORQ_AUTO_CHAT": "0",
+                "XDG_CONFIG_HOME": str(config), "TERM": "xterm-256color",
+                "PATH": f"{falsos}:/usr/bin:/bin",
+            })
+
+            cli = subprocess.run(
+                [str(raiz / "orq"), "--help"], env=env,
+                capture_output=True, text=True, timeout=10,
+            )
+            chat = subprocess.run(
+                [str(raiz / "orqchat.py")], env=env, input="/salir\n",
+                capture_output=True, text=True, timeout=10,
+            )
+
+            self.assertEqual(cli.returncode, 0, cli.stderr)
+            self.assertEqual(chat.returncode, 0, chat.stderr)
+            self.assertFalse(marca.exists())
+
+    def test_cuentas_activas_eliminan_credenciales_heredadas_conflictivas(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = pathlib.Path(tmp)
+            raiz = base / "Instalacion"
+            perfiles = {
+                "profiles": {
+                    "claude-a": {
+                        "provider": "claude", "home": "accounts/claude-a",
+                    },
+                    "gpt-a": {"provider": "gpt", "home": "accounts/gpt-a"},
+                },
+                "_activas": {"claude": "claude-a", "gpt": "gpt-a"},
+            }
+            self.copiar_instalacion(raiz, perfiles)
+            credenciales = (
+                raiz / "accounts" / "claude-a" / ".credentials.json",
+                raiz / "accounts" / "gpt-a" / "auth.json",
+            )
+            for credencial in credenciales:
+                credencial.parent.mkdir(parents=True, exist_ok=True)
+                credencial.write_text("{}", encoding="utf-8")
+                credencial.chmod(0o600)
+            estado = raiz / "state" / "entorno.sh"
+            estado.parent.mkdir()
+            estado.write_text("orquesta-entorno-v2\n", encoding="utf-8")
+            config = base / "config"
+            config.mkdir()
+            env = dict(os.environ)
+            env.update({
+                "ORQ_AUTO_CHAT": "0", "XDG_CONFIG_HOME": str(config),
+                "TERM": "xterm-256color", "ANTHROPIC_API_KEY": "no-heredar",
+                "OPENAI_API_KEY": "no-heredar", "GEMINI_API_KEY": "conservar",
+            })
+            proceso = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-ic",
+                 f'. "{raiz / "shell.sh"}"; '
+                 'printf "RESULT=%s|%s|%s|%s|%s\\n" '
+                 '"${ANTHROPIC_API_KEY-unset}" "${OPENAI_API_KEY-unset}" '
+                 '"$GEMINI_API_KEY" "$ORQ_CLAUDE_CUENTA" "$ORQ_GPT_CUENTA"'],
+                env=env, capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(proceso.returncode, 0, proceso.stderr)
+            self.assertIn("RESULT=unset|unset|conservar|claude-a|gpt-a", proceso.stdout)
 
 
 if __name__ == "__main__":

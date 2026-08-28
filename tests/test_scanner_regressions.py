@@ -95,11 +95,38 @@ class ScannerStagedTests(unittest.TestCase):
         self.git("add", "-A")
         self.assertEqual(self.scan().returncode, 1)
 
-    def test_indice_ilegible_falla_cerrado(self):
+    def test_git_index_file_heredado_no_contamina_el_scanner(self):
         entorno = dict(os.environ)
         entorno["GIT_INDEX_FILE"] = "/dev/null"
         resultado = self.scan(entorno)
+        self.assertEqual(resultado.returncode, 0)
+
+    def test_indice_real_corrupto_falla_cerrado(self):
+        (self.repo / ".git" / "index").write_bytes(b"indice-corrupto")
+        resultado = self.scan()
         self.assertEqual(resultado.returncode, 2)
+
+    def test_fsmonitor_local_no_se_ejecuta(self):
+        marca = self.repo / "fsmonitor-ejecutado"
+        hook = self.repo / "fsmonitor"
+        hook.write_text(f"#!/bin/sh\ntouch {marca}\n", encoding="utf-8")
+        hook.chmod(0o700)
+        self.git("config", "core.fsmonitor", str(hook))
+
+        resultado = self.scan_args("--todo", "--repo", str(self.repo))
+
+        self.assertEqual(resultado.returncode, 0, resultado.stdout + resultado.stderr)
+        self.assertFalse(marca.exists())
+
+    def test_nombre_hostil_no_inyecta_controles_en_salida(self):
+        patron_prueba = "github_" + "pat_" + "E" * 32
+        ruta = self.repo / "malo\x1b]52;c;ataque\x07.env"
+        ruta.write_text(patron_prueba + "\n", encoding="utf-8")
+        self.git("add", ruta.name)
+        resultado = self.scan()
+        self.assertEqual(resultado.returncode, 1)
+        self.assertNotIn("\x1b]52", resultado.stdout + resultado.stderr)
+        self.assertNotIn(patron_prueba, resultado.stdout + resultado.stderr)
 
     def test_todo_incluye_archivos_no_trackeados_y_commit_revisa_su_arbol(self):
         patron_prueba = "CLIENT_" + "SECRET=" + "D" * 32
@@ -118,6 +145,24 @@ class ScannerStagedTests(unittest.TestCase):
         historico = self.scan_args("--commit", commit, "--repo", str(self.repo))
         self.assertEqual(historico.returncode, 1)
         self.assertNotIn(patron_prueba, historico.stdout + historico.stderr)
+
+    def test_commit_revisa_mensaje_sin_mostrar_el_marcador(self):
+        prefijo = "".join(chr(x) for x in (
+            67, 76, 73, 69, 78, 84, 95, 83, 69, 67, 82, 69, 84, 61,
+        ))
+        marcador_mensaje = prefijo + "M" * 32
+        self.git("commit", "--allow-empty", "-qm", marcador_mensaje)
+        commit = self.git("rev-parse", "HEAD").stdout.strip()
+
+        resultado = self.scan_args(
+            "--commit", commit, "--repo", str(self.repo)
+        )
+
+        self.assertEqual(resultado.returncode, 1)
+        self.assertIn("metadata del commit", resultado.stdout + resultado.stderr)
+        self.assertNotIn(
+            marcador_mensaje, resultado.stdout + resultado.stderr
+        )
 
 
 if __name__ == "__main__":

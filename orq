@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """orq — orquestador multi-cuenta de IA. Compartido entre todas las terminales."""
 import argparse, json, os, re, sys, subprocess, time, datetime, shutil, threading
 from concurrent.futures import ThreadPoolExecutor
@@ -122,8 +122,12 @@ def cmd_cuenta_add(a):
                 p.get("provider") == "antigravity" for k, p in ps.items()
                 if k != a.id)):
             print(c("red", "Antigravity usa una sesion global; ya existe un perfil")); sys.exit(1)
-        home = L.home_de(a.id, {"home": a.home} if a.home else {})
-        os.makedirs(home, exist_ok=True); os.chmod(home, 0o700)
+        perfil_home = {"provider": a.provider}
+        if a.home:
+            perfil_home["home"] = a.home
+        home = L.home_de(a.id, perfil_home)
+        with L._abrir_directorio_seguro(home, crear=True) as home_fd:
+            os.fchmod(home_fd, 0o700)
         ps[a.id] = {"label": a.label or f"{a.provider} · {a.id}",
                     "provider": a.provider, "home": home,
                     "plan": a.plan, "ventana_horas": a.ventana,
@@ -132,7 +136,7 @@ def cmd_cuenta_add(a):
                     "weights": dict(PESOS_BASE)}
         if a.provider == "minimax":
             ps[a.id]["auth"] = "apikey"
-            ps[a.id]["api_key_file"] = os.path.join(home, "api_key")
+            ps[a.id]["api_key_file"] = "api_key"
             ps[a.id].setdefault("base_url", L.MINIMAX_BASE_URL)
         if a.provider == "antigravity":
             ps[a.id]["allowed_tasks"] = ["imagen"]
@@ -160,41 +164,46 @@ def cmd_cuenta_key(a):
     pr = ps.get(a.id)
     if not pr:
         print(c("red", "cuenta desconocida")); sys.exit(1)
-    h = L.home_de(a.id, pr)
-    os.makedirs(h, exist_ok=True); os.chmod(h, 0o700)
-    destino = os.path.expanduser(pr.get("api_key_file") or os.path.join(h, "api_key"))
-    destino = L.ruta_contenida(h, destino)
-    if not destino:
-        print(c("red", "api_key_file debe permanecer dentro del directorio privado de la cuenta"))
-        sys.exit(1)
     print(c("d", "pega la API key y dale Enter (no se muestra en pantalla):"))
     import getpass
     try:
         k = getpass.getpass("  key> ").strip()
     except (EOFError, KeyboardInterrupt):
         print("\n" + c("y", "cancelado")); sys.exit(1)
-    if len(k) < 20:
-        print(c("red", "esa clave parece demasiado corta; no la guardo")); sys.exit(1)
-    fd = os.open(destino, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(k)
+    try:
+        L.guardar_api_key(a.id, pr, k)
+    except (ValueError, OSError):
+        print(c("red", "no pude guardar una clave valida de forma segura")); sys.exit(1)
+    if L.ruta_api_key(a.id, pr) is None:
+        print(c("red", "ruta privada de la clave invalida")); sys.exit(1)
     with L.bloqueo():
         cf = L.cfg(); cf["profiles"][a.id]["auth"] = "apikey"
-        cf["profiles"][a.id]["api_key_file"] = destino
+        cf["profiles"][a.id]["api_key_file"] = "api_key"
         L.guardar_cfg(cf)
-    print(c("g", f"guardada en {destino} (modo 600, fuera de git)"))
+    print(c("g", "clave guardada en su archivo privado (modo 600, fuera de git)"))
     print(c("d", "compruébala con:  orq verificar --id " + a.id))
 
 def cmd_cuenta_rm(a):
     with L.bloqueo():
-        cf = L.cfg()
-        p = cf.get("profiles", {}).pop(a.id, None)
+        cf = L.cfg(); p = cf.get("profiles", {}).get(a.id)
         if not p: print(c("red","cuenta desconocida")); sys.exit(1)
+        try:
+            h = L.home_de(a.id, p)
+            purgable = L.home_purgable(a.id, p) if a.purge else None
+        except ValueError:
+            print(c("red", "perfil con home inseguro; no se modifico el registro")); sys.exit(1)
+        cf["profiles"].pop(a.id)
+        for prov, pid_activo in list(cf.get("_activas", {}).items()):
+            if pid_activo == a.id:
+                cf["_activas"].pop(prov)
         L.guardar_cfg(cf)
+    L.escribir_entorno()
     print(c("g", f"'{a.id}' eliminada del registro"))
-    h = L.home_de(a.id, p)
-    if a.purge and L.home_purgable(a.id, p):
-        shutil.rmtree(h, ignore_errors=True); print(c("y", f"credenciales borradas: {h}"))
+    if purgable and L.purgar_home_cuenta(a.id, p):
+        print(c("y", f"credenciales borradas: {purgable}"))
+    elif purgable:
+        print(c("red", "purga rechazada durante la revalidacion segura"))
+        print(c("d", f"credenciales conservadas en {h}"))
     elif a.purge:
         print(c("red", "purga rechazada: la ruta no es el directorio privado directo de esa cuenta"))
         print(c("d", f"credenciales conservadas en {h}"))
@@ -206,6 +215,7 @@ def cmd_cuenta_toggle(a):
         cf = L.cfg(); p = cf.get("profiles", {}).get(a.id)
         if not p: print(c("red","cuenta desconocida")); sys.exit(1)
         p["enabled"] = (a.c == "enable"); L.guardar_cfg(cf)
+    L.escribir_entorno()
     print(c("g", f"'{a.id}' {'activada' if a.c=='enable' else 'desactivada'}"))
 
 # ---------- estado / auditoria de gasto ----------
@@ -303,11 +313,20 @@ def _elegir(a):
     if not rk: print(c("red","ninguna cuenta disponible (¿todas con limite?)  orq limites")); sys.exit(1)
     return rk[0]["pid"], rk[0]["p"]
 
+
+def _ruta_trabajo_cli(valor, crear=False):
+    """Resuelve una capacidad de cwd o termina antes de invocar un proveedor."""
+    segura = L.preparar_ruta_trabajo(valor or os.getcwd(), crear=crear)
+    if not segura:
+        print(c("red", "carpeta fuera de las areas de trabajo autorizadas"))
+        sys.exit(1)
+    return segura
+
 def cmd_ask(a):
     pid, p = _elegir(a)
     print(c("d", f"-> {pid} · {p.get('label',pid)}\n"))
     prompt = a.prompt + (BREVE if getattr(a, "corto", False) else "")
-    carpeta = os.path.abspath(os.path.expanduser(a.en or os.getcwd()))
+    carpeta = _ruta_trabajo_cli(a.en)
     if a.tarea in {"reasoning", "research"}:
         r = L.correr(pid, p, prompt, a.tarea, a.timeout, carpeta=carpeta,
                      solo_lectura=True)
@@ -321,9 +340,9 @@ def cmd_ask(a):
         print("\n".join(partes[:lim]))
         print(c("d", f"  … {len(partes) - lim} lineas mas. Completo en:  "
                     f"orq ver {r['run_id']}"))
-        os.makedirs(os.path.join(L.BASE, "state", "salidas"), exist_ok=True)
-        with open(os.path.join(L.BASE, "state", "salidas", r["run_id"] + ".txt"), "w") as f:
-            f.write(txt)
+        L._escribir_texto(
+            os.path.join(L.BASE, "state", "salidas", r["run_id"] + ".txt"), txt
+        )
     else:
         print(txt)
     extra = c("red", f" LIMITE hasta {r['limitado']}") if r["limitado"] else ""
@@ -452,7 +471,7 @@ def cmd_imagen(a):
     else:
         print("\n  " + c("red", "ninguna cuenta sabe generar imagenes"))
         print("  " + c("d", "hoy solo el proveedor 'antigravity' puede") + "\n"); sys.exit(1)
-    destino = os.path.abspath(os.path.expanduser(a.en or os.getcwd()))
+    destino = _ruta_trabajo_cli(a.en, crear=True)
     print(c("d", f"-> {pid} · generando en {destino}\n"))
     nombre = a.nombre or "imagen"
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", nombre):
@@ -487,10 +506,11 @@ def cmd_ver(a):
     if nombre_run != a.run_id or not L.run_id_valido(nombre_run):
         print(c("red", "run_id invalido")); sys.exit(1)
     f = os.path.join(L.BASE, "state", "salidas", nombre_run + ".txt")
-    if not os.path.exists(f):
-        print(c("red", "no hay salida guardada para ese run_id")); sys.exit(1)
-    with open(f) as archivo:
-        print(archivo.read())
+    try:
+        with L._abrir_regular(f, privado=True) as archivo:
+            print(archivo.read())
+    except (OSError, UnicodeError):
+        print(c("red", "no hay salida privada segura para ese run_id")); sys.exit(1)
 
 def cmd_permisos(a):
     with L.bloqueo():
@@ -508,7 +528,7 @@ def cmd_permisos(a):
     print("  " + c("d", "cambia con:  orq permisos on|off") + "\n")
 
 def cmd_proyecto(a):
-    carpeta = os.path.abspath(os.path.expanduser(a.en or os.getcwd()))
+    carpeta = _ruta_trabajo_cli(a.en, crear=True)
     with L.bloqueo_proyecto(carpeta):
         return _cmd_proyecto_bloqueado(a, carpeta)
 
@@ -516,11 +536,14 @@ def cmd_proyecto(a):
 def _cmd_proyecto_bloqueado(a, carpeta):
     preferir = getattr(a, "preferir", None)
     ctx_term = ""
-    if getattr(a, "contexto", None) and os.path.exists(a.contexto):
-        try:
-            ctx_term = open(a.contexto).read()[:4000]
-        except OSError:
-            pass
+    if getattr(a, "contexto", None):
+        ruta_ctx = None
+        for raiz_ctx in (carpeta, os.path.join(L.BASE, "state", "sesiones")):
+            ruta_ctx = L._ruta_sin_enlaces(raiz_ctx, a.contexto)
+            if ruta_ctx:
+                break
+        if ruta_ctx:
+            ctx_term = (L._leer_texto(ruta_ctx, "") or "")[:4000]
     print("\n  " + c("b", "PROYECTO") + "  " + c("d", carpeta))
     print("  " + c("d", a.prompt[:150]) + "\n")
 
@@ -630,8 +653,16 @@ def _cmd_proyecto_bloqueado(a, carpeta):
                         "tokens": 0, "seg": 0, "rc": 127,
                         "texto": "no habia una cuenta disponible para integrar"})
 
+    publicar = getattr(a, "publicar", None)
+    if publicar is None:
+        publicar = bool(L.cfg().get("_publicar_github", False))
+    mensaje_publicacion = f"feat: completar {plan.get('nombre') or 'proyecto'}"
+
     # Namespace antiguos/embebidos no conocian esta fase: solo se activa
     # cuando el parser actual aporta explicitamente sin_verificar=False.
+    identidad_verificada = None
+    identidad_repo_verificada = None
+    snapshot_verificado = None
     if not getattr(a, "sin_verificar", True):
         rondas = max(1, min(5, int(getattr(a, "rondas", 3))))
         for ronda in range(1, rondas + 1):
@@ -639,7 +670,8 @@ def _cmd_proyecto_bloqueado(a, carpeta):
                   + c("d", " · pruebas reales y revision independiente…"), flush=True)
             with Pulso("verificacion"):
                 ver = L.verificar_proyecto(
-                    plan, carpeta, res, a.timeout, preferir=preferir
+                    plan, carpeta, res, a.timeout, preferir=preferir,
+                    mensaje_snapshot=(mensaje_publicacion if publicar else None),
                 )
             verificable = bool(ver and ver.get("verificacion_ok"))
             comprobaciones = (ver or {}).get("comprobaciones") or []
@@ -648,6 +680,9 @@ def _cmd_proyecto_bloqueado(a, carpeta):
                 print(f"  {marca} {str(prueba.get('comando', 'comprobacion'))[:72]}"
                       + c("d", f" · rc={prueba.get('rc')}"))
             if verificable:
+                identidad_verificada = ver.get("cwd_identidad")
+                identidad_repo_verificada = ver.get("repo_identidad")
+                snapshot_verificado = ver.get("snapshot_verificado")
                 res.append({
                     "titulo": "verificacion final", "perfil": ver.get("perfil", "verificador"),
                     "tokens": ver.get("tokens", 0), "seg": ver.get("seg", 0), "rc": 0,
@@ -707,9 +742,6 @@ def _cmd_proyecto_bloqueado(a, carpeta):
     # Publicar es una politica local opt-in. Nunca se hace si alguna fase
     # fallo o si se omitio/no supero la verificacion independiente.
     fallos = [r for r in res if r.get("rc") != 0 and not r.get("relevado")]
-    publicar = getattr(a, "publicar", None)
-    if publicar is None:
-        publicar = bool(L.cfg().get("_publicar_github", False))
     if publicar and not fallos:
         verificada = any(
             r.get("titulo") == "verificacion final" and r.get("rc") == 0
@@ -724,7 +756,10 @@ def _cmd_proyecto_bloqueado(a, carpeta):
                   + c("d", " · escaneo total, commit y push sin secretos…"), flush=True)
             publicado = L.publicar_repo(
                 carpeta,
-                mensaje=f"feat: completar {plan.get('nombre') or 'proyecto'}",
+                mensaje=mensaje_publicacion,
+                identidad_esperada=identidad_verificada,
+                identidad_repo_esperada=identidad_repo_verificada,
+                snapshot_esperado=snapshot_verificado,
             )
             res.append({"titulo": "publicacion segura", "perfil": "git",
                         "tokens": 0, "seg": 0,
@@ -763,7 +798,7 @@ def _cmd_proyecto_bloqueado(a, carpeta):
 
 
 def cmd_publicar(a):
-    carpeta = os.path.abspath(os.path.expanduser(a.en or os.getcwd()))
+    carpeta = _ruta_trabajo_cli(a.en)
     print("\n  " + c("b", "PUBLICACION SEGURA") + c("d", f"  ·  {carpeta}"))
     resultado = L.publicar_repo(carpeta, mensaje=a.mensaje)
     if resultado.get("ok"):
@@ -904,10 +939,13 @@ def cmd_budget(a): _set(a, "budget_tokens_dia", a.tokens)
 def cmd_cupo(a):   _set(a, "cupo_ventana", a.tokens)
 
 def cmd_chat(a):
-    os.execv(sys.executable, [sys.executable, os.path.join(L.BASE, "orqchat.py")])
+    os.execv("/usr/bin/python3", ["/usr/bin/python3", "-I",
+                                  os.path.join(L.BASE, "orqchat.py")])
 
 def cmd_web(a):
-    os.execv(sys.executable, [sys.executable, os.path.join(L.BASE,"orqweb.py"), str(a.puerto)])
+    os.execv("/usr/bin/python3", ["/usr/bin/python3", "-I",
+                                  os.path.join(L.BASE, "orqweb.py"),
+                                  str(a.puerto)])
 
 def main():
     ap = argparse.ArgumentParser(prog="orq", description="Orquestador multi-cuenta de IA")
@@ -1028,4 +1066,8 @@ def main():
     a = ap.parse_args(); a.f(a)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except L.ErrorConfiguracion as exc:
+        print(c("red", f"configuracion rechazada: {exc}"), file=sys.stderr)
+        raise SystemExit(2)

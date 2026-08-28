@@ -1,0 +1,46 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Compile Python entrypoints
+        run: >-
+          python -m py_compile
+          orq orqchat.py orqenv.py orqlib.py orqlogin.py orqroot.py orqrun.py orquesta-app.py
+          tools/minimax
+
+      - name: Validate shell entrypoints
+        run: bash -n shell.sh tools/scan-secretos.sh tools/git-hooks/pre-push
+
+      - name: Scan the complete worktree
+        run: tools/scan-secretos.sh --todo
+
+      - name: Run the complete test suite
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m unittest discover -s tests -v

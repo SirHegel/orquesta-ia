@@ -1,38 +1,115 @@
-#!/usr/bin/env bash
-# Gate heredado por todos los proveedores que lanza Orquesta.
+#!/usr/bin/bash
+# Gate heredado por los proveedores que lanza Orquesta.
 # Git entrega por stdin: <ref local> <sha local> <ref remoto> <sha remoto>.
 set -uo pipefail
 
-ORQ_RAIZ=${ORQ_HOME:-$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)}
-SCANNER="$ORQ_RAIZ/tools/scan-secretos.sh"
-[ -x "$SCANNER" ] || {
-  echo "BLOQUEADO: falta el escaner de secretos de Orquesta" >&2
+PATH=/usr/bin:/bin
+export PATH
+GIT_SEGURO=(
+  /usr/bin/git --no-pager --no-replace-objects
+  -c core.hooksPath=/dev/null
+  -c core.fsmonitor=false
+  -c core.untrackedCache=false
+  -c core.commitGraph=false
+  -c fetch.writeCommitGraph=false
+  -c credential.helper=
+  -c protocol.ext.allow=never
+  -c advice.graftFileDeprecated=false
+)
+git_seguro() {
+  env -i HOME=/nonexistent PATH=/usr/bin:/bin LC_ALL=C.UTF-8 \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_NO_LAZY_FETCH=1 \
+    GIT_SHALLOW_FILE=/dev/null GIT_GRAFT_FILE=/dev/null \
+    "${GIT_SEGURO[@]}" "$@"
+}
+bloquear() {
+  echo "BLOQUEADO: $1" >&2
   exit 2
 }
-REPO=$(git rev-parse --show-toplevel 2>/dev/null) || {
-  echo "BLOQUEADO: no pude resolver el repositorio" >&2
-  exit 2
+oid_valido() {
+  [[ "$1" =~ ^[0-9a-f]{40}$ || "$1" =~ ^[0-9a-f]{64}$ ]]
 }
-CERO=0000000000000000000000000000000000000000
-REVISADOS=""
+oid_cero() {
+  [[ "$1" =~ ^0{40}$ || "$1" =~ ^0{64}$ ]]
+}
+head_remota_valida() {
+  local ref=$1 rama parte
+  [[ "$ref" == refs/heads/* ]] || return 1
+  rama=${ref#refs/heads/}
+  [[ "$rama" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$ ]] || return 1
+  [[ "$rama" != *..* && "$rama" != *//* && "$rama" != *@\{* \
+    && "$rama" != *. && "$rama" != */ && "$rama" != *.lock ]] || return 1
+  IFS=/ read -r -a partes <<<"$rama"
+  for parte in "${partes[@]}"; do
+    [[ -n "$parte" && "$parte" != .* && "$parte" != *.lock ]] || return 1
+  done
+}
 
+ORQ_RAIZ=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P) \
+  || bloquear "no pude resolver la instalacion del hook"
+SCANNER="$ORQ_RAIZ/tools/scan-secretos.sh"
+[ -x "$SCANNER" ] || bloquear "falta el escaner de secretos de Orquesta"
+REPO=$(git_seguro rev-parse --show-toplevel 2>/dev/null) \
+  || bloquear "no pude resolver el repositorio"
+cd "$REPO" || bloquear "no pude adquirir el repositorio"
+
+# Un archivo .git (linked worktree), enlaces o topologías alternativas quedan
+# fuera de la capacidad simple del hook. La publicación robusta debe hacerse
+# desde el checkout principal mediante Orquesta.
+[ -d .git ] && [ ! -L .git ] \
+  || bloquear "el hook no admite linked worktrees ni metadata Git enlazada"
+for metadata in .git/shallow .git/info/grafts; do
+  if [ -e "$metadata" ] || [ -L "$metadata" ]; then
+    bloquear "historial shallow/grafts no verificable"
+  fi
+done
+
+LISTA=$(/usr/bin/mktemp) || bloquear "no pude reservar la lista de commits"
+trap '/usr/bin/rm -f -- "$LISTA"' EXIT
+TOTAL=0
+REFS=0
 while read -r _ref_local sha_local _ref_remota sha_remota; do
   [ -n "${sha_local:-}" ] || continue
-  [ "$sha_local" = "$CERO" ] && continue
-  if [ "$sha_remota" = "$CERO" ]; then
-    COMMITS=$(git rev-list "$sha_local" --not --remotes 2>/dev/null) || exit 2
-    [ -n "$COMMITS" ] || COMMITS="$sha_local"
+  REFS=$((REFS + 1))
+  [ "$REFS" -le 1000 ] || bloquear "demasiadas refs en un solo push"
+  oid_valido "$sha_local" || bloquear "OID local invalido"
+  oid_valido "$sha_remota" || bloquear "OID remoto invalido"
+  # Las eliminaciones no introducen objetos nuevos y conservan su contrato
+  # previo. Cualquier actualización no vacía es exclusivamente rama→commit.
+  oid_cero "$sha_local" && continue
+  head_remota_valida "$_ref_remota" \
+    || bloquear "solo se permiten actualizaciones de refs/heads con nombre seguro"
+  TIPO=$(git_seguro cat-file -t "$sha_local" 2>/dev/null) \
+    || bloquear "no pude resolver el objeto enviado"
+  [ "$TIPO" = commit ] || bloquear "el OID enviado no es un commit"
+
+  : >"$LISTA"
+  if oid_cero "$sha_remota"; then
+    # Una rama nueva no confía en refs remotas locales: todo ancestro del OID
+    # enviado debe superar el gate, aunque otro ref fabricado lo alcance.
+    git_seguro rev-list --max-count=10001 "$sha_local" >"$LISTA" 2>/dev/null \
+      || bloquear "no pude enumerar la historia nueva"
   else
-    COMMITS=$(git rev-list "$sha_remota..$sha_local" 2>/dev/null) || exit 2
+    git_seguro rev-list --max-count=10001 "$sha_remota..$sha_local" \
+      >"$LISTA" 2>/dev/null || bloquear "no pude enumerar el rango enviado"
   fi
-  for commit in $COMMITS; do
-    case " $REVISADOS " in *" $commit "*) continue ;; esac
-    REVISADOS="$REVISADOS $commit"
+  TAM=$(/usr/bin/stat -c %s "$LISTA" 2>/dev/null) \
+    || bloquear "no pude medir la historia enviada"
+  [ "$TAM" -le $((1024 * 1024)) ] || bloquear "historia enviada excesiva"
+  CUENTA=$(/usr/bin/wc -l <"$LISTA") || bloquear "no pude contar los commits"
+  [ "$CUENTA" -le 10000 ] || bloquear "mas de 10000 commits por push"
+
+  while IFS= read -r commit; do
+    [ -n "$commit" ] || continue
+    oid_valido "$commit" || bloquear "rev-list produjo un OID invalido"
+    TOTAL=$((TOTAL + 1))
+    [ "$TOTAL" -le 10000 ] || bloquear "cobertura total de commits excesiva"
     if ! "$SCANNER" --commit "$commit" --repo "$REPO"; then
       echo "BLOQUEADO: el push contiene datos sensibles" >&2
       exit 1
     fi
-  done
+  done <"$LISTA"
 done
 
 exit 0

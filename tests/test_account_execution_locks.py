@@ -48,7 +48,7 @@ class RastreadorRunner:
 
 
 class LocksCuentaClaudeTests(unittest.TestCase):
-    def _ejecutar_dos(self, tmp, perfiles, runner):
+    def _ejecutar_dos(self, tmp, perfiles, runner, home_usuario=None):
         resultados = []
 
         def ejecutar(pid, perfil):
@@ -58,6 +58,7 @@ class LocksCuentaClaudeTests(unittest.TestCase):
 
         with (
             mock.patch.object(orqlib, "BASE", tmp),
+            mock.patch.object(orqlib, "HOME_USUARIO", home_usuario or tmp),
             mock.patch.object(orqlib, "comando", return_value=["claude"]),
             mock.patch.object(orqlib, "entorno", return_value={}),
             mock.patch.object(orqlib.subprocess, "run", side_effect=runner),
@@ -82,22 +83,23 @@ class LocksCuentaClaudeTests(unittest.TestCase):
 
     def test_dos_perfiles_con_la_misma_home_se_serializan(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cuenta = os.path.join(tmp, "cuenta")
+            cuenta = os.path.join(tmp, ".claude")
             os.mkdir(cuenta)
             runner = RastreadorRunner()
             perfiles = [
                 {"provider": "claude", "home": cuenta},
                 {"provider": "claude", "home": os.path.join(cuenta, ".")},
             ]
-            self._ejecutar_dos(tmp, perfiles, runner)
+            self._ejecutar_dos(tmp, perfiles, runner, home_usuario=tmp)
 
         self.assertEqual(runner.llamadas, 2)
         self.assertEqual(runner.max_activas, 1)
 
     def test_cuentas_con_homes_distintas_pueden_correr_en_paralelo(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cuenta_a = os.path.join(tmp, "a")
-            cuenta_b = os.path.join(tmp, "b")
+            cuenta_a = os.path.join(tmp, "accounts", "claude-a")
+            cuenta_b = os.path.join(tmp, "accounts", "claude-b")
+            os.makedirs(os.path.dirname(cuenta_a))
             os.mkdir(cuenta_a)
             os.mkdir(cuenta_b)
             runner = RastreadorRunner(esperar_dos=True)
@@ -112,10 +114,12 @@ class LocksCuentaClaudeTests(unittest.TestCase):
 
     def test_path_es_canonico_estable_opaco_y_el_archivo_es_0600(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cuenta = os.path.join(tmp, "cuenta")
+            cuenta = os.path.join(tmp, ".claude")
             os.mkdir(cuenta)
             perfil = {"provider": "claude", "home": cuenta}
-            with mock.patch.object(orqlib, "BASE", tmp):
+            with mock.patch.object(orqlib, "BASE", tmp), mock.patch.object(
+                orqlib, "HOME_USUARIO", tmp
+            ):
                 ruta_a = orqlib.ruta_lock_cuenta_claude("claude-a", perfil)
                 ruta_b = orqlib.ruta_lock_cuenta_claude(
                     "otro-id", {"provider": "claude", "home": cuenta + "/."}
