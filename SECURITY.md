@@ -47,6 +47,53 @@ Las respuestas de la API van con CSP, `X-Frame-Options: DENY`,
 La interfaz escapa todo el contenido que viene del servidor antes de insertarlo en el DOM,
 para que una respuesta de un modelo no pueda inyectar HTML en el panel.
 
+## Modelo de amenaza de CodeQL
+
+Orquesta es una herramienta **local** controlada por la misma cuenta Unix que la
+ejecuta. Los argumentos del CLI, `ORQ_HOME`, `ORQ_CARPETA`, `profiles.json` y el
+comando escrito explícitamente tras `/shell` son decisiones del operador: por diseño
+pueden seleccionar cualquier proyecto o ejecutar las mismas acciones que ese usuario
+ya puede realizar en su terminal. No son una frontera entre usuarios con permisos
+distintos.
+
+`ORQ_HOME` solo selecciona una instalación completa y reconocible. La raíz se
+canonicaliza (por eso ella sí puede llegar mediante un symlink), pero cada
+marcador debe ser un archivo regular en su ubicación exacta: no se admiten
+symlinks finales ni en directorios intermedios, aunque apunten dentro de la
+instalación. El entrypoint de esa misma raíz toma la ejecución antes de cargar el
+estado. El código Python deriva la raíz exclusivamente de su propio `__file__`;
+jamás usa `ORQ_HOME` para abrir ni ejecutar una ruta. Esa variable solo debe
+coincidir literalmente con la raíz canónica como aserción de consistencia. El
+shell enlaza sus funciones `orq` y `minimax` directamente con la copia elegida;
+invocar explícitamente un binario de otra copia falla de forma cerrada.
+El shell conserva aparte la raíz elegida y la reafirma antes de cada operación,
+por lo que cambiar accidentalmente `ORQ_HOME` después no selecciona otra copia;
+para hacerlo se debe cargar el `shell.sh` de esa instalación. Ese cambio restaura
+primero el entorno original y descarta la caché, los indicadores de cuenta, el
+override manual y la política de la raíz anterior antes de cargar el nuevo estado.
+La configuración local más reciente se aplica después de esa limpieza. Además,
+los wrappers que pueden omitir el sandbox vuelven a validar la política en cada
+invocación: pasar de `ORQ_PERMISOS_TOTALES=1` a `0` no deja flags peligrosos vivos.
+
+La selección es local: no se lee de una petición web ni de una ruta persistida
+en `profiles.json`. Al cargar `shell.sh`, la ubicación validada de ese archivo
+reemplaza una variable heredada porque es la elección más reciente del operador,
+y se reafirma después de cargar `shell.local.sh` para que las demás preferencias
+no separen código y estado.
+
+La frontera no confiable principal es la entrada HTTP del panel, aun cuando este
+escuche solo en loopback. CodeQL se mantiene deliberadamente en el modelo más estricto
+`remote_and_local`: además de revisar todos los datos HTTP, ayuda a detectar cuándo un
+identificador local llega accidentalmente a una ruta o a una invocación de proceso. Los
+identificadores que sí se convierten en nombres de archivo (sesión, `run_id`, notas de
+memoria y nombre de imagen) se acotan, vuelven opacos o canonicalizan para impedir
+traversal, enlaces fuera de su raíz e inyección accidental de opciones.
+
+Los resultados que partan de funciones locales deliberadas —por ejemplo abrir una
+carpeta elegida con `--en`— deben juzgarse contra este modelo antes de modificar la
+funcionalidad. Que una ruta sea elegible por el operador local no implica que el panel
+web pueda controlarla; ambos límites se prueban por separado.
+
 ## Permisos de disco
 
 Los directorios de cuenta se crean con modo `700`. Verifícalo:

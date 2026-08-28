@@ -196,6 +196,11 @@ class H(BaseHTTPRequestHandler):
             pid = pid_raw.strip()
             if not L.id_perfil_valido(pid):
                 return self._j(400, {"error": "id invalido"})
+            # basename es una segunda barrera local para el único dato HTTP que
+            # termina formando parte de una ruta de credenciales.
+            pid_ruta = os.path.basename(pid)
+            if pid_ruta != pid:
+                return self._j(400, {"error": "id invalido"})
             prov = d.get("provider")
             if prov not in ("claude", "gpt", "antigravity", "minimax"):
                 return self._j(400, {"error": "proveedor invalido"})
@@ -209,7 +214,7 @@ class H(BaseHTTPRequestHandler):
                 if (prov == "antigravity" and any(
                         x.get("provider") == "antigravity" for x in ps.values())):
                     return self._j(400, {"error": "Antigravity ya tiene un perfil global"})
-                home = os.path.join(L.ACCOUNTS, pid)
+                home = os.path.join(L.ACCOUNTS, pid_ruta)
                 os.makedirs(home, exist_ok=True); os.chmod(home, 0o700)
                 ps[pid] = {"label": d.get("label") or f"{prov} · {pid}", "provider": prov,
                            "home": home, "plan": d.get("plan", "pro"),

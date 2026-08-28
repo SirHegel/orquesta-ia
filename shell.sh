@@ -6,37 +6,57 @@ case $- in
   *) return 0 2>/dev/null || exit 0 ;;
 esac
 
-# La ubicacion del clon no es fija. ORQ_HOME sigue admitiendo un override.
-if [ -z "${ORQ_HOME:-}" ]; then
-  _ORQ_SHELL_FILE="${BASH_SOURCE[0]:-}"
-  if [ -n "$_ORQ_SHELL_FILE" ]; then
-    ORQ_HOME="$(CDPATH= cd -- "$(dirname -- "$_ORQ_SHELL_FILE")" 2>/dev/null && pwd -P)"
-  fi
-  [ -n "${ORQ_HOME:-}" ] || ORQ_HOME="$HOME/.local/share/orquesta"
-  export ORQ_HOME
-  unset _ORQ_SHELL_FILE
+# ORQ_HOME selecciona una instalación completa, no un directorio de datos.
+# Cargar este archivo es la decisión más reciente del operador: su ubicación
+# real reemplaza cualquier ORQ_HOME heredado y todos los entrypoints la usan.
+_ORQ_SHELL_FILE="${BASH_SOURCE[0]:-}"
+if ! ORQ_HOME="$(
+  python3 - "$_ORQ_SHELL_FILE" <<'PY'
+import os
+import sys
+
+archivo = sys.argv[1]
+raiz_shell = os.path.dirname(os.path.realpath(archivo))
+sys.path.insert(0, raiz_shell)
+try:
+    import orqroot
+    raiz = orqroot.resolver_raiz(raiz_shell, "shell.sh")
+except (ImportError, ValueError) as exc:
+    print(exc, file=sys.stderr)
+    raise SystemExit(1)
+print(raiz)
+PY
+)"; then
+  unset _ORQ_SHELL_FILE ORQ_HOME
+  return 1 2>/dev/null || exit 1
 fi
+export ORQ_HOME
+_ORQ_HOME_CANONICO="$ORQ_HOME"
+unset _ORQ_SHELL_FILE
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH";; esac
 
-# Preferencias de ESTA maquina, fuera del repositorio. Es codigo de shell local:
-# debe ser propiedad del usuario y no se copia ni se publica con el proyecto.
-_ORQ_SHELL_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/orquesta/shell.local.sh"
-if [ -r "$_ORQ_SHELL_CONFIG" ]; then
-  . "$_ORQ_SHELL_CONFIG"
+# Detecta el cambio antes de reemplazar la selección anterior. El entorno
+# original se captura antes de cargar cualquier configuración de Orquesta.
+if [ -n "${_ORQ_RAIZ_ACTIVA:-}" ] && [ "$_ORQ_RAIZ_ACTIVA" != "$ORQ_HOME" ]; then
+  _ORQ_CAMBIO_RAIZ=1
+else
+  _ORQ_CAMBIO_RAIZ=0
 fi
-unset _ORQ_SHELL_CONFIG
-
-# Foto del entorno anterior a Orquesta. Permite cambiar MiniMax -> Claude sin
-# filtrar endpoint/modelo y, con `orqoff`, restaurar valores que ya eran del
-# usuario en vez de borrarlos definitivamente.
+declare -ga _ORQ_VARIABLES_PROVEEDOR=(
+  CLAUDE_CONFIG_DIR CODEX_HOME GEMINI_CLI_HOME GEMINI_API_KEY
+  GOOGLE_API_KEY GOOGLE_GENAI_USE_GCA GEMINI_CLI_TRUST_WORKSPACE
+  ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN
+  ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL
+  ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL
+  ANTHROPIC_DEFAULT_HAIKU_MODEL CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+  ORQ_CLAUDE_CUENTA ORQ_GPT_CUENTA ORQ_GEMINI_CUENTA
+  ORQ_ANTIGRAVITY_CUENTA ORQ_MINIMAX_CUENTA
+)
+declare -ga _ORQ_VARIABLES_POLITICA=(ORQ_AUTO_CHAT ORQ_PERMISOS_TOTALES)
 if ! declare -p _ORQ_ORIG_PROVIDER_SET >/dev/null 2>&1; then
   declare -gA _ORQ_ORIG_PROVIDER_SET=() _ORQ_ORIG_PROVIDER_VALUE=()
-  for _orq_v in CLAUDE_CONFIG_DIR CODEX_HOME GEMINI_CLI_HOME GEMINI_API_KEY \
-      GOOGLE_API_KEY GOOGLE_GENAI_USE_GCA GEMINI_CLI_TRUST_WORKSPACE \
-      ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN \
-      ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL \
-      ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
-      ANTHROPIC_DEFAULT_HAIKU_MODEL CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC; do
+  for _orq_v in "${_ORQ_VARIABLES_PROVEEDOR[@]}" \
+      "${_ORQ_VARIABLES_POLITICA[@]}"; do
     if [ "${!_orq_v+x}" = x ]; then
       _ORQ_ORIG_PROVIDER_SET["$_orq_v"]=1
       _ORQ_ORIG_PROVIDER_VALUE["$_orq_v"]="${!_orq_v}"
@@ -44,6 +64,58 @@ if ! declare -p _ORQ_ORIG_PROVIDER_SET >/dev/null 2>&1; then
   done
   unset _orq_v
 fi
+_orq_restaurar_original() {
+  local v
+  for v in "$@"; do
+    unset "$v"
+    if [ "${_ORQ_ORIG_PROVIDER_SET[$v]:-}" = 1 ]; then
+      printf -v "$v" '%s' "${_ORQ_ORIG_PROVIDER_VALUE[$v]}"
+      export "$v"
+    fi
+  done
+}
+
+# Una copia anterior no aporta entorno ni política a la nueva. La política se
+# reinicia siempre antes de cargar shell.local.sh: quitar o cambiar una opción
+# en ese archivo también debe surtir efecto al volver a cargar la misma copia.
+if [ "$_ORQ_CAMBIO_RAIZ" = 1 ]; then
+  _orq_restaurar_original "${_ORQ_VARIABLES_PROVEEDOR[@]}"
+  unset ORQ_CUENTA _ORQ_ENTORNO_MTIME
+fi
+_orq_restaurar_original "${_ORQ_VARIABLES_POLITICA[@]}"
+
+# Preferencias de ESTA maquina, fuera del repositorio. Es codigo de shell local:
+# debe ser propiedad del usuario y no se copia ni se publica con el proyecto.
+_ORQ_SHELL_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/orquesta/shell.local.sh"
+if [ -r "$_ORQ_SHELL_CONFIG" ]; then
+  . "$_ORQ_SHELL_CONFIG"
+fi
+# Las preferencias locales controlan autoarranque y permisos, no pueden volver
+# a separar el shell del estado cambiando la instalación ya seleccionada.
+ORQ_HOME="$_ORQ_HOME_CANONICO"
+export ORQ_HOME
+_ORQ_RAIZ_ACTIVA="$ORQ_HOME"
+unset _ORQ_SHELL_CONFIG _ORQ_HOME_CANONICO
+
+# Fija los comandos interactivos a esta instalación. Así un enlace obsoleto en
+# PATH no puede seleccionar otra copia; `command orq` o una ruta B explícita
+# quedan igualmente protegidos porque el CLI contrasta su raíz con ORQ_HOME.
+# La copia elegida se guarda aparte para que un `export ORQ_HOME=...` accidental
+# no cambie código ni estado. Volver a cargar el shell de otra copia actualiza
+# deliberadamente ambas variables y las funciones existentes.
+unalias orq minimax 2>/dev/null || true
+_orq_reafirmar_raiz() {
+  ORQ_HOME="$_ORQ_RAIZ_ACTIVA"
+  export ORQ_HOME
+}
+orq() {
+  _orq_reafirmar_raiz
+  "$_ORQ_RAIZ_ACTIVA/orq" "$@"
+}
+minimax() {
+  _orq_reafirmar_raiz
+  "$_ORQ_RAIZ_ACTIVA/tools/minimax" "$@"
+}
 
 # Identidad de ESTA terminal: permite medir uso por sesion.
 if [ -z "$ORQ_SESION" ]; then
@@ -54,6 +126,7 @@ if [ -z "$ORQ_SESION" ]; then
 fi
 
 _orq_cargar_entorno() {
+  _orq_reafirmar_raiz
   local f="$ORQ_HOME/state/entorno.sh"
   [ -f "$f" ] || return 0
   local m; m=$(stat -c %Y "$f" 2>/dev/null) || return 0
@@ -72,7 +145,6 @@ _orq_cargar_entorno() {
     _ORQ_ENTORNO_MTIME="$m"
   fi
 }
-_orq_cargar_entorno
 
 # Las terminales YA ABIERTAS adoptan la cuenta activa antes de cada comando,
 # sin necesidad de reiniciarlas ni de hacer 'source ~/.bashrc'.
@@ -87,25 +159,19 @@ alias orqw='orq web'
 alias orqu='orq uso'
 
 _orq_restaurar_proveedores() {
-  local v
-  for v in CLAUDE_CONFIG_DIR CODEX_HOME GEMINI_CLI_HOME GEMINI_API_KEY \
-      GOOGLE_API_KEY GOOGLE_GENAI_USE_GCA GEMINI_CLI_TRUST_WORKSPACE \
-      ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN \
-      ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL \
-      ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL \
-      ANTHROPIC_DEFAULT_HAIKU_MODEL CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC; do
-    unset "$v"
-    if [ "${_ORQ_ORIG_PROVIDER_SET[$v]:-}" = 1 ]; then
-      printf -v "$v" '%s' "${_ORQ_ORIG_PROVIDER_VALUE[$v]}"
-      export "$v"
-    fi
-  done
+  _orq_restaurar_original "${_ORQ_VARIABLES_PROVEEDOR[@]}"
   unset ORQ_CUENTA _ORQ_ENTORNO_MTIME
   _orq_cargar_entorno
 }
 
+# El cambio de raíz ya limpió el entorno antes de cargar la nueva configuración;
+# la caché vacía obliga a leer ahora el state de la copia seleccionada.
+_orq_cargar_entorno
+unset _ORQ_CAMBIO_RAIZ
+
 # Override solo para ESTA terminal (bloquea la recarga automatica)
 orquse() {
+  _orq_reafirmar_raiz
   local id="$1"
   [ -z "$id" ] && { echo "uso: orquse <id-de-cuenta>"; orq cuentas; return 1; }
   local -a info=()
@@ -177,19 +243,32 @@ if [ "${ORQ_PERMISOS_TOTALES:-0}" = "1" ]; then
   # Respeta tu lanzador claude-vagabond (el del logo de Musashi) si existe,
   # solo le añade los permisos.
   if [ -x "$HOME/.config/kitty/claude-vagabond" ]; then
-    claude() { "$HOME/.config/kitty/claude-vagabond" --dangerously-skip-permissions "$@"; }
+    claude() {
+      if [ "${ORQ_PERMISOS_TOTALES:-0}" != 1 ]; then command claude "$@"; return; fi
+      "$HOME/.config/kitty/claude-vagabond" --dangerously-skip-permissions "$@"
+    }
   else
-    claude() { command claude --dangerously-skip-permissions "$@"; }
+    claude() {
+      if [ "${ORQ_PERMISOS_TOTALES:-0}" != 1 ]; then command claude "$@"; return; fi
+      command claude --dangerously-skip-permissions "$@"
+    }
   fi
   codex()  {
+    if [ "${ORQ_PERMISOS_TOTALES:-0}" != 1 ]; then command codex "$@"; return; fi
     case "$1" in
       exec|login|logout|mcp|sandbox|apply|resume)
         command codex "$@";;
       *) command codex --dangerously-bypass-approvals-and-sandbox "$@";;
     esac
   }
-  agy()    { command agy --dangerously-skip-permissions "$@"; }
-  gemini() { command gemini --yolo "$@"; }
+  agy()    {
+    if [ "${ORQ_PERMISOS_TOTALES:-0}" != 1 ]; then command agy "$@"; return; fi
+    command agy --dangerously-skip-permissions "$@"
+  }
+  gemini() {
+    if [ "${ORQ_PERMISOS_TOTALES:-0}" != 1 ]; then command gemini "$@"; return; fi
+    command gemini --yolo "$@"
+  }
 fi
 
 # ── Un prompt, todas las IA ─────────────────────────────────────────────
