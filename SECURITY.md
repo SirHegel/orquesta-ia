@@ -56,6 +56,15 @@ pueden seleccionar cualquier proyecto o ejecutar las mismas acciones que ese usu
 ya puede realizar en su terminal. No son una frontera entre usuarios con permisos
 distintos.
 
+`ORQ_HOME` solo selecciona una instalación completa y reconocible. Se
+canonicaliza, se rechazan marcadores que escapen mediante enlaces y el entrypoint
+de esa misma instalación toma la ejecución antes de cargar el estado. Es una
+elección explícita del entorno local, no se lee de una petición web ni de una
+ruta persistida en `profiles.json`. Una raíz inválida falla de forma cerrada; no
+se usa otra copia como fallback. Al cargar `shell.sh`, la ubicación validada de
+ese archivo reemplaza una variable heredada porque es la elección local más
+reciente del operador.
+
 La frontera no confiable principal es la entrada HTTP del panel, aun cuando este
 escuche solo en loopback. CodeQL se mantiene deliberadamente en el modelo más estricto
 `remote_and_local`: además de revisar todos los datos HTTP, ayuda a detectar cuándo un

@@ -6,16 +6,32 @@ case $- in
   *) return 0 2>/dev/null || exit 0 ;;
 esac
 
-# La ubicacion del clon no es fija. ORQ_HOME sigue admitiendo un override.
-if [ -z "${ORQ_HOME:-}" ]; then
-  _ORQ_SHELL_FILE="${BASH_SOURCE[0]:-}"
-  if [ -n "$_ORQ_SHELL_FILE" ]; then
-    ORQ_HOME="$(CDPATH= cd -- "$(dirname -- "$_ORQ_SHELL_FILE")" 2>/dev/null && pwd -P)"
-  fi
-  [ -n "${ORQ_HOME:-}" ] || ORQ_HOME="$HOME/.local/share/orquesta"
-  export ORQ_HOME
-  unset _ORQ_SHELL_FILE
+# ORQ_HOME selecciona una instalación completa, no un directorio de datos.
+# Cargar este archivo es la decisión más reciente del operador: su ubicación
+# real reemplaza cualquier ORQ_HOME heredado y todos los entrypoints la usan.
+_ORQ_SHELL_FILE="${BASH_SOURCE[0]:-}"
+if ! ORQ_HOME="$(
+  python3 - "$_ORQ_SHELL_FILE" <<'PY'
+import os
+import sys
+
+archivo = sys.argv[1]
+raiz_shell = os.path.dirname(os.path.realpath(archivo))
+sys.path.insert(0, raiz_shell)
+try:
+    import orqroot
+    raiz = orqroot.resolver_raiz(raiz_shell, "shell.sh")
+except (ImportError, ValueError) as exc:
+    print(exc, file=sys.stderr)
+    raise SystemExit(1)
+print(raiz)
+PY
+)"; then
+  unset _ORQ_SHELL_FILE ORQ_HOME
+  return 1 2>/dev/null || exit 1
 fi
+export ORQ_HOME
+unset _ORQ_SHELL_FILE
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH";; esac
 
 # Preferencias de ESTA maquina, fuera del repositorio. Es codigo de shell local:

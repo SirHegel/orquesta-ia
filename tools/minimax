@@ -11,10 +11,15 @@ proceso hijo: la cuenta Claude real de la terminal no se toca.
 """
 import os, sys
 
-BASE = os.environ.get("ORQ_HOME") or os.path.dirname(
-    os.path.dirname(os.path.realpath(__file__))
-)
-sys.path.insert(0, BASE)
+_RAIZ_ENTRYPOINT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, _RAIZ_ENTRYPOINT)
+import orqroot
+
+try:
+    orqroot.activar_raiz(_RAIZ_ENTRYPOINT, "tools/minimax", "minimax")
+except orqroot.RaizOrquestaInvalida as exc:
+    sys.exit(str(exc))
+
 import orqlib as L
 
 

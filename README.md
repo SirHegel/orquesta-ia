@@ -48,6 +48,16 @@ ln -sf "$PWD/orq" ~/.local/bin/orq
 ln -sf "$PWD/tools/minimax" ~/.local/bin/minimax
 ```
 
+`ORQ_HOME` es la raíz canónica de **una instalación completa**, no una carpeta
+de datos independiente. Al cargar `shell.sh`, su ubicación real es la elección
+más reciente del operador: este valida la copia y reemplaza cualquier
+`ORQ_HOME` heredado. `orq` y `minimax` usan esa misma raíz aunque un enlace
+encontrado en `PATH` apunte accidentalmente a otro clon. Fuera de ese shell, un
+`ORQ_HOME` explícito selecciona la copia y debe contener `orq`, `orqlib.py`,
+`orqroot.py`, `shell.sh` y `tools/minimax`. Si no es válido, los comandos fallan
+en vez de leer o escribir en otra instalación. Para cambiar de copia, carga el
+`shell.sh` de esa copia.
+
 Requiere Python 3.9+ y los CLIs que vayas a usar (`claude`, `codex`, `agy`).
 La ruta del clon y el emulador de terminal no importan: Kitty, GNOME Terminal,
 Konsole, WezTerm, Alacritty o una consola SSH pueden ejecutar el mismo comando:
@@ -189,6 +199,7 @@ Para dejarlo permanente hay un servicio de usuario en
 ```
 orq                  CLI
 orqlib.py            núcleo compartido (estado con bloqueo fcntl)
+orqroot.py           contrato y validación compartidos de ORQ_HOME
 orqchat.py           conversación natural (Kitty mejora la presentación gráfica)
 orqweb.py            panel web (API + jobs asíncronos)
 orquesta-app.py      envoltorio GTK4/WebKit del panel

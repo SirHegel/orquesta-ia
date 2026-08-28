@@ -2,7 +2,16 @@
 """orq — orquestador multi-cuenta de IA. Compartido entre todas las terminales."""
 import argparse, json, os, re, sys, subprocess, time, datetime, shutil, threading
 from concurrent.futures import ThreadPoolExecutor
-sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+_RAIZ_ENTRYPOINT = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, _RAIZ_ENTRYPOINT)
+import orqroot
+
+try:
+    orqroot.activar_raiz(_RAIZ_ENTRYPOINT, "orq")
+except orqroot.RaizOrquestaInvalida as exc:
+    sys.exit(str(exc))
+
 import orqlib as L
 
 C = {"r":"\033[0m","b":"\033[1m","d":"\033[2m","g":"\033[32m","y":"\033[33m",
